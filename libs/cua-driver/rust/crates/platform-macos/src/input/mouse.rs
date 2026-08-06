@@ -74,6 +74,22 @@ enum MousePostMode {
     PublicOnly,
 }
 
+#[derive(Clone, Copy)]
+pub enum WindowClickDelivery {
+    Background,
+    Foreground,
+}
+
+impl WindowClickDelivery {
+    pub fn from_foreground(foreground: bool) -> Self {
+        if foreground {
+            Self::Foreground
+        } else {
+            Self::Background
+        }
+    }
+}
+
 /// Left-click at `(x, y)` screen coordinates, posted to `pid`.
 ///
 /// Window-local coordinates for backgrounded targets: if `window_local` is
@@ -86,7 +102,7 @@ pub fn click_at_xy(
     count: usize,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    click_at_xy_inner(pid, x, y, None, None, count, modifiers)
+    click_at_xy_inner(pid, x, y, None, None, count, modifiers, MousePostMode::Both)
 }
 
 /// Screen-absolute click posted to the GLOBAL HID tap (`CGEventTapLocation::HID`),
@@ -463,9 +479,9 @@ extern "C" {
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
 }
 
-/// Like `click_at_xy` but also stamps window-local `(wx, wy)` onto the event.
-/// When `wid` is provided, additionally stamps Chromium routing fields
-/// (f51 / f58 / f91 / f92) for better backgrounded-target delivery.
+/// Like `click_at_xy` but also targets a specific window. Foreground delivery
+/// uses one public pid post; background delivery uses one SkyLight post with a
+/// public fallback only when the private symbol is unavailable.
 // The flattened arguments mirror the native event fields used by existing callers.
 #[allow(clippy::too_many_arguments)]
 pub fn click_at_xy_with_window_local(
@@ -477,8 +493,27 @@ pub fn click_at_xy_with_window_local(
     wid: u32,
     count: usize,
     modifiers: &[&str],
+    delivery: WindowClickDelivery,
+    focus_context: Option<crate::input::skylight::SyntheticTargetFocusContext>,
 ) -> anyhow::Result<()> {
-    click_at_xy_inner(pid, x, y, Some((wx, wy)), Some(wid), count, modifiers)
+    match delivery {
+        WindowClickDelivery::Background => {
+            click_at_xy_chromium(pid, x, y, wx, wy, wid, count, modifiers, focus_context)
+        }
+        WindowClickDelivery::Foreground => {
+            drop(focus_context);
+            click_at_xy_inner(
+                pid,
+                x,
+                y,
+                Some((wx, wy)),
+                Some(wid),
+                count,
+                modifiers,
+                MousePostMode::PublicOnly,
+            )
+        }
+    }
 }
 
 fn click_at_xy_inner(
@@ -489,6 +524,7 @@ fn click_at_xy_inner(
     wid: Option<u32>,
     count: usize,
     modifiers: &[&str],
+    post_mode: MousePostMode,
 ) -> anyhow::Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -518,7 +554,7 @@ fn click_at_xy_inner(
             window_local,
             wid,
             click_group_id,
-            MousePostMode::PublicOnly,
+            post_mode,
         );
         std::thread::sleep(std::time::Duration::from_millis(12));
 
@@ -545,7 +581,7 @@ fn click_at_xy_inner(
                 click_state,
                 0,
                 3,
-                MousePostMode::PublicOnly,
+                post_mode,
             );
             // 28 ms down→up gap: an NSButton's mouseDown enters a modal
             // tracking loop that polls for the matching mouseUp; too tight a
@@ -572,7 +608,7 @@ fn click_at_xy_inner(
                 click_state,
                 0,
                 3,
-                MousePostMode::PublicOnly,
+                post_mode,
             );
 
             if count > 1 {

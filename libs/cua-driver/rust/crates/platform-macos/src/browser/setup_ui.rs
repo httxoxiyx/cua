@@ -869,6 +869,8 @@ fn press_pixel_checkbox(
             window_id,
             1,
             &[],
+            crate::input::mouse::WindowClickDelivery::Foreground,
+            None,
         )?;
         std::thread::sleep(Duration::from_millis(100));
         Ok(())

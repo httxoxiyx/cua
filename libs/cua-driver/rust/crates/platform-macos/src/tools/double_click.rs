@@ -290,6 +290,8 @@ impl Tool for DoubleClickTool {
                         wid,
                         2,
                         &[],
+                        crate::input::mouse::WindowClickDelivery::from_foreground(fg),
+                        None,
                     )
                 } else {
                     crate::input::mouse::click_at_xy(pid, screen_x, screen_y, 2, &[])
@@ -382,7 +384,18 @@ fn ax_double_click(
              screen coordinates as window-local for element [{idx}]."
             )
         })?;
-    crate::input::mouse::click_at_xy_with_window_local(pid, cx, cy, wx, wy, wid, 2, &[])?;
+    crate::input::mouse::click_at_xy_with_window_local(
+        pid,
+        cx,
+        cy,
+        wx,
+        wy,
+        wid,
+        2,
+        &[],
+        crate::input::mouse::WindowClickDelivery::from_foreground(allow_pointer_fallback),
+        None,
+    )?;
     Ok(format!(
         "✅ Double-clicked element [{idx}] at ({cx:.1}, {cy:.1})."
     ))
