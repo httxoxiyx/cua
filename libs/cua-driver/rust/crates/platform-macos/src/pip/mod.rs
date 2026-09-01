@@ -99,9 +99,6 @@ static VIEW_MODEL: Mutex<Option<PipViewModel>> = Mutex::new(None);
 static HIDDEN_APPS: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static HOVERED_APP: Mutex<Option<i64>> = Mutex::new(None);
 static CARD_GESTURE: Mutex<Option<CardGesture>> = Mutex::new(None);
-static SYSTEM_CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
-static SYSTEM_CURSOR_HIDE_PENDING: AtomicBool = AtomicBool::new(false);
-static HIDDEN_CURSOR_CONNECTION: AtomicU64 = AtomicU64::new(0);
 static LIVE_STREAMS: LazyLock<Mutex<HashMap<i64, LiveStreamEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -125,8 +122,6 @@ const MINIMUM_PIP_HEIGHT: f64 = 180.0;
 const MAXIMUM_DEFAULT_PIP_WIDTH: f64 = 480.0;
 const MAXIMUM_DEFAULT_PIP_HEIGHT: f64 = 300.0;
 const CLICK_DRAG_THRESHOLD: f64 = 4.0;
-const CURSOR_WATCHDOG_INITIAL_DELAY: Duration = Duration::from_millis(35);
-const CURSOR_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
 const RESIZE_LEFT: isize = 1;
 const RESIZE_RIGHT: isize = 2;
@@ -146,13 +141,6 @@ extern "C" {
         context: *mut c_void,
         work: unsafe extern "C" fn(*mut c_void),
     );
-    fn dispatch_time(when: u64, delta: i64) -> u64;
-    fn dispatch_after_f(
-        when: u64,
-        queue: *const c_void,
-        context: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
 }
 
 fn dispatch_to_main<T: Send + 'static>(payload: T, cb: unsafe extern "C" fn(*mut c_void)) {
@@ -160,24 +148,6 @@ fn dispatch_to_main<T: Send + 'static>(payload: T, cb: unsafe extern "C" fn(*mut
     unsafe {
         let main_queue = &raw const _dispatch_main_q as *const c_void;
         dispatch_async_f(main_queue, Box::into_raw(boxed) as *mut c_void, cb);
-    }
-}
-
-fn dispatch_to_main_after<T: Send + 'static>(
-    delay: Duration,
-    payload: T,
-    cb: unsafe extern "C" fn(*mut c_void),
-) {
-    let boxed = Box::new(payload);
-    let nanos = delay.as_nanos().min(i64::MAX as u128) as i64;
-    unsafe {
-        let main_queue = &raw const _dispatch_main_q as *const c_void;
-        dispatch_after_f(
-            dispatch_time(0, nanos),
-            main_queue,
-            Box::into_raw(boxed) as *mut c_void,
-            cb,
-        );
     }
 }
 
@@ -897,105 +867,19 @@ unsafe fn refresh_cursor_at_window_point(
 }
 
 unsafe fn show_custom_cursor(
-    owner_window: *mut objc2::runtime::AnyObject,
-    location: objc2_foundation::NSPoint,
+    _owner_window: *mut objc2::runtime::AnyObject,
+    _location: objc2_foundation::NSPoint,
     cursor: *mut objc2::runtime::AnyObject,
 ) {
     use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-    use objc2_foundation::{NSPoint, NSRect};
 
-    if owner_window.is_null() || cursor.is_null() {
+    if cursor.is_null() {
         return;
     }
-    let image_view = {
-        let guard = HANDLES.lock().unwrap();
-        let Some(handles) = guard.as_ref() else {
-            return;
-        };
-        handles.cursor_image_view as *mut AnyObject
-    };
-    if image_view.is_null() {
-        return;
-    }
-
-    let image: *mut AnyObject = msg_send![cursor, image];
-    if image.is_null() {
-        return;
-    }
-    let size: objc2_foundation::NSSize = msg_send![image, size];
-    let hotspot: NSPoint = msg_send![cursor, hotSpot];
-    let content: *mut AnyObject = msg_send![owner_window, contentView];
-    let bounds: NSRect = msg_send![content, bounds];
-    let origin_x = (location.x - hotspot.x).clamp(0.0, (bounds.size.width - size.width).max(0.0));
-    let origin_y = (location.y - (size.height - hotspot.y))
-        .clamp(0.0, (bounds.size.height - size.height).max(0.0));
-    let frame = NSRect::new(NSPoint::new(origin_x, origin_y), size);
-    let _: () = msg_send![image_view, setImage: image];
-    let _: () = msg_send![image_view, setFrame: frame];
-    let _: () = msg_send![image_view, setHidden: false];
-    SYSTEM_CURSOR_HIDDEN.store(true, Ordering::SeqCst);
-    obscure_system_cursor();
-    schedule_cursor_watchdog(CURSOR_WATCHDOG_INITIAL_DELAY);
-}
-
-fn obscure_system_cursor() {
-    let Some(connection) = crate::input::skylight::obscure_front_process_cursor() else {
-        return;
-    };
-    let previous = HIDDEN_CURSOR_CONNECTION.swap(u64::from(connection), Ordering::SeqCst) as u32;
-    if previous != 0 && previous != connection {
-        crate::input::skylight::reveal_cursor_for_connection(previous);
-    }
-}
-
-fn schedule_cursor_watchdog(delay: Duration) {
-    if !SYSTEM_CURSOR_HIDE_PENDING.swap(true, Ordering::SeqCst) {
-        dispatch_to_main_after(delay, (), cursor_watchdog_cb);
-    }
-}
-
-unsafe fn pointer_is_inside_pip_window() -> bool {
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-
-    let window = HANDLES
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|handles| handles.window)
-        .unwrap_or(0) as *mut AnyObject;
-    if window.is_null() {
-        return false;
-    }
-    let visible: objc2::runtime::Bool = msg_send![window, isVisible];
-    if !visible.as_bool() {
-        return false;
-    }
-    let frame: objc2_foundation::NSRect = msg_send![window, frame];
-    let mouse: objc2_foundation::NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
-    mouse.x >= frame.origin.x
-        && mouse.x < frame.origin.x + frame.size.width
-        && mouse.y >= frame.origin.y
-        && mouse.y < frame.origin.y + frame.size.height
-}
-
-unsafe extern "C" fn cursor_watchdog_cb(ctx: *mut c_void) {
-    drop(Box::from_raw(ctx as *mut ()));
-    SYSTEM_CURSOR_HIDE_PENDING.store(false, Ordering::SeqCst);
-    if !SYSTEM_CURSOR_HIDDEN.load(Ordering::SeqCst) {
-        return;
-    }
-    if !pointer_is_inside_pip_window() {
-        hide_custom_cursor();
-        return;
-    }
-
-    // The foreground app can replace its cursor after this inactive panel's
-    // mouseMoved callback. Reassert while the pointer is actually over the
-    // PiP, and stop immediately if an AppKit exit event was missed.
-    obscure_system_cursor();
-    schedule_cursor_watchdog(CURSOR_WATCHDOG_INTERVAL);
+    // Never hide or obscure the foreground application's cursor from this
+    // non-activating panel. AppKit may honor this safe best-effort cursor set;
+    // if it does not, the ordinary arrow remains visible.
+    let _: () = msg_send![cursor, set];
 }
 
 fn hide_custom_cursor() {
@@ -1011,14 +895,6 @@ fn hide_custom_cursor() {
     unsafe {
         if !image_view.is_null() {
             let _: () = msg_send![image_view, setHidden: true];
-        }
-        let was_active = SYSTEM_CURSOR_HIDDEN.swap(false, Ordering::SeqCst);
-        let connection = HIDDEN_CURSOR_CONNECTION.swap(0, Ordering::SeqCst) as u32;
-        if connection != 0 {
-            crate::input::skylight::reveal_cursor_for_connection(connection);
-        }
-        if was_active {
-            crate::input::skylight::reveal_front_process_cursor();
         }
     }
 }
@@ -1887,10 +1763,6 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
     if HANDLES.lock().unwrap().is_some() {
         return;
     }
-
-    // Repair any transient cursor state left by an interrupted prior PiP
-    // instance before installing this window's custom cursor overlay.
-    crate::input::skylight::reveal_front_process_cursor();
 
     let screen: *mut AnyObject = msg_send![objc2::class!(NSScreen), mainScreen];
     if screen.is_null() {

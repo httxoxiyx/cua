@@ -41,12 +41,6 @@ type SetIntFieldFn = unsafe extern "C" fn(*mut c_void, u32, i64);
 /// `uint32_t CGSMainConnectionID(void)`
 type ConnectionIDFn = unsafe extern "C" fn() -> u32;
 
-/// `CGError SLSGetConnectionIDForPSN(uint32_t cid, const void *psn, uint32_t *out_cid)`
-type GetConnectionIDForPsnFn = unsafe extern "C" fn(u32, *const c_void, *mut u32) -> i32;
-
-/// `CGError CGSObscureCursor(CGSConnectionID cid)` / `CGSRevealCursor`.
-type CursorVisibilityFn = unsafe extern "C" fn(u32) -> i32;
-
 /// `uint64_t CGSGetActiveSpace(uint32_t cid)`
 type GetActiveSpaceFn = unsafe extern "C" fn(u32) -> u64;
 
@@ -158,33 +152,6 @@ fn connection_id_fn() -> Option<ConnectionIDFn> {
     *SYM.get_or_init(|| find_sym(b"CGSMainConnectionID\0").map(|p| unsafe { as_fn(p) }))
 }
 
-fn get_connection_id_for_psn_fn() -> Option<GetConnectionIDForPsnFn> {
-    static SYM: OnceLock<Option<GetConnectionIDForPsnFn>> = OnceLock::new();
-    *SYM.get_or_init(|| {
-        find_sym(b"SLSGetConnectionIDForPSN\0")
-            .or_else(|| find_sym(b"CGSGetConnectionIDForPSN\0"))
-            .map(|p| unsafe { as_fn(p) })
-    })
-}
-
-fn obscure_cursor_fn() -> Option<CursorVisibilityFn> {
-    static SYM: OnceLock<Option<CursorVisibilityFn>> = OnceLock::new();
-    *SYM.get_or_init(|| {
-        find_sym(b"SLSObscureCursor\0")
-            .or_else(|| find_sym(b"CGSObscureCursor\0"))
-            .map(|p| unsafe { as_fn(p) })
-    })
-}
-
-fn reveal_cursor_fn() -> Option<CursorVisibilityFn> {
-    static SYM: OnceLock<Option<CursorVisibilityFn>> = OnceLock::new();
-    *SYM.get_or_init(|| {
-        find_sym(b"SLSRevealCursor\0")
-            .or_else(|| find_sym(b"CGSRevealCursor\0"))
-            .map(|p| unsafe { as_fn(p) })
-    })
-}
-
 fn get_active_space_fn() -> Option<GetActiveSpaceFn> {
     static SYM: OnceLock<Option<GetActiveSpaceFn>> = OnceLock::new();
     *SYM.get_or_init(|| {
@@ -259,60 +226,6 @@ fn get_process_for_pid_fn() -> Option<GetProcessForPIDFn> {
 /// `true` when `SLEventPostToPid` resolved.
 pub fn is_available() -> bool {
     post_to_pid_fn().is_some()
-}
-
-fn front_process_connection() -> Option<u32> {
-    let (Some(main_connection), Some(get_front), Some(get_connection)) = (
-        connection_id_fn(),
-        get_front_process_fn(),
-        get_connection_id_for_psn_fn(),
-    ) else {
-        return None;
-    };
-    let mut psn = [0u8; 8];
-    if unsafe { get_front(psn.as_mut_ptr() as *mut c_void) } != 0 {
-        return None;
-    }
-    let mut front_connection = 0u32;
-    if unsafe {
-        get_connection(
-            main_connection(),
-            psn.as_ptr() as *const c_void,
-            &mut front_connection,
-        )
-    } != 0
-        || front_connection == 0
-    {
-        return None;
-    }
-    Some(front_connection)
-}
-
-/// Hide the foreground application's cursor until the next physical mouse
-/// movement. Unlike `CGSHideCursor`, this does not leave a persistent hide
-/// count behind if the PiP process exits unexpectedly.
-pub(crate) fn obscure_front_process_cursor() -> Option<u32> {
-    let (Some(connection), Some(obscure_cursor)) =
-        (front_process_connection(), obscure_cursor_fn())
-    else {
-        return None;
-    };
-    (unsafe { obscure_cursor(connection) } == 0).then_some(connection)
-}
-
-pub(crate) fn reveal_cursor_for_connection(connection: u32) -> bool {
-    if connection == 0 {
-        return false;
-    }
-    reveal_cursor_fn()
-        .map(|reveal_cursor| unsafe { reveal_cursor(connection) == 0 })
-        .unwrap_or(false)
-}
-
-pub(crate) fn reveal_front_process_cursor() -> bool {
-    front_process_connection()
-        .map(reveal_cursor_for_connection)
-        .unwrap_or(false)
 }
 
 /// `true` when the focus-without-raise SPIs resolved, including either the
