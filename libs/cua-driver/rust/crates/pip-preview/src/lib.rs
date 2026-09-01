@@ -354,6 +354,26 @@ impl PipViewModel {
         removed
     }
 
+    /// Move an existing app to the front of the visual card stack.
+    ///
+    /// The platform renderer paints publication order back-to-front, so the
+    /// final entry is the card that receives the full-size foreground slot.
+    pub fn promote_app(&mut self, pid: i64) -> bool {
+        let Some(index) = self
+            .publication_order
+            .iter()
+            .position(|published_pid| *published_pid == pid)
+        else {
+            return false;
+        };
+        if index + 1 == self.publication_order.len() {
+            return false;
+        }
+        self.publication_order.remove(index);
+        self.publication_order.push(pid);
+        true
+    }
+
     pub fn frame_for_app(&self, pid: i64) -> Option<&PipFrame> {
         self.frames_by_pid.get(&pid)
     }
@@ -467,6 +487,27 @@ mod tests {
         assert_eq!(outcome.evicted_pid, None);
         let ordered = model.ordered_frames();
         assert_eq!(ordered[0].target.pid, 1);
+    }
+
+    #[test]
+    fn promoting_an_app_moves_it_to_the_front_without_dropping_frames() {
+        let mut model = PipViewModel::new(3);
+        model.upsert(frame(1, 11, 10));
+        model.upsert(frame(2, 22, 20));
+        model.upsert(frame(3, 33, 30));
+
+        assert!(model.promote_app(1));
+        let ordered = model.ordered_frames();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|frame| frame.target.pid)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+        assert_eq!(model.len(), 3);
+        assert!(!model.promote_app(1));
+        assert!(!model.promote_app(99));
     }
 
     #[test]

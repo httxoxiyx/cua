@@ -11,7 +11,8 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pip_preview::{
-    PipBackend, PipBackendFactory, PipConfig, PipFrame, PipViewModel, MAX_VISIBLE_PIP_CARDS,
+    PipBackend, PipBackendFactory, PipConfig, PipFrame, PipGeometry, PipViewModel,
+    MAX_VISIBLE_PIP_CARDS,
 };
 use screencapturekit::prelude::{
     CMSampleBufferExt, CMSampleBufferSCExt, CMTime, SCContentFilter, SCShareableContent, SCStream,
@@ -42,12 +43,15 @@ struct NativeHandles {
     window: usize,
     canvas: usize,
     delegate: usize,
+    cursor_image_view: usize,
 }
 
 #[derive(Clone, Copy)]
 struct NativeCardHandles {
+    card: usize,
     image_view: usize,
     controls: usize,
+    resting_rect: CardRect,
 }
 
 struct LiveStreamEntry {
@@ -64,6 +68,12 @@ struct LiveFrame {
     frame_pending: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Copy)]
+struct ClickedTarget {
+    pid: i64,
+    window_id: u64,
+}
+
 enum LiveFrameImage {
     CgImage(screencapturekit::CGImage),
     Png(Vec<u8>),
@@ -78,6 +88,10 @@ static RESIZE_VIEW_DIRECTIONS: LazyLock<Mutex<HashMap<usize, isize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static VIEW_MODEL: Mutex<Option<PipViewModel>> = Mutex::new(None);
 static HIDDEN_APPS: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static HOVERED_APP: Mutex<Option<i64>> = Mutex::new(None);
+static SYSTEM_CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+static SYSTEM_CURSOR_HIDE_PENDING: AtomicBool = AtomicBool::new(false);
+static HIDDEN_CURSOR_CONNECTION: AtomicU64 = AtomicU64::new(0);
 static LIVE_STREAMS: LazyLock<Mutex<HashMap<i64, LiveStreamEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -86,12 +100,21 @@ const LIVE_CAPTURE_MAX_SIDE: f64 = 960.0;
 const LIVE_CAPTURE_WINDOW_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 const LIVE_CAPTURE_WATCHDOG: Duration = Duration::from_millis(750);
 const FALLBACK_CAPTURE_INTERVAL: Duration = Duration::from_millis(500);
-const CARD_GAP: f64 = 8.0;
 const STACK_INSET: f64 = 8.0;
+const STACK_CARD_OFFSET_X: f64 = 16.0;
+const STACK_CARD_OFFSET_Y: f64 = 18.0;
+const STACK_MIN_CARD_HEIGHT: f64 = 120.0;
+const STACK_HOVER_LIFT_X: f64 = 8.0;
+const STACK_HOVER_LIFT_Y: f64 = 5.0;
 const CARD_RADIUS: f64 = 12.0;
-const TITLE_HEIGHT: f64 = 27.0;
 const CONTROL_SIZE: f64 = 24.0;
-const RESIZE_HIT_INSET: f64 = 7.0;
+const RESIZE_HIT_INSET: f64 = 20.0;
+const DEFAULT_SCREEN_FRACTION: f64 = 0.20;
+const MINIMUM_PIP_WIDTH: f64 = 280.0;
+const MINIMUM_PIP_HEIGHT: f64 = 180.0;
+const MAXIMUM_DEFAULT_PIP_WIDTH: f64 = 480.0;
+const MAXIMUM_DEFAULT_PIP_HEIGHT: f64 = 300.0;
+const CLICK_DRAG_THRESHOLD: f64 = 4.0;
 
 const RESIZE_LEFT: isize = 1;
 const RESIZE_RIGHT: isize = 2;
@@ -111,6 +134,13 @@ extern "C" {
         context: *mut c_void,
         work: unsafe extern "C" fn(*mut c_void),
     );
+    fn dispatch_time(when: u64, delta: i64) -> u64;
+    fn dispatch_after_f(
+        when: u64,
+        queue: *const c_void,
+        context: *mut c_void,
+        work: unsafe extern "C" fn(*mut c_void),
+    );
 }
 
 fn dispatch_to_main<T: Send + 'static>(payload: T, cb: unsafe extern "C" fn(*mut c_void)) {
@@ -118,6 +148,24 @@ fn dispatch_to_main<T: Send + 'static>(payload: T, cb: unsafe extern "C" fn(*mut
     unsafe {
         let main_queue = &raw const _dispatch_main_q as *const c_void;
         dispatch_async_f(main_queue, Box::into_raw(boxed) as *mut c_void, cb);
+    }
+}
+
+fn dispatch_to_main_after<T: Send + 'static>(
+    delay: Duration,
+    payload: T,
+    cb: unsafe extern "C" fn(*mut c_void),
+) {
+    let boxed = Box::new(payload);
+    let nanos = delay.as_nanos().min(i64::MAX as u128) as i64;
+    unsafe {
+        let main_queue = &raw const _dispatch_main_q as *const c_void;
+        dispatch_after_f(
+            dispatch_time(0, nanos),
+            main_queue,
+            Box::into_raw(boxed) as *mut c_void,
+            cb,
+        );
     }
 }
 
@@ -418,7 +466,10 @@ fn build_live_capture(
         .with_preserves_aspect_ratio(true)
         .with_queue_depth(2)
         .with_minimum_frame_interval(&frame_interval)
-        .with_shows_cursor(true);
+        // The PiP window renders its own interaction cursor. Including the
+        // desktop cursor in the captured app frame would make the source
+        // arrow appear underneath that hand/resize cursor.
+        .with_shows_cursor(false);
 
     let mut stream = SCStream::new(&filter, &config);
     stream
@@ -565,6 +616,32 @@ fn pip_card_view_class() -> &'static objc2::runtime::AnyClass {
     })
 }
 
+fn pip_cursor_image_view_class() -> &'static objc2::runtime::AnyClass {
+    use objc2::class;
+    use objc2::declare::ClassBuilder;
+
+    static CLASS: OnceLock<&'static objc2::runtime::AnyClass> = OnceLock::new();
+    CLASS.get_or_init(|| {
+        let mut builder = ClassBuilder::new("CuaDriverPipCursorImageView", class!(NSImageView))
+            .expect("CuaDriverPipCursorImageView already registered");
+        unsafe {
+            builder.add_method(
+                objc2::sel!(hitTest:),
+                cursor_image_hit_test as extern "C" fn(_, _, _) -> _,
+            );
+        }
+        builder.register()
+    })
+}
+
+extern "C" fn cursor_image_hit_test(
+    _view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    _point: objc2_foundation::NSPoint,
+) -> *mut objc2::runtime::AnyObject {
+    std::ptr::null_mut()
+}
+
 extern "C" fn accepts_first_mouse(
     _view: *mut objc2::runtime::AnyObject,
     _selector: objc2::runtime::Sel,
@@ -573,56 +650,316 @@ extern "C" fn accepts_first_mouse(
     objc2::runtime::Bool::YES
 }
 
-fn set_card_controls_hidden(pid: i64, hidden: bool) {
+fn set_hovered_app(pid: Option<i64>) {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-    let controls = CARD_HANDLES
+    {
+        let mut hovered = HOVERED_APP.lock().unwrap();
+        if *hovered == pid {
+            return;
+        }
+        *hovered = pid;
+    }
+
+    let front_pid = VIEW_MODEL
         .lock()
         .unwrap()
-        .get(&pid)
-        .map(|handles| handles.controls)
-        .unwrap_or(0) as *mut AnyObject;
-    if !controls.is_null() {
-        unsafe {
-            let _: () = msg_send![controls, setHidden: hidden];
+        .as_ref()
+        .and_then(|model| model.ordered_frames().last().map(|frame| frame.target.pid));
+    let handles = CARD_HANDLES.lock().unwrap().clone();
+    for (card_pid, card_handles) in handles {
+        let controls = card_handles.controls as *mut AnyObject;
+        let card = card_handles.card as *mut AnyObject;
+        if !controls.is_null() {
+            unsafe {
+                let hidden = Some(card_pid) != pid || Some(card_pid) != front_pid;
+                let _: () = msg_send![controls, setHidden: hidden];
+            }
         }
+        if !card.is_null() {
+            let lift = Some(card_pid) == pid && Some(card_pid) != front_pid;
+            let rect = card_handles.resting_rect;
+            let frame = NSRect::new(
+                NSPoint::new(
+                    rect.x + if lift { STACK_HOVER_LIFT_X } else { 0.0 },
+                    rect.y + if lift { STACK_HOVER_LIFT_Y } else { 0.0 },
+                ),
+                NSSize::new(rect.width, rect.height),
+            );
+            unsafe {
+                let animator: *mut AnyObject = msg_send![card, animator];
+                let _: () = msg_send![animator, setFrame: frame];
+            }
+        }
+    }
+}
+
+unsafe fn hovered_pid_at_event(
+    view: *mut objc2::runtime::AnyObject,
+    event: *mut objc2::runtime::AnyObject,
+) -> Option<i64> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSPoint;
+
+    let window: *mut AnyObject = msg_send![view, window];
+    if window.is_null() {
+        return None;
+    }
+    let content: *mut AnyObject = msg_send![window, contentView];
+    if content.is_null() {
+        return None;
+    }
+    let point: NSPoint = msg_send![event, locationInWindow];
+    let hit: *mut AnyObject = msg_send![content, hitTest: point];
+    let mut candidate = hit;
+    while !candidate.is_null() {
+        if let Some(pid) = CARD_VIEW_PIDS
+            .lock()
+            .unwrap()
+            .get(&(candidate as usize))
+            .copied()
+        {
+            return Some(pid);
+        }
+        candidate = msg_send![candidate, superview];
+    }
+    None
+}
+
+fn activate_target_window(target: ClickedTarget) {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+
+    let (Ok(pid), Ok(window_id)) = (
+        libc::pid_t::try_from(target.pid),
+        u32::try_from(target.window_id),
+    ) else {
+        return;
+    };
+    let _ = crate::input::skylight::set_front_process_persistently(pid, window_id);
+    let _ = crate::input::skylight::make_exact_window_key(pid, window_id);
+    if let Some(app) = unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) }
+    {
+        unsafe {
+            app.activateWithOptions(
+                NSApplicationActivationOptions::NSApplicationActivateAllWindows,
+            );
+        }
+    }
+}
+
+fn pointer_gesture_is_click(
+    start_mouse: objc2_foundation::NSPoint,
+    end_mouse: objc2_foundation::NSPoint,
+    start_window_origin: objc2_foundation::NSPoint,
+    end_window_origin: objc2_foundation::NSPoint,
+) -> bool {
+    let pointer_distance = (end_mouse.x - start_mouse.x).hypot(end_mouse.y - start_mouse.y);
+    let window_distance = (end_window_origin.x - start_window_origin.x)
+        .hypot(end_window_origin.y - start_window_origin.y);
+    pointer_distance < CLICK_DRAG_THRESHOLD && window_distance < CLICK_DRAG_THRESHOLD
+}
+
+unsafe extern "C" fn promote_clicked_app_cb(ctx: *mut c_void) {
+    let target = *Box::from_raw(ctx as *mut ClickedTarget);
+    let snapshot = {
+        let mut model = VIEW_MODEL.lock().unwrap();
+        let Some(model) = model.as_mut() else {
+            return;
+        };
+        model.promote_app(target.pid).then(|| {
+            model
+                .ordered_frames()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    };
+    HOVERED_APP.lock().unwrap().take();
+    if let Some(snapshot) = snapshot {
+        render_snapshot(&snapshot);
     }
 }
 
 extern "C" fn card_mouse_entered(
     view: *mut objc2::runtime::AnyObject,
     _selector: objc2::runtime::Sel,
-    _event: *mut objc2::runtime::AnyObject,
+    event: *mut objc2::runtime::AnyObject,
 ) {
-    if view.is_null() {
+    if view.is_null() || event.is_null() {
         return;
     }
-    let pid = CARD_VIEW_PIDS
-        .lock()
-        .unwrap()
-        .get(&(view as usize))
-        .copied();
-    if let Some(pid) = pid {
-        set_card_controls_hidden(pid, false);
-    }
+    let pid = unsafe { hovered_pid_at_event(view, event) };
+    set_hovered_app(pid);
+    unsafe { refresh_cursor_at_event(view, event) };
 }
 
 extern "C" fn card_mouse_exited(
     view: *mut objc2::runtime::AnyObject,
     _selector: objc2::runtime::Sel,
-    _event: *mut objc2::runtime::AnyObject,
+    event: *mut objc2::runtime::AnyObject,
 ) {
-    if view.is_null() {
+    if view.is_null() || event.is_null() {
         return;
     }
-    let pid = CARD_VIEW_PIDS
+    let pid = unsafe { hovered_pid_at_event(view, event) };
+    set_hovered_app(pid);
+    unsafe { refresh_cursor_at_event(view, event) };
+}
+
+unsafe fn refresh_cursor_at_event(
+    view: *mut objc2::runtime::AnyObject,
+    event: *mut objc2::runtime::AnyObject,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let window: *mut AnyObject = msg_send![view, window];
+    if window.is_null() {
+        return;
+    }
+    let location: objc2_foundation::NSPoint = msg_send![event, locationInWindow];
+    refresh_cursor_at_window_point(window, location);
+}
+
+unsafe fn refresh_cursor_at_window_point(
+    window: *mut objc2::runtime::AnyObject,
+    location: objc2_foundation::NSPoint,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let content: *mut AnyObject = msg_send![window, contentView];
+    if content.is_null() {
+        hide_custom_cursor();
+        return;
+    }
+    let hit: *mut AnyObject = msg_send![content, hitTest: location];
+    let mut candidate = hit;
+    while !candidate.is_null() {
+        if let Some(direction) = RESIZE_VIEW_DIRECTIONS
+            .lock()
+            .unwrap()
+            .get(&(candidate as usize))
+            .copied()
+        {
+            show_custom_cursor(window, location, resize_cursor_for_direction(direction));
+            return;
+        }
+        if let Some(pid) = CARD_VIEW_PIDS
+            .lock()
+            .unwrap()
+            .get(&(candidate as usize))
+            .copied()
+        {
+            let front_pid = VIEW_MODEL
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|model| model.ordered_frames().last().map(|frame| frame.target.pid));
+            let cursor: *mut AnyObject = if Some(pid) == front_pid {
+                msg_send![objc2::class!(NSCursor), pointingHandCursor]
+            } else {
+                std::ptr::null_mut()
+            };
+            if cursor.is_null() {
+                hide_custom_cursor();
+            } else {
+                show_custom_cursor(window, location, cursor);
+            }
+            return;
+        }
+        candidate = msg_send![candidate, superview];
+    }
+    hide_custom_cursor();
+}
+
+unsafe fn show_custom_cursor(
+    owner_window: *mut objc2::runtime::AnyObject,
+    location: objc2_foundation::NSPoint,
+    cursor: *mut objc2::runtime::AnyObject,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSPoint, NSRect};
+
+    if owner_window.is_null() || cursor.is_null() {
+        return;
+    }
+    let image_view = {
+        let guard = HANDLES.lock().unwrap();
+        let Some(handles) = guard.as_ref() else {
+            return;
+        };
+        handles.cursor_image_view as *mut AnyObject
+    };
+    if image_view.is_null() {
+        return;
+    }
+
+    let image: *mut AnyObject = msg_send![cursor, image];
+    if image.is_null() {
+        return;
+    }
+    let size: objc2_foundation::NSSize = msg_send![image, size];
+    let hotspot: NSPoint = msg_send![cursor, hotSpot];
+    let content: *mut AnyObject = msg_send![owner_window, contentView];
+    let bounds: NSRect = msg_send![content, bounds];
+    let origin_x = (location.x - hotspot.x).clamp(0.0, (bounds.size.width - size.width).max(0.0));
+    let origin_y = (location.y - (size.height - hotspot.y))
+        .clamp(0.0, (bounds.size.height - size.height).max(0.0));
+    let frame = NSRect::new(NSPoint::new(origin_x, origin_y), size);
+    let _: () = msg_send![image_view, setImage: image];
+    let _: () = msg_send![image_view, setFrame: frame];
+    let _: () = msg_send![image_view, setHidden: false];
+    SYSTEM_CURSOR_HIDDEN.store(true, Ordering::SeqCst);
+    if HIDDEN_CURSOR_CONNECTION.load(Ordering::SeqCst) == 0 {
+        if let Some(connection) = crate::input::skylight::hide_front_process_cursor() {
+            HIDDEN_CURSOR_CONNECTION.store(u64::from(connection), Ordering::SeqCst);
+        }
+    }
+    if !SYSTEM_CURSOR_HIDE_PENDING.swap(true, Ordering::SeqCst) {
+        // The foreground app may update its cursor after this inactive
+        // panel's mouseMoved callback. Reassert once that event has drained.
+        dispatch_to_main_after(Duration::from_millis(35), (), hide_system_cursor_cb);
+    }
+}
+
+unsafe extern "C" fn hide_system_cursor_cb(ctx: *mut c_void) {
+    drop(Box::from_raw(ctx as *mut ()));
+    SYSTEM_CURSOR_HIDE_PENDING.store(false, Ordering::SeqCst);
+    if SYSTEM_CURSOR_HIDDEN.load(Ordering::SeqCst) {
+        let previous = HIDDEN_CURSOR_CONNECTION.swap(0, Ordering::SeqCst) as u32;
+        if previous != 0 {
+            crate::input::skylight::show_cursor_for_connection(previous);
+        }
+        if let Some(connection) = crate::input::skylight::hide_front_process_cursor() {
+            HIDDEN_CURSOR_CONNECTION.store(u64::from(connection), Ordering::SeqCst);
+        }
+    }
+}
+
+fn hide_custom_cursor() {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let image_view = HANDLES
         .lock()
         .unwrap()
-        .get(&(view as usize))
-        .copied();
-    if let Some(pid) = pid {
-        set_card_controls_hidden(pid, true);
+        .as_ref()
+        .map(|handles| handles.cursor_image_view)
+        .unwrap_or(0) as *mut AnyObject;
+    unsafe {
+        if !image_view.is_null() {
+            let _: () = msg_send![image_view, setHidden: true];
+        }
+        SYSTEM_CURSOR_HIDDEN.store(false, Ordering::SeqCst);
+        let connection = HIDDEN_CURSOR_CONNECTION.swap(0, Ordering::SeqCst) as u32;
+        if connection != 0 {
+            crate::input::skylight::show_cursor_for_connection(connection);
+        }
     }
 }
 
@@ -638,9 +975,50 @@ extern "C" fn card_mouse_down(
         return;
     }
     unsafe {
+        let pid = hovered_pid_at_event(view, event);
+        let (target, front_pid) = VIEW_MODEL
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|model| {
+                (
+                    pid.and_then(|pid| {
+                        model.frame_for_app(pid).map(|frame| ClickedTarget {
+                            pid,
+                            window_id: frame.target.window_id,
+                        })
+                    }),
+                    model.ordered_frames().last().map(|frame| frame.target.pid),
+                )
+            })
+            .unwrap_or((None, None));
+        if let Some(target) = target.filter(|target| Some(target.pid) != front_pid) {
+            dispatch_to_main(target, promote_clicked_app_cb);
+            return;
+        }
         let window: *mut AnyObject = msg_send![view, window];
         if !window.is_null() {
+            let start_mouse: objc2_foundation::NSPoint =
+                msg_send![objc2::class!(NSEvent), mouseLocation];
+            let start_frame: objc2_foundation::NSRect = msg_send![window, frame];
+            hide_custom_cursor();
             let _: () = msg_send![window, performWindowDragWithEvent: event];
+            let end_mouse: objc2_foundation::NSPoint =
+                msg_send![objc2::class!(NSEvent), mouseLocation];
+            let end_frame: objc2_foundation::NSRect = msg_send![window, frame];
+            if pointer_gesture_is_click(
+                start_mouse,
+                end_mouse,
+                start_frame.origin,
+                end_frame.origin,
+            ) {
+                if let Some(target) = target {
+                    activate_target_window(target);
+                }
+            }
+            let location: objc2_foundation::NSPoint =
+                msg_send![window, mouseLocationOutsideOfEventStream];
+            refresh_cursor_at_window_point(window, location);
         }
     }
 }
@@ -659,8 +1037,8 @@ fn pip_delegate_class() -> &'static objc2::runtime::AnyClass {
                 window_did_resize as extern "C" fn(_, _, _),
             );
             builder.add_method(
-                objc2::sel!(hideAppPreview:),
-                hide_app_preview as extern "C" fn(_, _, _),
+                objc2::sel!(minimizePip:),
+                minimize_pip as extern "C" fn(_, _, _),
             );
         }
         builder.register()
@@ -684,7 +1062,7 @@ extern "C" fn window_did_resize(
     unsafe { render_snapshot(&snapshot) };
 }
 
-extern "C" fn hide_app_preview(
+extern "C" fn minimize_pip(
     _delegate: *mut objc2::runtime::AnyObject,
     _selector: objc2::runtime::Sel,
     sender: *mut objc2::runtime::AnyObject,
@@ -692,23 +1070,16 @@ extern "C" fn hide_app_preview(
     if sender.is_null() {
         return;
     }
-    let pid: isize = unsafe { objc2::msg_send![sender, tag] };
-    let pid = pid as i64;
-    HIDDEN_APPS.lock().unwrap().insert(pid);
-    stop_live_capture_for(pid);
-    let snapshot = {
-        let mut model = VIEW_MODEL.lock().unwrap();
-        let Some(model) = model.as_mut() else {
-            return;
-        };
-        model.remove_app(pid);
-        model
-            .ordered_frames()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    unsafe { render_snapshot(&snapshot) };
+    HOVERED_APP.lock().unwrap().take();
+    hide_custom_cursor();
+    unsafe {
+        let window: *mut objc2::runtime::AnyObject = objc2::msg_send![sender, window];
+        if !window.is_null() {
+            let _: () = objc2::msg_send![window, orderOut: std::ptr::null_mut::<
+                objc2::runtime::AnyObject,
+            >()];
+        }
+    }
 }
 
 fn resize_hit_view_class() -> &'static objc2::runtime::AnyClass {
@@ -728,9 +1099,103 @@ fn resize_hit_view_class() -> &'static objc2::runtime::AnyClass {
                 objc2::sel!(mouseDown:),
                 resize_mouse_down as extern "C" fn(_, _, _),
             );
+            builder.add_method(
+                objc2::sel!(mouseDownCanMoveWindow),
+                mouse_down_cannot_move_window as extern "C" fn(_, _) -> objc2::runtime::Bool,
+            );
+            builder.add_method(
+                objc2::sel!(mouseEntered:),
+                refresh_resize_cursor as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(mouseMoved:),
+                refresh_resize_cursor as extern "C" fn(_, _, _),
+            );
         }
         builder.register()
     })
+}
+
+extern "C" fn refresh_resize_cursor(
+    view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    event: *mut objc2::runtime::AnyObject,
+) {
+    if view.is_null() || event.is_null() {
+        return;
+    }
+    unsafe {
+        let window: *mut objc2::runtime::AnyObject = objc2::msg_send![view, window];
+        if window.is_null() {
+            return;
+        }
+        let direction = RESIZE_VIEW_DIRECTIONS
+            .lock()
+            .unwrap()
+            .get(&(view as usize))
+            .copied()
+            .unwrap_or(0);
+        let location: objc2_foundation::NSPoint = objc2::msg_send![event, locationInWindow];
+        show_custom_cursor(window, location, resize_cursor_for_direction(direction));
+    }
+}
+
+extern "C" fn mouse_down_cannot_move_window(
+    _view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::NO
+}
+
+unsafe fn resize_cursor_for_direction(direction: isize) -> *mut objc2::runtime::AnyObject {
+    use objc2::msg_send;
+
+    let cursor_class = objc2::class!(NSCursor);
+    let is_horizontal = direction & (RESIZE_LEFT | RESIZE_RIGHT) != 0;
+    let is_vertical = direction & (RESIZE_TOP | RESIZE_BOTTOM) != 0;
+    if is_horizontal && is_vertical {
+        return if direction == (RESIZE_LEFT | RESIZE_TOP)
+            || direction == (RESIZE_RIGHT | RESIZE_BOTTOM)
+        {
+            msg_send![cursor_class, _windowResizeNorthWestSouthEastCursor]
+        } else {
+            msg_send![cursor_class, _windowResizeNorthEastSouthWestCursor]
+        };
+    }
+    let modern_selector = objc2::sel!(frameResizeCursorFromPosition:inDirections:);
+    let supports_frame_cursor: objc2::runtime::Bool =
+        msg_send![cursor_class, respondsToSelector: modern_selector];
+    if supports_frame_cursor.as_bool() {
+        let mut position = 0u64;
+        if direction & RESIZE_TOP != 0 {
+            position |= 1;
+        }
+        if direction & RESIZE_LEFT != 0 {
+            position |= 2;
+        }
+        if direction & RESIZE_BOTTOM != 0 {
+            position |= 4;
+        }
+        if direction & RESIZE_RIGHT != 0 {
+            position |= 8;
+        }
+        return msg_send![
+            cursor_class,
+            frameResizeCursorFromPosition: position
+            inDirections: 3u64
+        ];
+    }
+    if direction & (RESIZE_LEFT | RESIZE_RIGHT) != 0
+        && direction & (RESIZE_TOP | RESIZE_BOTTOM) == 0
+    {
+        msg_send![cursor_class, resizeLeftRightCursor]
+    } else if direction & (RESIZE_TOP | RESIZE_BOTTOM) != 0
+        && direction & (RESIZE_LEFT | RESIZE_RIGHT) == 0
+    {
+        msg_send![cursor_class, resizeUpDownCursor]
+    } else {
+        msg_send![cursor_class, crosshairCursor]
+    }
 }
 
 fn resized_window_frame(
@@ -818,6 +1283,8 @@ extern "C" fn resize_mouse_down(
                 minimum,
             );
             let _: () = msg_send![window, setFrame: frame display: true];
+            let location: objc2_foundation::NSPoint = msg_send![next, locationInWindow];
+            show_custom_cursor(window, location, resize_cursor_for_direction(direction));
         }
     }
 }
@@ -830,6 +1297,7 @@ unsafe fn add_resize_hit_view(
 ) {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     let allocated: *mut AnyObject = msg_send![resize_hit_view_class(), alloc];
     let view: *mut AnyObject = msg_send![allocated, initWithFrame: frame];
@@ -838,79 +1306,84 @@ unsafe fn add_resize_hit_view(
         .unwrap()
         .insert(view as usize, direction);
     let _: () = msg_send![view, setAutoresizingMask: autoresizing_mask];
-    let _: () = msg_send![parent, addSubview: view];
+    let _: () = msg_send![view, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![view, layer];
+    set_layer_background(layer, color(0.0, 0.0, 0.0, 0.001));
+    let _: () = msg_send![
+        parent,
+        addSubview: view
+        positioned: 1i64
+        relativeTo: std::ptr::null_mut::<AnyObject>()
+    ];
+    let tracking_options: u64 = 0x1 | 0x2 | 0x80 | 0x200;
+    let tracking_allocated: *mut AnyObject = msg_send![objc2::class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking_allocated,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
+        options: tracking_options
+        owner: view
+        userInfo: std::ptr::null_mut::<AnyObject>()
+    ];
+    let _: () = msg_send![view, addTrackingArea: tracking];
+    let _: () = msg_send![tracking, release];
 }
 
 unsafe fn install_resize_hit_views(
-    content_view: *mut objc2::runtime::AnyObject,
+    canvas: *mut objc2::runtime::AnyObject,
     bounds: objc2_foundation::NSRect,
+    layout: &[CardRect],
 ) {
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
+    let (Some(back), Some(front)) = (layout.first(), layout.last()) else {
+        return;
+    };
     let edge = RESIZE_HIT_INSET;
-    let width = bounds.size.width;
-    let height = bounds.size.height;
+    let half = edge / 2.0;
+    let clamp_x = |x: f64| x.clamp(0.0, (bounds.size.width - edge).max(0.0));
+    let clamp_y = |y: f64| y.clamp(0.0, (bounds.size.height - edge).max(0.0));
     add_resize_hit_view(
-        content_view,
+        canvas,
         NSRect::new(
-            NSPoint::new(edge, height - edge),
-            NSSize::new(width - 2.0 * edge, edge),
+            NSPoint::new(clamp_x(front.x - half), clamp_y(front.y - half)),
+            NSSize::new(edge, edge),
         ),
-        RESIZE_TOP,
-        10,
+        RESIZE_LEFT | RESIZE_BOTTOM,
+        0,
     );
     add_resize_hit_view(
-        content_view,
+        canvas,
         NSRect::new(
-            NSPoint::new(edge, 0.0),
-            NSSize::new(width - 2.0 * edge, edge),
+            NSPoint::new(
+                clamp_x(front.x + front.width - half),
+                clamp_y(front.y - half),
+            ),
+            NSSize::new(edge, edge),
         ),
-        RESIZE_BOTTOM,
-        10,
+        RESIZE_RIGHT | RESIZE_BOTTOM,
+        0,
     );
     add_resize_hit_view(
-        content_view,
+        canvas,
         NSRect::new(
-            NSPoint::new(0.0, edge),
-            NSSize::new(edge, height - 2.0 * edge),
+            NSPoint::new(clamp_x(back.x - half), clamp_y(back.y + back.height - half)),
+            NSSize::new(edge, edge),
         ),
-        RESIZE_LEFT,
-        20,
+        RESIZE_LEFT | RESIZE_TOP,
+        0,
     );
     add_resize_hit_view(
-        content_view,
+        canvas,
         NSRect::new(
-            NSPoint::new(width - edge, edge),
-            NSSize::new(edge, height - 2.0 * edge),
+            NSPoint::new(
+                clamp_x(back.x + back.width - half),
+                clamp_y(back.y + back.height - half),
+            ),
+            NSSize::new(edge, edge),
         ),
-        RESIZE_RIGHT,
-        17,
+        RESIZE_RIGHT | RESIZE_TOP,
+        0,
     );
-    for (origin, direction, mask) in [
-        (NSPoint::new(0.0, 0.0), RESIZE_LEFT | RESIZE_BOTTOM, 4),
-        (
-            NSPoint::new(width - edge, 0.0),
-            RESIZE_RIGHT | RESIZE_BOTTOM,
-            1,
-        ),
-        (
-            NSPoint::new(0.0, height - edge),
-            RESIZE_LEFT | RESIZE_TOP,
-            8,
-        ),
-        (
-            NSPoint::new(width - edge, height - edge),
-            RESIZE_RIGHT | RESIZE_TOP,
-            2,
-        ),
-    ] {
-        add_resize_hit_view(
-            content_view,
-            NSRect::new(origin, NSSize::new(edge, edge)),
-            direction,
-            mask,
-        );
-    }
 }
 
 unsafe fn ns_string(value: &str) -> *mut objc2::runtime::AnyObject {
@@ -978,32 +1451,85 @@ fn card_layout(width: f64, height: f64, count: usize) -> Vec<CardRect> {
     if count == 0 {
         return Vec::new();
     }
-    let columns = match count {
-        1 => 1,
-        2 | 3 | 4 => 2,
-        _ => 3,
+    let visible_count = count.min(MAX_VISIBLE_PIP_CARDS);
+    let depth = visible_count.saturating_sub(1) as f64;
+    let usable_width = (width - 2.0 * STACK_INSET - STACK_HOVER_LIFT_X).max(1.0);
+    let usable_height = (height - 2.0 * STACK_INSET - STACK_HOVER_LIFT_Y).max(1.0);
+    let offset_x = if depth == 0.0 {
+        0.0
+    } else {
+        STACK_CARD_OFFSET_X.min((usable_width * 0.24) / depth)
     };
-    let rows = count.div_ceil(columns);
-    let usable_width = (width - 2.0 * STACK_INSET - CARD_GAP * (columns - 1) as f64).max(1.0);
-    let usable_height = (height - 2.0 * STACK_INSET - CARD_GAP * (rows - 1) as f64).max(1.0);
-    let card_width = usable_width / columns as f64;
-    let card_height = usable_height / rows as f64;
+    let offset_y = if depth == 0.0 {
+        0.0
+    } else {
+        STACK_CARD_OFFSET_Y.min(((usable_height - STACK_MIN_CARD_HEIGHT).max(0.0)) / depth)
+    };
+    let card_width = (usable_width - offset_x * depth).max(1.0);
+    let card_height = (usable_height - offset_y * depth).max(1.0);
 
-    (0..count)
+    // Older cards sit closely behind and peek out above/right of the newest
+    // card. Clicking a visible sliver promotes that app into the front slot.
+    // AppKit paints later subviews on top, so the final published app becomes
+    // the front card while every earlier app keeps a visible title strip.
+    (0..visible_count)
         .map(|index| {
-            let column = index % columns;
-            let row_from_top = index / columns;
+            let depth_from_front = (visible_count - 1 - index) as f64;
             CardRect {
-                x: STACK_INSET + column as f64 * (card_width + CARD_GAP),
-                y: height
-                    - STACK_INSET
-                    - (row_from_top + 1) as f64 * card_height
-                    - row_from_top as f64 * CARD_GAP,
+                x: STACK_INSET + depth_from_front * offset_x,
+                y: STACK_INSET + depth_from_front * offset_y,
                 width: card_width,
                 height: card_height,
             }
         })
         .collect()
+}
+
+fn initial_pip_size(screen_width: f64, screen_height: f64, geometry: PipGeometry) -> (f64, f64) {
+    let default_geometry = PipGeometry::default();
+    let use_responsive_default = geometry.width == default_geometry.width
+        && geometry.height == default_geometry.height
+        && geometry.x.is_none()
+        && geometry.y.is_none();
+    if use_responsive_default {
+        return (
+            (screen_width * DEFAULT_SCREEN_FRACTION)
+                .round()
+                .clamp(MINIMUM_PIP_WIDTH, MAXIMUM_DEFAULT_PIP_WIDTH),
+            (screen_height * DEFAULT_SCREEN_FRACTION)
+                .round()
+                .clamp(MINIMUM_PIP_HEIGHT, MAXIMUM_DEFAULT_PIP_HEIGHT),
+        );
+    }
+    (
+        (geometry.width as f64).max(MINIMUM_PIP_WIDTH),
+        (geometry.height as f64).max(MINIMUM_PIP_HEIGHT),
+    )
+}
+
+fn aspect_fill_rect(
+    container_width: f64,
+    container_height: f64,
+    image_width: f64,
+    image_height: f64,
+) -> CardRect {
+    if image_width <= 0.0 || image_height <= 0.0 {
+        return CardRect {
+            x: 0.0,
+            y: 0.0,
+            width: container_width,
+            height: container_height,
+        };
+    }
+    let scale = (container_width / image_width).max(container_height / image_height);
+    let width = image_width * scale;
+    let height = image_height * scale;
+    CardRect {
+        x: (container_width - width) / 2.0,
+        y: (container_height - height) / 2.0,
+        width,
+        height,
+    }
 }
 
 unsafe fn install_tracking_area(card: *mut objc2::runtime::AnyObject) {
@@ -1046,15 +1572,26 @@ unsafe fn render_card(
         .insert(card as usize, frame.target.pid);
     let _: () = msg_send![card, setWantsLayer: true];
     let card_layer: *mut AnyObject = msg_send![card, layer];
-    let _: () = msg_send![card_layer, setCornerRadius: CARD_RADIUS];
-    let _: () = msg_send![card_layer, setMasksToBounds: true];
-    let _: () = msg_send![card_layer, setBorderWidth: 0.75_f64];
-    let border = color(1.0, 1.0, 1.0, 0.28);
-    let border_cg: *mut CGColor = msg_send![border, CGColor];
-    let _: () = msg_send![card_layer, setBorderColor: border_cg];
-    set_layer_background(card_layer, color(0.02, 0.025, 0.035, 0.72));
+    let shadow = color(0.0, 0.0, 0.0, 0.72);
+    let shadow_cg: *mut CGColor = msg_send![shadow, CGColor];
+    let _: () = msg_send![card_layer, setShadowColor: shadow_cg];
+    let _: () = msg_send![card_layer, setShadowOpacity: 0.34_f32];
+    let _: () = msg_send![card_layer, setShadowRadius: 10.0_f64];
+    let _: () = msg_send![card_layer, setShadowOffset: NSSize::new(0.0, -3.0)];
 
     let bounds = NSRect::new(NSPoint::new(0.0, 0.0), card_frame.size);
+    let clip: *mut AnyObject = {
+        let allocated: *mut AnyObject = msg_send![objc2::class!(NSView), alloc];
+        msg_send![allocated, initWithFrame: bounds]
+    };
+    let _: () = msg_send![clip, setAutoresizingMask: 18u64];
+    let _: () = msg_send![clip, setWantsLayer: true];
+    let clip_layer: *mut AnyObject = msg_send![clip, layer];
+    let _: () = msg_send![clip_layer, setCornerRadius: CARD_RADIUS];
+    let _: () = msg_send![clip_layer, setMasksToBounds: true];
+    set_layer_background(clip_layer, color(0.0, 0.0, 0.0, 0.0));
+    let _: () = msg_send![card, addSubview: clip];
+
     let glass: *mut AnyObject = {
         let allocated: *mut AnyObject = msg_send![objc2::class!(NSVisualEffectView), alloc];
         msg_send![allocated, initWithFrame: bounds]
@@ -1064,59 +1601,46 @@ unsafe fn render_card(
     let _: () = msg_send![glass, setBlendingMode: 1i64];
     let _: () = msg_send![glass, setState: 1i64];
     let _: () = msg_send![glass, setAppearance: vibrant_dark_appearance()];
-    let _: () = msg_send![card, addSubview: glass];
+    let _: () = msg_send![clip, addSubview: glass];
+
+    let image = image_from_png(&frame.png_bytes);
+    let image_rect = if image.is_null() {
+        CardRect {
+            x: 0.0,
+            y: 0.0,
+            width: rect.width,
+            height: rect.height,
+        }
+    } else {
+        let image_size: NSSize = msg_send![image, size];
+        aspect_fill_rect(rect.width, rect.height, image_size.width, image_size.height)
+    };
 
     let image_view: *mut AnyObject = {
         let allocated: *mut AnyObject = msg_send![objc2::class!(NSImageView), alloc];
-        msg_send![allocated, initWithFrame: bounds]
+        msg_send![allocated, initWithFrame: NSRect::new(
+            NSPoint::new(image_rect.x, image_rect.y),
+            NSSize::new(image_rect.width, image_rect.height),
+        )]
     };
-    let _: () = msg_send![image_view, setAutoresizingMask: 18u64];
     let _: () = msg_send![image_view, setImageScaling: 3u64];
-    let image = image_from_png(&frame.png_bytes);
     if !image.is_null() {
         let _: () = msg_send![image_view, setImage: image];
         let _: () = msg_send![image, release];
     }
-    let _: () = msg_send![card, addSubview: image_view];
-
-    let title_width = (rect.width - CONTROL_SIZE - 24.0).max(40.0);
-    let title_glass_frame = NSRect::new(
-        NSPoint::new(7.0, rect.height - TITLE_HEIGHT - 7.0),
-        NSSize::new(title_width, TITLE_HEIGHT),
-    );
-    let title_glass: *mut AnyObject = {
-        let allocated: *mut AnyObject = msg_send![objc2::class!(NSVisualEffectView), alloc];
-        msg_send![allocated, initWithFrame: title_glass_frame]
-    };
-    let _: () = msg_send![title_glass, setMaterial: 13i64];
-    let _: () = msg_send![title_glass, setBlendingMode: 0i64];
-    let _: () = msg_send![title_glass, setState: 1i64];
-    let _: () = msg_send![title_glass, setAppearance: vibrant_dark_appearance()];
-    let _: () = msg_send![title_glass, setWantsLayer: true];
-    let title_layer: *mut AnyObject = msg_send![title_glass, layer];
-    let _: () = msg_send![title_layer, setCornerRadius: TITLE_HEIGHT / 2.0];
-    let _: () = msg_send![title_layer, setMasksToBounds: true];
-
-    let title = ns_string(&frame.target.app_name);
-    let label: *mut AnyObject = msg_send![objc2::class!(NSTextField), labelWithString: title];
-    let _: () = msg_send![label, setFrame: NSRect::new(
-        NSPoint::new(10.0, 4.0),
-        NSSize::new((title_width - 20.0).max(20.0), TITLE_HEIGHT - 8.0),
-    )];
-    let font: *mut AnyObject =
-        msg_send![objc2::class!(NSFont), systemFontOfSize: 11.0_f64 weight: 0.35_f64];
-    let _: () = msg_send![label, setFont: font];
-    let _: () = msg_send![label, setTextColor: color(1.0, 1.0, 1.0, 0.94)];
-    let _: () = msg_send![label, setLineBreakMode: 4u64];
-    let _: () = msg_send![title_glass, addSubview: label];
-    let _: () = msg_send![card, addSubview: title_glass];
+    let _: () = msg_send![clip, addSubview: image_view];
 
     // A transparent surface above the preview makes the whole card draggable.
-    // The hover control is added after it and therefore remains clickable.
+    // The hover chrome is added after it and therefore remains clickable.
     let drag_allocated: *mut AnyObject = msg_send![pip_card_view_class(), alloc];
     let drag_surface: *mut AnyObject = msg_send![drag_allocated, initWithFrame: bounds];
+    CARD_VIEW_PIDS
+        .lock()
+        .unwrap()
+        .insert(drag_surface as usize, frame.target.pid);
     let _: () = msg_send![drag_surface, setAutoresizingMask: 18u64];
-    let _: () = msg_send![card, addSubview: drag_surface];
+    let _: () = msg_send![clip, addSubview: drag_surface];
+    install_tracking_area(drag_surface);
 
     let controls_frame = NSRect::new(
         NSPoint::new(
@@ -1146,24 +1670,28 @@ unsafe fn render_card(
         )]
     };
     let _: () = msg_send![button, setBordered: false];
-    let _: () = msg_send![button, setTitle: ns_string("×")];
-    let button_font: *mut AnyObject =
-        msg_send![objc2::class!(NSFont), systemFontOfSize: 17.0_f64 weight: 0.2_f64];
-    let _: () = msg_send![button, setFont: button_font];
+    let symbol: *mut AnyObject = msg_send![
+        objc2::class!(NSImage),
+        imageWithSystemSymbolName: ns_string("minus")
+        accessibilityDescription: ns_string("Minimize PiP")
+    ];
+    if !symbol.is_null() {
+        let _: () = msg_send![button, setImage: symbol];
+    }
     let _: () = msg_send![button, setContentTintColor: color(1.0, 1.0, 1.0, 0.96)];
-    let _: () = msg_send![button, setToolTip: ns_string("Hide this app preview")];
-    let _: () = msg_send![button, setTag: frame.target.pid as isize];
+    let _: () = msg_send![button, setToolTip: ns_string("Minimize PiP")];
     let _: () = msg_send![button, setTarget: delegate];
-    let _: () = msg_send![button, setAction: objc2::sel!(hideAppPreview:)];
+    let _: () = msg_send![button, setAction: objc2::sel!(minimizePip:)];
     let _: () = msg_send![controls, addSubview: button];
     let _: () = msg_send![controls, setHidden: true];
-    let _: () = msg_send![card, addSubview: controls];
+    let _: () = msg_send![clip, addSubview: controls];
 
-    install_tracking_area(card);
     let _: () = msg_send![canvas, addSubview: card];
     NativeCardHandles {
+        card: card as usize,
         image_view: image_view as usize,
         controls: controls as usize,
+        resting_rect: rect,
     }
 }
 
@@ -1185,19 +1713,28 @@ unsafe fn render_snapshot(snapshot: &[PipFrame]) {
 
     CARD_HANDLES.lock().unwrap().clear();
     CARD_VIEW_PIDS.lock().unwrap().clear();
+    RESIZE_VIEW_DIRECTIONS.lock().unwrap().clear();
     let empty: *mut AnyObject = msg_send![objc2::class!(NSArray), array];
     let _: () = msg_send![canvas, setSubviews: empty];
     let bounds: objc2_foundation::NSRect = msg_send![canvas, bounds];
     let layout = card_layout(bounds.size.width, bounds.size.height, snapshot.len());
-    for (frame, rect) in snapshot.iter().zip(layout) {
+    for (frame, rect) in snapshot.iter().zip(layout.iter().copied()) {
         let handles = render_card(canvas, delegate, frame, rect);
         CARD_HANDLES
             .lock()
             .unwrap()
             .insert(frame.target.pid, handles);
     }
+    install_resize_hit_views(canvas, bounds, &layout);
+    let mouse_location: objc2_foundation::NSPoint =
+        msg_send![window, mouseLocationOutsideOfEventStream];
+    refresh_cursor_at_window_point(window, mouse_location);
+
+    let hovered_pid = HOVERED_APP.lock().unwrap().take();
+    set_hovered_app(hovered_pid);
 
     if snapshot.is_empty() {
+        hide_custom_cursor();
         let _: () = msg_send![window, orderOut: std::ptr::null_mut::<AnyObject>()];
     } else {
         let _: () = msg_send![window, orderFrontRegardless];
@@ -1228,9 +1765,12 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
         return;
     }
     let screen_frame: NSRect = msg_send![screen, frame];
-    let minimum = NSSize::new(320.0, 200.0);
-    let width = (cfg.geometry.width as f64).max(minimum.width);
-    let height = (cfg.geometry.height as f64).max(minimum.height);
+    let minimum = NSSize::new(MINIMUM_PIP_WIDTH, MINIMUM_PIP_HEIGHT);
+    let (width, height) = initial_pip_size(
+        screen_frame.size.width,
+        screen_frame.size.height,
+        cfg.geometry,
+    );
     let inset = 24.0;
     let (top_left_x, top_left_y) = match (cfg.geometry.x, cfg.geometry.y) {
         (Some(x), Some(y)) => (x as f64, y as f64),
@@ -1244,7 +1784,7 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
 
     // Borderless, non-activating panel. Movement and resizing are handled by
     // custom hit views, so no standard traffic-light controls cover previews.
-    let style_mask: u64 = 1 << 7;
+    let style_mask: u64 = (1 << 7) | (1 << 3);
     let window: *mut AnyObject = {
         let allocated: *mut AnyObject = msg_send![objc2::class!(NSPanel), alloc];
         msg_send![
@@ -1262,19 +1802,42 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
     let clear: *mut AnyObject = msg_send![objc2::class!(NSColor), clearColor];
     let _: () = msg_send![window, setBackgroundColor: clear];
     let _: () = msg_send![window, setOpaque: false];
-    let _: () = msg_send![window, setHasShadow: true];
+    let _: () = msg_send![window, setHasShadow: false];
     let _: () = msg_send![window, setIgnoresMouseEvents: false];
     let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
+    // NSPanel is deliberately non-activating. Opt into cursor-rect handling
+    // while another application remains active, otherwise AppKit delivers the
+    // hover callbacks but leaves the visible system cursor unchanged.
+    let _: () = msg_send![window, setAllowsCursorRectsWhenInactive: true];
+    let _: () = msg_send![window, _setAllowEdgeResizingCursorsInInactiveApp: true];
+    let _: () = msg_send![window, _setWantsMouseMoveEventsInBackground: true];
     let _: () = msg_send![window, setBecomesKeyOnlyIfNeeded: true];
-    let _: () = msg_send![window, setMovableByWindowBackground: true];
+    // Cards explicitly call performWindowDragWithEvent. Keeping the window's
+    // implicit background dragging off lets the edge/corner resize hit views
+    // receive mouseDown first instead of moving the whole panel.
+    let _: () = msg_send![window, setMovableByWindowBackground: false];
     let _: () = msg_send![window, setFloatingPanel: false];
     // Match Codex's ordinary window level instead of pinning the preview above
-    // every application. 0x108 = transient + full-screen auxiliary.
-    let _: () = msg_send![window, setLevel: 0i64];
+    // every application. The opt-in override is only for local UI demos where
+    // the headless daemon has no foreground app capable of owning the panel.
+    let window_level = if std::env::var_os("CUA_PIP_DEMO_FLOATING").is_some() {
+        3i64
+    } else {
+        0i64
+    };
+    let _: () = msg_send![window, setLevel: window_level];
     let _: () = msg_send![window, setCollectionBehavior: 0x108u64];
     let _: () = msg_send![window, setReleasedWhenClosed: false];
     let _: () = msg_send![window, setHidesOnDeactivate: false];
     let _: () = msg_send![window, setMinSize: minimum];
+
+    let cursor_image_view: *mut AnyObject = {
+        let allocated: *mut AnyObject = msg_send![pip_cursor_image_view_class(), alloc];
+        msg_send![allocated, initWithFrame: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(1.0, 1.0),
+        )]
+    };
 
     let content_view: *mut AnyObject = msg_send![window, contentView];
     let _: () = msg_send![content_view, setWantsLayer: true];
@@ -1288,7 +1851,13 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
     };
     let _: () = msg_send![canvas, setAutoresizingMask: 18u64];
     let _: () = msg_send![content_view, addSubview: canvas];
-    install_resize_hit_views(content_view, bounds);
+    let _: () = msg_send![cursor_image_view, setHidden: true];
+    let _: () = msg_send![
+        content_view,
+        addSubview: cursor_image_view
+        positioned: 1i64
+        relativeTo: std::ptr::null_mut::<AnyObject>()
+    ];
 
     let delegate = pip_delegate_instance();
     let _: () = msg_send![window, setDelegate: delegate];
@@ -1296,6 +1865,7 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
         window: window as usize,
         canvas: canvas as usize,
         delegate: delegate as usize,
+        cursor_image_view: cursor_image_view as usize,
     });
     *VIEW_MODEL.lock().unwrap() = Some(PipViewModel::new(MAX_VISIBLE_PIP_CARDS));
 
@@ -1312,11 +1882,13 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
 
+    hide_custom_cursor();
     CARD_HANDLES.lock().unwrap().clear();
     CARD_VIEW_PIDS.lock().unwrap().clear();
     RESIZE_VIEW_DIRECTIONS.lock().unwrap().clear();
     VIEW_MODEL.lock().unwrap().take();
     HIDDEN_APPS.lock().unwrap().clear();
+    HOVERED_APP.lock().unwrap().take();
     if let Some(handles) = HANDLES.lock().unwrap().take() {
         let window = handles.window as *mut AnyObject;
         let _: () = msg_send![window, setDelegate: std::ptr::null_mut::<AnyObject>()];
@@ -1360,19 +1932,53 @@ mod tests {
     }
 
     #[test]
-    fn grid_gives_every_app_its_own_non_overlapping_card() {
+    fn cards_form_a_bounded_vertical_stack() {
         let cards = card_layout(620.0, 420.0, 5);
         assert_eq!(cards.len(), 5);
-        for (index, left) in cards.iter().enumerate() {
-            assert!(left.width > 0.0 && left.height > 0.0);
-            for right in cards.iter().skip(index + 1) {
-                let overlaps = left.x < right.x + right.width
-                    && left.x + left.width > right.x
-                    && left.y < right.y + right.height
-                    && left.y + left.height > right.y;
-                assert!(!overlaps, "cards {left:?} and {right:?} overlap");
-            }
+        for card in &cards {
+            assert!(card.width > 0.0 && card.height >= STACK_MIN_CARD_HEIGHT);
+            assert!(card.x >= STACK_INSET && card.y >= STACK_INSET);
+            assert!(card.x + card.width <= 620.0 - STACK_INSET + f64::EPSILON);
+            assert!(card.y + card.height <= 420.0 - STACK_INSET + f64::EPSILON);
         }
+        for pair in cards.windows(2) {
+            let behind = pair[0];
+            let in_front = pair[1];
+            assert!(behind.x > in_front.x);
+            assert!(behind.y > in_front.y);
+            assert!(behind.y < in_front.y + in_front.height);
+        }
+    }
+
+    #[test]
+    fn aspect_fill_crops_instead_of_letterboxing() {
+        let rect = aspect_fill_rect(580.0, 332.0, 860.0, 535.0);
+        assert!(rect.width >= 580.0);
+        assert!(rect.height >= 332.0);
+        assert!(rect.x <= 0.0);
+        assert!(rect.y <= 0.0);
+        assert!((rect.width / rect.height - 860.0 / 535.0).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn default_window_size_tracks_screen_size_and_explicit_geometry_wins() {
+        assert_eq!(
+            initial_pip_size(1728.0, 1000.0, PipGeometry::default()),
+            (346.0, 200.0)
+        );
+        assert_eq!(
+            initial_pip_size(
+                1728.0,
+                1000.0,
+                PipGeometry {
+                    width: 500,
+                    height: 360,
+                    x: Some(24),
+                    y: Some(24),
+                }
+            ),
+            (500.0, 360.0)
+        );
     }
 
     #[test]
@@ -1390,5 +1996,33 @@ mod tests {
         assert_eq!(resized.size.width, 360.0);
         assert_eq!(resized.origin.y, 100.0);
         assert_eq!(resized.size.height, 290.0);
+    }
+
+    #[test]
+    fn activating_a_card_requires_a_stationary_pointer_and_window() {
+        use objc2_foundation::NSPoint;
+
+        let origin = NSPoint::new(100.0, 100.0);
+        assert!(pointer_gesture_is_click(
+            NSPoint::new(20.0, 30.0),
+            NSPoint::new(21.0, 31.0),
+            origin,
+            origin,
+        ));
+        assert!(!pointer_gesture_is_click(
+            NSPoint::new(20.0, 30.0),
+            NSPoint::new(40.0, 50.0),
+            origin,
+            NSPoint::new(120.0, 120.0),
+        ));
+        // AppKit's global pointer sample can occasionally be stale after
+        // performWindowDragWithEvent:, so window movement alone must veto
+        // activation as well.
+        assert!(!pointer_gesture_is_click(
+            NSPoint::new(20.0, 30.0),
+            NSPoint::new(20.0, 30.0),
+            origin,
+            NSPoint::new(140.0, 100.0),
+        ));
     }
 }
