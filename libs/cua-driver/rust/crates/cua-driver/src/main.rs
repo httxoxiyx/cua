@@ -256,15 +256,33 @@ fn maybe_init_pip() {
                 StdMutex<Option<Box<dyn pip_preview::PipBackend>>>,
             > = std::sync::OnceLock::new();
             let _ = BACKEND.set(StdMutex::new(Some(backend)));
-            cua_driver_core::pip_hook::set_pip_push_fn(|frame| {
+            cua_driver_core::pip_hook::set_pip_event_fn(|event| {
                 if let Some(slot) = BACKEND.get() {
                     if let Some(b) = slot.lock().unwrap().as_ref() {
-                        b.push_frame(pip_preview::PipFrame {
-                            png_bytes: frame.png_bytes,
-                            timestamp_ms: frame.timestamp_ms,
-                        });
+                        match event {
+                            cua_driver_core::pip_hook::PipHookEvent::Upsert(frame) => {
+                                b.push_frame(pip_preview::PipFrame {
+                                    target: pip_preview::PipTarget {
+                                        pid: frame.target.pid,
+                                        window_id: frame.target.window_id,
+                                        app_name: String::new(),
+                                        window_title: None,
+                                    },
+                                    png_bytes: frame.png_bytes,
+                                    timestamp_ms: frame.timestamp_ms,
+                                });
+                            }
+                            cua_driver_core::pip_hook::PipHookEvent::SetInputPassthrough {
+                                passthrough,
+                            } => {
+                                return b
+                                    .set_input_passthrough(passthrough)
+                                    .map_err(|error| error.to_string());
+                            }
+                        }
                     }
                 }
+                Ok(())
             });
             eprintln!(
                 "⚗️  PiP preview enabled (experimental — macOS only today; \

@@ -1,66 +1,22 @@
-//! macOS picture-in-picture preview window.
+//! Native macOS Picture-in-Picture stack for Computer Use.
 //!
-//! Floating NSWindow with an NSImageView showing a low-frame-rate live
-//! preview of the main display. The preview window itself is excluded
-//! from ScreenCaptureKit so it never produces a recursive mirror.
-//!
-//! ## Threading model
-//!
-//! Mirrors `cursor/overlay.rs`:
-//!
-//! - The MCP/tokio server runs on a background thread.
-//! - AppKit MUST run on the main thread, which `cua-driver/src/main.rs`
-//!   parks in `NSApplication.run()` for the cursor overlay.
-//! - A ScreenCaptureKit stream runs on its own callback queue and sends
-//!   retained `CGImage`s to the AppKit main queue via `dispatch_async_f`.
-//! - At most one frame may be waiting for AppKit. Newer frames are dropped
-//!   while that slot is occupied so a busy main thread cannot accumulate
-//!   an unbounded queue.
-//! - `push_frame()` remains as a post-action PNG fallback when live capture
-//!   cannot start.
-//!
-//! ## Window properties
-//!
-//! - Standard titled, closable, miniaturizable, resizable window chrome.
-//! - Default collection behavior, so the preview stays on the Space where the
-//!   user opened it instead of following them across every desktop.
-//! - `level = .floating` (kCGFloatingWindowLevel, between normal apps
-//!   and dock; high enough to stay visible, low enough not to obscure
-//!   menus or accessibility overlays).
-//! - `setIgnoresMouseEvents(false)` and
-//!   `setMovableByWindowBackground(true)` — the user can move, resize,
-//!   minimize, or close the preview without affecting the daemon.
-//! - No activation: `setHidesOnDeactivate(false)` and
-//!   `setBecomesKeyOnlyIfNeeded(true)` so the window never steals
-//!   keyboard focus from the user's frontmost app.
-//!
-//! ## Init lifecycle
-//!
-//! Because the cursor overlay already owns the main thread when
-//! enabled, `MacosPipBackend::start` cannot block on it. Instead it
-//! posts the window-creation block onto the main queue and returns
-//! immediately. The first frame may arrive before the window exists;
-//! that's fine — the push path reads the window pointer from a
-//! `Mutex<Option<usize>>` and silently no-ops until init finishes.
+//! Exact native windows are captured continuously, one app owns one bounded
+//! card, and all cards live inside one borderless native stack. The daemon is
+//! in-process, so it does not need Codex's cross-process CAContext transport.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use pip_preview::{PipBackend, PipBackendFactory, PipConfig, PipFrame};
+use pip_preview::{
+    PipBackend, PipBackendFactory, PipConfig, PipFrame, PipViewModel, MAX_VISIBLE_PIP_CARDS,
+};
 use screencapturekit::prelude::{
     CMSampleBufferExt, CMSampleBufferSCExt, CMTime, SCContentFilter, SCShareableContent, SCStream,
     SCStreamConfiguration, SCStreamOutputType,
 };
-
-// ── CGColor objc2 encoding shim ────────────────────────────────────────────
-//
-// `[NSColor CGColor]` returns a `CGColorRef` whose Objective-C type encoding
-// is `^{CGColor=}`. objc2's strict msg_send! enforcement rejects bare
-// `*mut c_void` (`^v`) for both sides of that call. Declare a phantom
-// struct with the matching encoding so we can typed-cast through it
-// without pulling in a wider CGColor binding crate.
 
 #[repr(C)]
 struct CGColor {
@@ -72,11 +28,6 @@ struct NativeCGImage {
     _opaque: [u8; 0],
 }
 
-// RefEncode supplies an automatic Encode impl for `*mut CGColor` /
-// `*const CGColor` via objc2's blanket — that's the route msg_send! needs
-// for both setting layer.backgroundColor and reading [NSColor CGColor].
-// `ENCODING_REF` is the encoding for one level of indirection, so the
-// pointer wrap goes here (objc encoding `^{CGColor=}`).
 unsafe impl objc2::RefEncode for CGColor {
     const ENCODING_REF: objc2::Encoding =
         objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGColor", &[]));
@@ -87,39 +38,75 @@ unsafe impl objc2::RefEncode for NativeCGImage {
         objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGImage", &[]));
 }
 
-// ── Native AppKit pointer cell ─────────────────────────────────────────────
-//
-// Window and image-view pointers are stashed as `usize` so
-// `Send` works (raw `*mut AnyObject` is `!Send`). The actual deref +
-// `msg_send!` happens only on the main queue inside the dispatched
-// block, so there is no thread-safety hazard from the Send promise.
-
 struct NativeHandles {
     window: usize,
+    canvas: usize,
+    delegate: usize,
+}
+
+#[derive(Clone, Copy)]
+struct NativeCardHandles {
     image_view: usize,
+    controls: usize,
+}
+
+struct LiveStreamEntry {
+    window_id: u64,
+    stream: Option<SCStream>,
+    cancelled: Arc<AtomicBool>,
+    frame_pending: Arc<AtomicBool>,
+}
+
+struct LiveFrame {
+    pid: i64,
+    window_id: u64,
+    image: LiveFrameImage,
+    frame_pending: Arc<AtomicBool>,
+}
+
+enum LiveFrameImage {
+    CgImage(screencapturekit::CGImage),
+    Png(Vec<u8>),
 }
 
 static HANDLES: Mutex<Option<NativeHandles>> = Mutex::new(None);
+static CARD_HANDLES: LazyLock<Mutex<HashMap<i64, NativeCardHandles>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CARD_VIEW_PIDS: LazyLock<Mutex<HashMap<usize, i64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RESIZE_VIEW_DIRECTIONS: LazyLock<Mutex<HashMap<usize, isize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static VIEW_MODEL: Mutex<Option<PipViewModel>> = Mutex::new(None);
+static HIDDEN_APPS: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static LIVE_STREAMS: LazyLock<Mutex<HashMap<i64, LiveStreamEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-const LIVE_CAPTURE_FPS: i32 = 8;
-const LIVE_CAPTURE_MAX_SIDE: f64 = 1280.0;
+const LIVE_CAPTURE_FPS: i32 = 12;
+const LIVE_CAPTURE_MAX_SIDE: f64 = 960.0;
 const LIVE_CAPTURE_WINDOW_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+const LIVE_CAPTURE_WATCHDOG: Duration = Duration::from_millis(750);
+const FALLBACK_CAPTURE_INTERVAL: Duration = Duration::from_millis(500);
+const CARD_GAP: f64 = 8.0;
+const STACK_INSET: f64 = 8.0;
+const CARD_RADIUS: f64 = 12.0;
+const TITLE_HEIGHT: f64 = 27.0;
+const CONTROL_SIZE: f64 = 24.0;
+const RESIZE_HIT_INSET: f64 = 7.0;
 
-static LIVE_STREAM: Mutex<Option<SCStream>> = Mutex::new(None);
-static LIVE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
-static LIVE_CAPTURE_CANCELLED: AtomicBool = AtomicBool::new(false);
-static LIVE_FRAME_PENDING: AtomicBool = AtomicBool::new(false);
-
-struct LiveFrame {
-    image: screencapturekit::CGImage,
-}
-
-// ── libdispatch glue — same shape as cursor::overlay ──────────────────────
+const RESIZE_LEFT: isize = 1;
+const RESIZE_RIGHT: isize = 2;
+const RESIZE_BOTTOM: isize = 4;
+const RESIZE_TOP: isize = 8;
 
 #[link(name = "dispatch", kind = "dylib")]
 extern "C" {
     static _dispatch_main_q: u8;
     fn dispatch_async_f(
+        queue: *const c_void,
+        context: *mut c_void,
+        work: unsafe extern "C" fn(*mut c_void),
+    );
+    fn dispatch_sync_f(
         queue: *const c_void,
         context: *mut c_void,
         work: unsafe extern "C" fn(*mut c_void),
@@ -134,123 +121,294 @@ fn dispatch_to_main<T: Send + 'static>(payload: T, cb: unsafe extern "C" fn(*mut
     }
 }
 
-// ── Backend impl ──────────────────────────────────────────────────────────
+fn dispatch_to_main_sync<T>(payload: T, cb: unsafe extern "C" fn(*mut c_void)) {
+    let context = Box::into_raw(Box::new(payload)) as *mut c_void;
+    unsafe {
+        if libc::pthread_main_np() != 0 {
+            cb(context);
+        } else {
+            let main_queue = &raw const _dispatch_main_q as *const c_void;
+            dispatch_sync_f(main_queue, context, cb);
+        }
+    }
+}
 
 pub struct MacosPipBackend;
 
 impl PipBackend for MacosPipBackend {
-    fn push_frame(&self, frame: PipFrame) {
-        // A live ScreenCaptureKit stream is the primary presentation path on
-        // macOS. Keep the existing post-action PNG bridge as a fallback for
-        // machines where live capture could not be established.
-        if LIVE_CAPTURE_ACTIVE.load(Ordering::Acquire) {
+    fn push_frame(&self, mut frame: PipFrame) {
+        if frame.target.pid <= 0
+            || frame.target.window_id == 0
+            || HIDDEN_APPS.lock().unwrap().contains(&frame.target.pid)
+        {
             return;
         }
-        // No window yet? Drop the frame silently — start() dispatches
-        // the create block onto the main queue and the very first
-        // tool call can race that block.
-        if HANDLES.lock().unwrap().is_none() {
-            return;
+
+        if let Ok(pid) = i32::try_from(frame.target.pid) {
+            if let Some(window) = crate::windows::all_windows().into_iter().find(|window| {
+                window.pid == pid && u64::from(window.window_id) == frame.target.window_id
+            }) {
+                frame.target.app_name = window.app_name;
+                frame.target.window_title =
+                    (!window.title.trim().is_empty()).then_some(window.title);
+            } else if frame.target.app_name.is_empty() {
+                frame.target.app_name = crate::apps::get_app_name_for_pid(pid).unwrap_or_default();
+            }
         }
+        if frame.target.app_name.trim().is_empty() {
+            frame.target.app_name = format!("App {}", frame.target.pid);
+        }
+
         dispatch_to_main(frame, push_frame_cb);
     }
 
+    fn set_input_passthrough(&self, passthrough: bool) -> anyhow::Result<()> {
+        dispatch_to_main_sync(passthrough, set_input_passthrough_cb);
+        Ok(())
+    }
+
     fn shutdown(self: Box<Self>) {
-        stop_live_capture();
+        stop_all_live_capture();
         dispatch_to_main((), shutdown_cb);
     }
 }
 
-fn live_capture_dimensions(width_points: u32, height_points: u32, scale: f64) -> (u32, u32) {
-    let mut width = (f64::from(width_points) * scale.max(1.0)).max(1.0);
-    let mut height = (f64::from(height_points) * scale.max(1.0)).max(1.0);
-    let longest = width.max(height);
-    if longest > LIVE_CAPTURE_MAX_SIDE {
-        let shrink = LIVE_CAPTURE_MAX_SIDE / longest;
-        width *= shrink;
-        height *= shrink;
+unsafe extern "C" fn set_input_passthrough_cb(ctx: *mut c_void) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let passthrough: bool = *Box::from_raw(ctx as *mut bool);
+    if let Some(handles) = HANDLES.lock().unwrap().as_ref() {
+        let window = handles.window as *mut AnyObject;
+        let _: () = msg_send![window, setIgnoresMouseEvents: passthrough];
     }
-    (width.round() as u32, height.round() as u32)
 }
 
-fn stop_live_capture() {
-    LIVE_CAPTURE_CANCELLED.store(true, Ordering::Release);
-    LIVE_CAPTURE_ACTIVE.store(false, Ordering::Release);
-    LIVE_FRAME_PENDING.store(false, Ordering::Release);
-    let stream = LIVE_STREAM
+unsafe extern "C" fn push_frame_cb(ctx: *mut c_void) {
+    let frame: PipFrame = *Box::from_raw(ctx as *mut PipFrame);
+    if HIDDEN_APPS.lock().unwrap().contains(&frame.target.pid) {
+        return;
+    }
+
+    let pid = frame.target.pid;
+    let window_id = frame.target.window_id;
+    let (snapshot, outcome) = {
+        let mut model = VIEW_MODEL.lock().unwrap();
+        let model = model.get_or_insert_with(|| PipViewModel::new(MAX_VISIBLE_PIP_CARDS));
+        let outcome = model.upsert(frame);
+        let snapshot = model
+            .ordered_frames()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        (snapshot, outcome)
+    };
+
+    if let Some(evicted_pid) = outcome.evicted_pid {
+        stop_live_capture_for(evicted_pid);
+    }
+    if outcome.window_changed {
+        stop_live_capture_for(pid);
+    }
+    render_snapshot(&snapshot);
+    ensure_live_capture(pid, window_id);
+}
+
+fn current_snapshot() -> Vec<PipFrame> {
+    VIEW_MODEL
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    if let Some(stream) = stream {
-        if let Err(error) = stream.stop_capture() {
-            tracing::debug!(target: "pip", %error, "failed to stop live PiP capture cleanly");
+        .unwrap()
+        .as_ref()
+        .map(|model| model.ordered_frames().into_iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn capture_dimensions(width: f64, height: f64) -> (u32, u32) {
+    let width = width.max(1.0);
+    let height = height.max(1.0);
+    let scale = (LIVE_CAPTURE_MAX_SIDE / width.max(height)).min(1.0);
+    (
+        (width * scale).round().max(1.0) as u32,
+        (height * scale).round().max(1.0) as u32,
+    )
+}
+
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn stream_frame_is_fresh(now_ms: u64, last_stream_frame_ms: u64) -> bool {
+    last_stream_frame_ms != 0
+        && now_ms.saturating_sub(last_stream_frame_ms) < LIVE_CAPTURE_WATCHDOG.as_millis() as u64
+}
+
+fn ensure_live_capture(pid: i64, window_id: u64) {
+    {
+        let streams = LIVE_STREAMS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if streams.get(&pid).is_some_and(|entry| {
+            entry.window_id == window_id && !entry.cancelled.load(Ordering::Acquire)
+        }) {
+            return;
         }
     }
-}
 
-fn start_live_capture(window_id: u32, output_width: u32, output_height: u32) {
-    LIVE_CAPTURE_CANCELLED.store(false, Ordering::Release);
+    stop_live_capture_for(pid);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let frame_pending = Arc::new(AtomicBool::new(false));
+    let last_stream_frame_ms = Arc::new(AtomicU64::new(0));
+    LIVE_STREAMS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            pid,
+            LiveStreamEntry {
+                window_id,
+                stream: None,
+                cancelled: Arc::clone(&cancelled),
+                frame_pending: Arc::clone(&frame_pending),
+            },
+        );
+
+    start_polling_fallback(
+        pid,
+        window_id,
+        Arc::clone(&cancelled),
+        Arc::clone(&frame_pending),
+        Arc::clone(&last_stream_frame_ms),
+    );
+
     if let Err(error) = std::thread::Builder::new()
-        .name("cua-pip-live-capture".into())
-        .spawn(move || match build_live_capture(window_id, output_width, output_height) {
-            Ok(stream) => {
-                if LIVE_CAPTURE_CANCELLED.load(Ordering::Acquire) {
-                    let _ = stream.stop_capture();
-                    return;
+        .name(format!("cua-pip-{pid}"))
+        .spawn(move || {
+            match build_live_capture(
+                pid,
+                window_id,
+                Arc::clone(&cancelled),
+                Arc::clone(&frame_pending),
+                Arc::clone(&last_stream_frame_ms),
+            ) {
+                Ok(stream) => {
+                    let mut streams = LIVE_STREAMS
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let current = streams.get_mut(&pid).filter(|entry| {
+                        entry.window_id == window_id
+                            && Arc::ptr_eq(&entry.cancelled, &cancelled)
+                            && !cancelled.load(Ordering::Acquire)
+                    });
+                    if let Some(entry) = current {
+                        entry.stream = Some(stream);
+                        tracing::info!(
+                            target: "pip",
+                            pid,
+                            window_id,
+                            fps = LIVE_CAPTURE_FPS,
+                            "live app PiP capture started"
+                        );
+                    } else {
+                        drop(streams);
+                        let _ = stream.stop_capture();
+                    }
                 }
-                *LIVE_STREAM
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stream);
-                LIVE_CAPTURE_ACTIVE.store(true, Ordering::Release);
-                tracing::info!(
-                    target: "pip",
-                    fps = LIVE_CAPTURE_FPS,
-                    width = output_width,
-                    height = output_height,
-                    "live PiP capture started"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(target: "pip", %error, "live PiP capture unavailable; using post-action screenshots");
+                Err(error) => {
+                    tracing::warn!(
+                        target: "pip",
+                        pid,
+                        window_id,
+                        %error,
+                        "SCStream unavailable; exact-window polling is keeping PiP live"
+                    );
+                }
             }
         })
     {
-        tracing::warn!(target: "pip", %error, "failed to spawn live PiP capture worker");
+        tracing::warn!(target: "pip", pid, window_id, %error, "failed to spawn PiP capture worker");
+    }
+}
+
+fn start_polling_fallback(
+    pid: i64,
+    window_id: u64,
+    cancelled: Arc<AtomicBool>,
+    frame_pending: Arc<AtomicBool>,
+    last_stream_frame_ms: Arc<AtomicU64>,
+) {
+    let Ok(native_window_id) = u32::try_from(window_id) else {
+        return;
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name(format!("cua-pip-watchdog-{pid}"))
+        .spawn(move || {
+            while !cancelled.load(Ordering::Acquire) {
+                let last_stream_frame = last_stream_frame_ms.load(Ordering::Acquire);
+                let stream_is_fresh = stream_frame_is_fresh(wall_clock_ms(), last_stream_frame);
+                if !stream_is_fresh && !frame_pending.swap(true, Ordering::AcqRel) {
+                    match crate::capture::screenshot_window_bytes(native_window_id) {
+                        Ok(png_bytes) => dispatch_to_main(
+                            LiveFrame {
+                                pid,
+                                window_id,
+                                image: LiveFrameImage::Png(png_bytes),
+                                frame_pending: Arc::clone(&frame_pending),
+                            },
+                            push_live_frame_cb,
+                        ),
+                        Err(error) => {
+                            frame_pending.store(false, Ordering::Release);
+                            tracing::debug!(target: "pip", pid, window_id, %error, "PiP fallback capture failed");
+                        }
+                    }
+                }
+                std::thread::sleep(FALLBACK_CAPTURE_INTERVAL);
+            }
+        })
+    {
+        tracing::warn!(target: "pip", pid, window_id, %error, "failed to spawn PiP capture watchdog");
     }
 }
 
 fn build_live_capture(
-    window_id: u32,
-    output_width: u32,
-    output_height: u32,
+    pid: i64,
+    window_id: u64,
+    cancelled: Arc<AtomicBool>,
+    frame_pending: Arc<AtomicBool>,
+    last_stream_frame_ms: Arc<AtomicU64>,
 ) -> anyhow::Result<SCStream> {
+    let native_window_id = u32::try_from(window_id)
+        .map_err(|_| anyhow::anyhow!("window id {window_id} does not fit a CGWindowID"))?;
     let deadline = Instant::now() + LIVE_CAPTURE_WINDOW_LOOKUP_TIMEOUT;
-    let (display, pip_window) = loop {
-        let content = SCShareableContent::get()
-            .map_err(|error| anyhow::anyhow!("SCShareableContent::get failed: {error}"))?;
-        let main_display_id = unsafe { core_graphics::display::CGMainDisplayID() };
-        let display = content
-            .displays()
-            .into_iter()
-            .find(|display| display.display_id() == main_display_id)
-            .or_else(|| content.displays().into_iter().next())
-            .ok_or_else(|| anyhow::anyhow!("no displays available for live PiP capture"))?;
+    let target_window = loop {
+        if cancelled.load(Ordering::Acquire) {
+            anyhow::bail!("capture cancelled");
+        }
+        let content = SCShareableContent::create()
+            .with_exclude_desktop_windows(true)
+            .with_on_screen_windows_only(false)
+            .get()
+            .map_err(|error| anyhow::anyhow!("SCShareableContent lookup failed: {error}"))?;
         if let Some(window) = content
             .windows()
             .into_iter()
-            .find(|window| window.window_id() == window_id)
+            .find(|window| window.window_id() == native_window_id)
         {
-            break (display, window);
+            break window;
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("PiP window {window_id} was not visible to ScreenCaptureKit");
+            anyhow::bail!("target window {window_id} was not available to ScreenCaptureKit");
         }
         std::thread::sleep(Duration::from_millis(100));
     };
 
+    let source_frame = target_window.frame();
+    let (output_width, output_height) =
+        capture_dimensions(source_frame.size.width, source_frame.size.height);
     let filter = SCContentFilter::create()
-        .with_display(&display)
-        .with_excluding_windows(&[&pip_window])
+        .with_window(&target_window)
         .build();
     let frame_interval = CMTime::new(1, LIVE_CAPTURE_FPS);
     let config = SCStreamConfiguration::new()
@@ -258,29 +416,40 @@ fn build_live_capture(
         .with_height(output_height)
         .with_scales_to_fit(true)
         .with_preserves_aspect_ratio(true)
-        .with_queue_depth(3)
+        .with_queue_depth(2)
         .with_minimum_frame_interval(&frame_interval)
         .with_shows_cursor(true);
 
     let mut stream = SCStream::new(&filter, &config);
     stream
         .add_output_handler(
-            |sample: screencapturekit::cm::CMSampleBuffer, output_type: SCStreamOutputType| {
+            move |sample: screencapturekit::cm::CMSampleBuffer,
+                  output_type: SCStreamOutputType| {
                 if output_type != SCStreamOutputType::Screen
-                    || LIVE_CAPTURE_CANCELLED.load(Ordering::Acquire)
+                    || cancelled.load(Ordering::Acquire)
                     || sample
                         .frame_status()
                         .is_some_and(|status| !status.has_content())
-                    || LIVE_FRAME_PENDING.swap(true, Ordering::AcqRel)
+                    || frame_pending.swap(true, Ordering::AcqRel)
                 {
                     return;
                 }
-
                 match sample.cg_image() {
-                    Ok(image) => dispatch_to_main(LiveFrame { image }, push_live_frame_cb),
+                    Ok(image) => {
+                        last_stream_frame_ms.store(wall_clock_ms(), Ordering::Release);
+                        dispatch_to_main(
+                            LiveFrame {
+                                pid,
+                                window_id,
+                                image: LiveFrameImage::CgImage(image),
+                                frame_pending: Arc::clone(&frame_pending),
+                            },
+                            push_live_frame_cb,
+                        )
+                    }
                     Err(error) => {
-                        LIVE_FRAME_PENDING.store(false, Ordering::Release);
-                        tracing::debug!(target: "pip", error, "live PiP frame had no image");
+                        frame_pending.store(false, Ordering::Release);
+                        tracing::debug!(target: "pip", pid, window_id, error, "live PiP frame had no image");
                     }
                 }
             },
@@ -293,272 +462,884 @@ fn build_live_capture(
     Ok(stream)
 }
 
+fn stop_live_capture_for(pid: i64) {
+    let entry = LIVE_STREAMS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&pid);
+    if let Some(entry) = entry {
+        entry.cancelled.store(true, Ordering::Release);
+        entry.frame_pending.store(false, Ordering::Release);
+        if let Some(stream) = entry.stream {
+            if let Err(error) = stream.stop_capture() {
+                tracing::debug!(target: "pip", pid, %error, "failed to stop app PiP capture cleanly");
+            }
+        }
+    }
+}
+
+fn stop_all_live_capture() {
+    let pids = LIVE_STREAMS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for pid in pids {
+        stop_live_capture_for(pid);
+    }
+}
+
 unsafe extern "C" fn push_live_frame_cb(ctx: *mut c_void) {
+    use objc2::msg_send;
     use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
     use objc2_foundation::NSSize;
 
     let frame: LiveFrame = *Box::from_raw(ctx as *mut LiveFrame);
-    LIVE_FRAME_PENDING.store(false, Ordering::Release);
+    frame.frame_pending.store(false, Ordering::Release);
+    if HIDDEN_APPS.lock().unwrap().contains(&frame.pid)
+        || !VIEW_MODEL
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|model| model.frame_for_app(frame.pid))
+            .is_some_and(|model_frame| model_frame.target.window_id == frame.window_id)
+    {
+        return;
+    }
+    let image_view = CARD_HANDLES
+        .lock()
+        .unwrap()
+        .get(&frame.pid)
+        .map(|handles| handles.image_view)
+        .unwrap_or(0) as *mut AnyObject;
+    if image_view.is_null() {
+        return;
+    }
 
-    let (window_ptr, image_view_ptr) = {
-        let guard = HANDLES.lock().unwrap();
-        match guard.as_ref() {
-            Some(handles) => (handles.window, handles.image_view),
-            None => return,
+    let image: *mut AnyObject = match frame.image {
+        LiveFrameImage::CgImage(image) => {
+            let cg_image = image.as_ptr() as *mut NativeCGImage;
+            let allocated: *mut AnyObject = msg_send![objc2::class!(NSImage), alloc];
+            msg_send![allocated, initWithCGImage: cg_image size: NSSize::new(0.0, 0.0)]
         }
-    };
-    let window = window_ptr as *mut AnyObject;
-    let minimized: bool = msg_send![window, isMiniaturized];
-    if minimized {
-        return;
-    }
-    let visible: bool = msg_send![window, isVisible];
-    if !visible {
-        stop_live_capture();
-        return;
-    }
-
-    let cg_image = frame.image.as_ptr() as *mut NativeCGImage;
-    let image: *mut AnyObject = {
-        let alloc: *mut AnyObject = msg_send![class!(NSImage), alloc];
-        msg_send![alloc, initWithCGImage: cg_image size: NSSize::new(0.0, 0.0)]
+        LiveFrameImage::Png(png_bytes) => image_from_png(&png_bytes),
     };
     if !image.is_null() {
-        let image_view = image_view_ptr as *mut AnyObject;
         let _: () = msg_send![image_view, setImage: image];
         let _: () = msg_send![image, release];
     }
 }
 
-unsafe extern "C" fn push_frame_cb(ctx: *mut c_void) {
+fn pip_card_view_class() -> &'static objc2::runtime::AnyClass {
+    use objc2::class;
+    use objc2::declare::ClassBuilder;
+
+    static CLASS: OnceLock<&'static objc2::runtime::AnyClass> = OnceLock::new();
+    CLASS.get_or_init(|| {
+        let mut builder = ClassBuilder::new("CuaDriverPipCardView", class!(NSView))
+            .expect("CuaDriverPipCardView already registered");
+        unsafe {
+            builder.add_method(
+                objc2::sel!(acceptsFirstMouse:),
+                accepts_first_mouse as extern "C" fn(_, _, _) -> objc2::runtime::Bool,
+            );
+            builder.add_method(
+                objc2::sel!(mouseEntered:),
+                card_mouse_entered as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(mouseExited:),
+                card_mouse_exited as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(mouseMoved:),
+                card_mouse_entered as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(mouseDown:),
+                card_mouse_down as extern "C" fn(_, _, _),
+            );
+        }
+        builder.register()
+    })
+}
+
+extern "C" fn accepts_first_mouse(
+    _view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    _event: *mut objc2::runtime::AnyObject,
+) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::YES
+}
+
+fn set_card_controls_hidden(pid: i64, hidden: bool) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let controls = CARD_HANDLES
+        .lock()
+        .unwrap()
+        .get(&pid)
+        .map(|handles| handles.controls)
+        .unwrap_or(0) as *mut AnyObject;
+    if !controls.is_null() {
+        unsafe {
+            let _: () = msg_send![controls, setHidden: hidden];
+        }
+    }
+}
+
+extern "C" fn card_mouse_entered(
+    view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    _event: *mut objc2::runtime::AnyObject,
+) {
+    if view.is_null() {
+        return;
+    }
+    let pid = CARD_VIEW_PIDS
+        .lock()
+        .unwrap()
+        .get(&(view as usize))
+        .copied();
+    if let Some(pid) = pid {
+        set_card_controls_hidden(pid, false);
+    }
+}
+
+extern "C" fn card_mouse_exited(
+    view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    _event: *mut objc2::runtime::AnyObject,
+) {
+    if view.is_null() {
+        return;
+    }
+    let pid = CARD_VIEW_PIDS
+        .lock()
+        .unwrap()
+        .get(&(view as usize))
+        .copied();
+    if let Some(pid) = pid {
+        set_card_controls_hidden(pid, true);
+    }
+}
+
+extern "C" fn card_mouse_down(
+    view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    event: *mut objc2::runtime::AnyObject,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    if view.is_null() || event.is_null() {
+        return;
+    }
+    unsafe {
+        let window: *mut AnyObject = msg_send![view, window];
+        if !window.is_null() {
+            let _: () = msg_send![window, performWindowDragWithEvent: event];
+        }
+    }
+}
+
+fn pip_delegate_class() -> &'static objc2::runtime::AnyClass {
+    use objc2::class;
+    use objc2::declare::ClassBuilder;
+
+    static CLASS: OnceLock<&'static objc2::runtime::AnyClass> = OnceLock::new();
+    CLASS.get_or_init(|| {
+        let mut builder = ClassBuilder::new("CuaDriverPipDelegate", class!(NSObject))
+            .expect("CuaDriverPipDelegate already registered");
+        unsafe {
+            builder.add_method(
+                objc2::sel!(windowDidResize:),
+                window_did_resize as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(hideAppPreview:),
+                hide_app_preview as extern "C" fn(_, _, _),
+            );
+        }
+        builder.register()
+    })
+}
+
+unsafe fn pip_delegate_instance() -> *mut objc2::runtime::AnyObject {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let allocated: *mut AnyObject = msg_send![pip_delegate_class(), alloc];
+    msg_send![allocated, init]
+}
+
+extern "C" fn window_did_resize(
+    _delegate: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    _notification: *mut objc2::runtime::AnyObject,
+) {
+    let snapshot = current_snapshot();
+    unsafe { render_snapshot(&snapshot) };
+}
+
+extern "C" fn hide_app_preview(
+    _delegate: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    sender: *mut objc2::runtime::AnyObject,
+) {
+    if sender.is_null() {
+        return;
+    }
+    let pid: isize = unsafe { objc2::msg_send![sender, tag] };
+    let pid = pid as i64;
+    HIDDEN_APPS.lock().unwrap().insert(pid);
+    stop_live_capture_for(pid);
+    let snapshot = {
+        let mut model = VIEW_MODEL.lock().unwrap();
+        let Some(model) = model.as_mut() else {
+            return;
+        };
+        model.remove_app(pid);
+        model
+            .ordered_frames()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    unsafe { render_snapshot(&snapshot) };
+}
+
+fn resize_hit_view_class() -> &'static objc2::runtime::AnyClass {
+    use objc2::class;
+    use objc2::declare::ClassBuilder;
+
+    static CLASS: OnceLock<&'static objc2::runtime::AnyClass> = OnceLock::new();
+    CLASS.get_or_init(|| {
+        let mut builder = ClassBuilder::new("CuaDriverPipResizeView", class!(NSView))
+            .expect("CuaDriverPipResizeView already registered");
+        unsafe {
+            builder.add_method(
+                objc2::sel!(acceptsFirstMouse:),
+                accepts_first_mouse as extern "C" fn(_, _, _) -> objc2::runtime::Bool,
+            );
+            builder.add_method(
+                objc2::sel!(mouseDown:),
+                resize_mouse_down as extern "C" fn(_, _, _),
+            );
+        }
+        builder.register()
+    })
+}
+
+fn resized_window_frame(
+    start: objc2_foundation::NSRect,
+    delta_x: f64,
+    delta_y: f64,
+    direction: isize,
+    minimum: objc2_foundation::NSSize,
+) -> objc2_foundation::NSRect {
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    let mut x = start.origin.x;
+    let mut y = start.origin.y;
+    let mut width = start.size.width;
+    let mut height = start.size.height;
+    if direction & RESIZE_LEFT != 0 {
+        let applied = delta_x.min(width - minimum.width);
+        x += applied;
+        width -= applied;
+    }
+    if direction & RESIZE_RIGHT != 0 {
+        width = (width + delta_x).max(minimum.width);
+    }
+    if direction & RESIZE_BOTTOM != 0 {
+        let applied = delta_y.min(height - minimum.height);
+        y += applied;
+        height -= applied;
+    }
+    if direction & RESIZE_TOP != 0 {
+        height = (height + delta_y).max(minimum.height);
+    }
+    NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+}
+
+extern "C" fn resize_mouse_down(
+    view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    event: *mut objc2::runtime::AnyObject,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    if view.is_null() || event.is_null() {
+        return;
+    }
+    unsafe {
+        let window: *mut AnyObject = msg_send![view, window];
+        if window.is_null() {
+            return;
+        }
+        let direction = RESIZE_VIEW_DIRECTIONS
+            .lock()
+            .unwrap()
+            .get(&(view as usize))
+            .copied()
+            .unwrap_or(0);
+        let start_frame: objc2_foundation::NSRect = msg_send![window, frame];
+        let minimum: objc2_foundation::NSSize = msg_send![window, minSize];
+        let start_mouse: objc2_foundation::NSPoint =
+            msg_send![objc2::class!(NSEvent), mouseLocation];
+        let event_mask: u64 = (1 << 2) | (1 << 6);
+        let distant_future: *mut AnyObject = msg_send![objc2::class!(NSDate), distantFuture];
+        let default_mode = ns_string("kCFRunLoopDefaultMode");
+        loop {
+            let next: *mut AnyObject = msg_send![
+                window,
+                nextEventMatchingMask: event_mask
+                untilDate: distant_future
+                inMode: default_mode
+                dequeue: true
+            ];
+            if next.is_null() {
+                break;
+            }
+            let event_type: usize = msg_send![next, type];
+            if event_type == 2 {
+                break;
+            }
+            let mouse: objc2_foundation::NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
+            let frame = resized_window_frame(
+                start_frame,
+                mouse.x - start_mouse.x,
+                mouse.y - start_mouse.y,
+                direction,
+                minimum,
+            );
+            let _: () = msg_send![window, setFrame: frame display: true];
+        }
+    }
+}
+
+unsafe fn add_resize_hit_view(
+    parent: *mut objc2::runtime::AnyObject,
+    frame: objc2_foundation::NSRect,
+    direction: isize,
+    autoresizing_mask: u64,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let allocated: *mut AnyObject = msg_send![resize_hit_view_class(), alloc];
+    let view: *mut AnyObject = msg_send![allocated, initWithFrame: frame];
+    RESIZE_VIEW_DIRECTIONS
+        .lock()
+        .unwrap()
+        .insert(view as usize, direction);
+    let _: () = msg_send![view, setAutoresizingMask: autoresizing_mask];
+    let _: () = msg_send![parent, addSubview: view];
+}
+
+unsafe fn install_resize_hit_views(
+    content_view: *mut objc2::runtime::AnyObject,
+    bounds: objc2_foundation::NSRect,
+) {
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    let edge = RESIZE_HIT_INSET;
+    let width = bounds.size.width;
+    let height = bounds.size.height;
+    add_resize_hit_view(
+        content_view,
+        NSRect::new(
+            NSPoint::new(edge, height - edge),
+            NSSize::new(width - 2.0 * edge, edge),
+        ),
+        RESIZE_TOP,
+        10,
+    );
+    add_resize_hit_view(
+        content_view,
+        NSRect::new(
+            NSPoint::new(edge, 0.0),
+            NSSize::new(width - 2.0 * edge, edge),
+        ),
+        RESIZE_BOTTOM,
+        10,
+    );
+    add_resize_hit_view(
+        content_view,
+        NSRect::new(
+            NSPoint::new(0.0, edge),
+            NSSize::new(edge, height - 2.0 * edge),
+        ),
+        RESIZE_LEFT,
+        20,
+    );
+    add_resize_hit_view(
+        content_view,
+        NSRect::new(
+            NSPoint::new(width - edge, edge),
+            NSSize::new(edge, height - 2.0 * edge),
+        ),
+        RESIZE_RIGHT,
+        17,
+    );
+    for (origin, direction, mask) in [
+        (NSPoint::new(0.0, 0.0), RESIZE_LEFT | RESIZE_BOTTOM, 4),
+        (
+            NSPoint::new(width - edge, 0.0),
+            RESIZE_RIGHT | RESIZE_BOTTOM,
+            1,
+        ),
+        (
+            NSPoint::new(0.0, height - edge),
+            RESIZE_LEFT | RESIZE_TOP,
+            8,
+        ),
+        (
+            NSPoint::new(width - edge, height - edge),
+            RESIZE_RIGHT | RESIZE_TOP,
+            2,
+        ),
+    ] {
+        add_resize_hit_view(
+            content_view,
+            NSRect::new(origin, NSSize::new(edge, edge)),
+            direction,
+            mask,
+        );
+    }
+}
+
+unsafe fn ns_string(value: &str) -> *mut objc2::runtime::AnyObject {
+    use objc2::{class, msg_send};
+
+    let sanitized = value.replace('\0', " ");
+    let Ok(cstr) = std::ffi::CString::new(sanitized) else {
+        return std::ptr::null_mut();
+    };
+    msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr() as *const u8]
+}
+
+unsafe fn color(red: f64, green: f64, blue: f64, alpha: f64) -> *mut objc2::runtime::AnyObject {
+    use objc2::{class, msg_send};
+
+    msg_send![
+        class!(NSColor),
+        colorWithCalibratedRed: red
+        green: green
+        blue: blue
+        alpha: alpha
+    ]
+}
+
+unsafe fn vibrant_dark_appearance() -> *mut objc2::runtime::AnyObject {
+    use objc2::{class, msg_send};
+
+    msg_send![class!(NSAppearance), appearanceNamed: ns_string("NSAppearanceNameVibrantDark")]
+}
+
+unsafe fn set_layer_background(
+    layer: *mut objc2::runtime::AnyObject,
+    background: *mut objc2::runtime::AnyObject,
+) {
+    use objc2::msg_send;
+    let cg: *mut CGColor = msg_send![background, CGColor];
+    let _: () = msg_send![layer, setBackgroundColor: cg];
+}
+
+unsafe fn image_from_png(bytes: &[u8]) -> *mut objc2::runtime::AnyObject {
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};
 
-    let frame: PipFrame = *Box::from_raw(ctx as *mut PipFrame);
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: bytes.as_ptr() as *const c_void
+        length: bytes.len()
+    ];
+    if data.is_null() {
+        return std::ptr::null_mut();
+    }
+    let allocated: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    msg_send![allocated, initWithData: data]
+}
 
-    let image_view_ptr = {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CardRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+fn card_layout(width: f64, height: f64, count: usize) -> Vec<CardRect> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let columns = match count {
+        1 => 1,
+        2 | 3 | 4 => 2,
+        _ => 3,
+    };
+    let rows = count.div_ceil(columns);
+    let usable_width = (width - 2.0 * STACK_INSET - CARD_GAP * (columns - 1) as f64).max(1.0);
+    let usable_height = (height - 2.0 * STACK_INSET - CARD_GAP * (rows - 1) as f64).max(1.0);
+    let card_width = usable_width / columns as f64;
+    let card_height = usable_height / rows as f64;
+
+    (0..count)
+        .map(|index| {
+            let column = index % columns;
+            let row_from_top = index / columns;
+            CardRect {
+                x: STACK_INSET + column as f64 * (card_width + CARD_GAP),
+                y: height
+                    - STACK_INSET
+                    - (row_from_top + 1) as f64 * card_height
+                    - row_from_top as f64 * CARD_GAP,
+                width: card_width,
+                height: card_height,
+            }
+        })
+        .collect()
+}
+
+unsafe fn install_tracking_area(card: *mut objc2::runtime::AnyObject) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    let options: u64 = 0x1 | 0x2 | 0x80 | 0x200;
+    let allocated: *mut AnyObject = msg_send![objc2::class!(NSTrackingArea), alloc];
+    let area: *mut AnyObject = msg_send![
+        allocated,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
+        options: options
+        owner: card
+        userInfo: std::ptr::null_mut::<AnyObject>()
+    ];
+    let _: () = msg_send![card, addTrackingArea: area];
+    let _: () = msg_send![area, release];
+}
+
+unsafe fn render_card(
+    canvas: *mut objc2::runtime::AnyObject,
+    delegate: *mut objc2::runtime::AnyObject,
+    frame: &PipFrame,
+    rect: CardRect,
+) -> NativeCardHandles {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    let card_frame = NSRect::new(
+        NSPoint::new(rect.x, rect.y),
+        NSSize::new(rect.width, rect.height),
+    );
+    let allocated: *mut AnyObject = msg_send![pip_card_view_class(), alloc];
+    let card: *mut AnyObject = msg_send![allocated, initWithFrame: card_frame];
+    CARD_VIEW_PIDS
+        .lock()
+        .unwrap()
+        .insert(card as usize, frame.target.pid);
+    let _: () = msg_send![card, setWantsLayer: true];
+    let card_layer: *mut AnyObject = msg_send![card, layer];
+    let _: () = msg_send![card_layer, setCornerRadius: CARD_RADIUS];
+    let _: () = msg_send![card_layer, setMasksToBounds: true];
+    let _: () = msg_send![card_layer, setBorderWidth: 0.75_f64];
+    let border = color(1.0, 1.0, 1.0, 0.28);
+    let border_cg: *mut CGColor = msg_send![border, CGColor];
+    let _: () = msg_send![card_layer, setBorderColor: border_cg];
+    set_layer_background(card_layer, color(0.02, 0.025, 0.035, 0.72));
+
+    let bounds = NSRect::new(NSPoint::new(0.0, 0.0), card_frame.size);
+    let glass: *mut AnyObject = {
+        let allocated: *mut AnyObject = msg_send![objc2::class!(NSVisualEffectView), alloc];
+        msg_send![allocated, initWithFrame: bounds]
+    };
+    let _: () = msg_send![glass, setAutoresizingMask: 18u64];
+    let _: () = msg_send![glass, setMaterial: 13i64];
+    let _: () = msg_send![glass, setBlendingMode: 1i64];
+    let _: () = msg_send![glass, setState: 1i64];
+    let _: () = msg_send![glass, setAppearance: vibrant_dark_appearance()];
+    let _: () = msg_send![card, addSubview: glass];
+
+    let image_view: *mut AnyObject = {
+        let allocated: *mut AnyObject = msg_send![objc2::class!(NSImageView), alloc];
+        msg_send![allocated, initWithFrame: bounds]
+    };
+    let _: () = msg_send![image_view, setAutoresizingMask: 18u64];
+    let _: () = msg_send![image_view, setImageScaling: 3u64];
+    let image = image_from_png(&frame.png_bytes);
+    if !image.is_null() {
+        let _: () = msg_send![image_view, setImage: image];
+        let _: () = msg_send![image, release];
+    }
+    let _: () = msg_send![card, addSubview: image_view];
+
+    let title_width = (rect.width - CONTROL_SIZE - 24.0).max(40.0);
+    let title_glass_frame = NSRect::new(
+        NSPoint::new(7.0, rect.height - TITLE_HEIGHT - 7.0),
+        NSSize::new(title_width, TITLE_HEIGHT),
+    );
+    let title_glass: *mut AnyObject = {
+        let allocated: *mut AnyObject = msg_send![objc2::class!(NSVisualEffectView), alloc];
+        msg_send![allocated, initWithFrame: title_glass_frame]
+    };
+    let _: () = msg_send![title_glass, setMaterial: 13i64];
+    let _: () = msg_send![title_glass, setBlendingMode: 0i64];
+    let _: () = msg_send![title_glass, setState: 1i64];
+    let _: () = msg_send![title_glass, setAppearance: vibrant_dark_appearance()];
+    let _: () = msg_send![title_glass, setWantsLayer: true];
+    let title_layer: *mut AnyObject = msg_send![title_glass, layer];
+    let _: () = msg_send![title_layer, setCornerRadius: TITLE_HEIGHT / 2.0];
+    let _: () = msg_send![title_layer, setMasksToBounds: true];
+
+    let title = ns_string(&frame.target.app_name);
+    let label: *mut AnyObject = msg_send![objc2::class!(NSTextField), labelWithString: title];
+    let _: () = msg_send![label, setFrame: NSRect::new(
+        NSPoint::new(10.0, 4.0),
+        NSSize::new((title_width - 20.0).max(20.0), TITLE_HEIGHT - 8.0),
+    )];
+    let font: *mut AnyObject =
+        msg_send![objc2::class!(NSFont), systemFontOfSize: 11.0_f64 weight: 0.35_f64];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setTextColor: color(1.0, 1.0, 1.0, 0.94)];
+    let _: () = msg_send![label, setLineBreakMode: 4u64];
+    let _: () = msg_send![title_glass, addSubview: label];
+    let _: () = msg_send![card, addSubview: title_glass];
+
+    // A transparent surface above the preview makes the whole card draggable.
+    // The hover control is added after it and therefore remains clickable.
+    let drag_allocated: *mut AnyObject = msg_send![pip_card_view_class(), alloc];
+    let drag_surface: *mut AnyObject = msg_send![drag_allocated, initWithFrame: bounds];
+    let _: () = msg_send![drag_surface, setAutoresizingMask: 18u64];
+    let _: () = msg_send![card, addSubview: drag_surface];
+
+    let controls_frame = NSRect::new(
+        NSPoint::new(
+            rect.width - CONTROL_SIZE - 7.0,
+            rect.height - CONTROL_SIZE - 7.0,
+        ),
+        NSSize::new(CONTROL_SIZE, CONTROL_SIZE),
+    );
+    let controls: *mut AnyObject = {
+        let allocated: *mut AnyObject = msg_send![objc2::class!(NSVisualEffectView), alloc];
+        msg_send![allocated, initWithFrame: controls_frame]
+    };
+    let _: () = msg_send![controls, setMaterial: 13i64];
+    let _: () = msg_send![controls, setBlendingMode: 0i64];
+    let _: () = msg_send![controls, setState: 1i64];
+    let _: () = msg_send![controls, setAppearance: vibrant_dark_appearance()];
+    let _: () = msg_send![controls, setWantsLayer: true];
+    let controls_layer: *mut AnyObject = msg_send![controls, layer];
+    let _: () = msg_send![controls_layer, setCornerRadius: CONTROL_SIZE / 2.0];
+    let _: () = msg_send![controls_layer, setMasksToBounds: true];
+
+    let button: *mut AnyObject = {
+        let allocated: *mut AnyObject = msg_send![objc2::class!(NSButton), alloc];
+        msg_send![allocated, initWithFrame: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(CONTROL_SIZE, CONTROL_SIZE),
+        )]
+    };
+    let _: () = msg_send![button, setBordered: false];
+    let _: () = msg_send![button, setTitle: ns_string("×")];
+    let button_font: *mut AnyObject =
+        msg_send![objc2::class!(NSFont), systemFontOfSize: 17.0_f64 weight: 0.2_f64];
+    let _: () = msg_send![button, setFont: button_font];
+    let _: () = msg_send![button, setContentTintColor: color(1.0, 1.0, 1.0, 0.96)];
+    let _: () = msg_send![button, setToolTip: ns_string("Hide this app preview")];
+    let _: () = msg_send![button, setTag: frame.target.pid as isize];
+    let _: () = msg_send![button, setTarget: delegate];
+    let _: () = msg_send![button, setAction: objc2::sel!(hideAppPreview:)];
+    let _: () = msg_send![controls, addSubview: button];
+    let _: () = msg_send![controls, setHidden: true];
+    let _: () = msg_send![card, addSubview: controls];
+
+    install_tracking_area(card);
+    let _: () = msg_send![canvas, addSubview: card];
+    NativeCardHandles {
+        image_view: image_view as usize,
+        controls: controls as usize,
+    }
+}
+
+unsafe fn render_snapshot(snapshot: &[PipFrame]) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let (window, canvas, delegate) = {
         let guard = HANDLES.lock().unwrap();
-        match guard.as_ref() {
-            Some(h) => h.image_view,
-            None => return,
-        }
+        let Some(handles) = guard.as_ref() else {
+            return;
+        };
+        (
+            handles.window as *mut AnyObject,
+            handles.canvas as *mut AnyObject,
+            handles.delegate as *mut AnyObject,
+        )
     };
 
-    // Construct NSData from the PNG bytes, then NSImage from NSData.
-    // `dataWithBytes:length:` copies into a fresh NSData so the input
-    // `Vec<u8>` can be freed at the end of this block.
-    let png_ptr = frame.png_bytes.as_ptr() as *const c_void;
-    let png_len = frame.png_bytes.len();
-    let ns_data: *mut AnyObject = msg_send![
-        class!(NSData),
-        dataWithBytes: png_ptr
-        length: png_len
-    ];
-    if ns_data.is_null() {
+    CARD_HANDLES.lock().unwrap().clear();
+    CARD_VIEW_PIDS.lock().unwrap().clear();
+    let empty: *mut AnyObject = msg_send![objc2::class!(NSArray), array];
+    let _: () = msg_send![canvas, setSubviews: empty];
+    let bounds: objc2_foundation::NSRect = msg_send![canvas, bounds];
+    let layout = card_layout(bounds.size.width, bounds.size.height, snapshot.len());
+    for (frame, rect) in snapshot.iter().zip(layout) {
+        let handles = render_card(canvas, delegate, frame, rect);
+        CARD_HANDLES
+            .lock()
+            .unwrap()
+            .insert(frame.target.pid, handles);
+    }
+
+    if snapshot.is_empty() {
+        let _: () = msg_send![window, orderOut: std::ptr::null_mut::<AnyObject>()];
+    } else {
+        let _: () = msg_send![window, orderFrontRegardless];
+    }
+}
+
+pub struct MacosPipBackendFactory;
+
+impl PipBackendFactory for MacosPipBackendFactory {
+    fn start(&self, cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
+        dispatch_to_main(cfg.clone(), init_cb);
+        Ok(Box::new(MacosPipBackend))
+    }
+}
+
+unsafe extern "C" fn init_cb(ctx: *mut c_void) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    let cfg: PipConfig = *Box::from_raw(ctx as *mut PipConfig);
+    if HANDLES.lock().unwrap().is_some() {
         return;
     }
-    let img: *mut AnyObject = {
-        let alloc: *mut AnyObject = msg_send![class!(NSImage), alloc];
-        msg_send![alloc, initWithData: ns_data]
-    };
-    if !img.is_null() {
-        let image_view = image_view_ptr as *mut AnyObject;
-        let _: () = msg_send![image_view, setImage: img];
-        let _: () = msg_send![img, release];
+
+    let screen: *mut AnyObject = msg_send![objc2::class!(NSScreen), mainScreen];
+    if screen.is_null() {
+        return;
     }
+    let screen_frame: NSRect = msg_send![screen, frame];
+    let minimum = NSSize::new(320.0, 200.0);
+    let width = (cfg.geometry.width as f64).max(minimum.width);
+    let height = (cfg.geometry.height as f64).max(minimum.height);
+    let inset = 24.0;
+    let (top_left_x, top_left_y) = match (cfg.geometry.x, cfg.geometry.y) {
+        (Some(x), Some(y)) => (x as f64, y as f64),
+        _ => (screen_frame.size.width - width - inset, inset),
+    };
+    let bottom_y = screen_frame.size.height - top_left_y - height;
+    let rect = NSRect::new(
+        NSPoint::new(top_left_x, bottom_y),
+        NSSize::new(width, height),
+    );
+
+    // Borderless, non-activating panel. Movement and resizing are handled by
+    // custom hit views, so no standard traffic-light controls cover previews.
+    let style_mask: u64 = 1 << 7;
+    let window: *mut AnyObject = {
+        let allocated: *mut AnyObject = msg_send![objc2::class!(NSPanel), alloc];
+        msg_send![
+            allocated,
+            initWithContentRect: rect
+            styleMask: style_mask
+            backing: 2u64
+            defer: false
+        ]
+    };
+    if window.is_null() {
+        return;
+    }
+
+    let clear: *mut AnyObject = msg_send![objc2::class!(NSColor), clearColor];
+    let _: () = msg_send![window, setBackgroundColor: clear];
+    let _: () = msg_send![window, setOpaque: false];
+    let _: () = msg_send![window, setHasShadow: true];
+    let _: () = msg_send![window, setIgnoresMouseEvents: false];
+    let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
+    let _: () = msg_send![window, setBecomesKeyOnlyIfNeeded: true];
+    let _: () = msg_send![window, setMovableByWindowBackground: true];
+    let _: () = msg_send![window, setFloatingPanel: false];
+    // Match Codex's ordinary window level instead of pinning the preview above
+    // every application. 0x108 = transient + full-screen auxiliary.
+    let _: () = msg_send![window, setLevel: 0i64];
+    let _: () = msg_send![window, setCollectionBehavior: 0x108u64];
+    let _: () = msg_send![window, setReleasedWhenClosed: false];
+    let _: () = msg_send![window, setHidesOnDeactivate: false];
+    let _: () = msg_send![window, setMinSize: minimum];
+
+    let content_view: *mut AnyObject = msg_send![window, contentView];
+    let _: () = msg_send![content_view, setWantsLayer: true];
+    let content_layer: *mut AnyObject = msg_send![content_view, layer];
+    set_layer_background(content_layer, color(0.0, 0.0, 0.0, 0.0));
+
+    let bounds: NSRect = msg_send![content_view, bounds];
+    let canvas: *mut AnyObject = {
+        let allocated: *mut AnyObject = msg_send![objc2::class!(NSView), alloc];
+        msg_send![allocated, initWithFrame: bounds]
+    };
+    let _: () = msg_send![canvas, setAutoresizingMask: 18u64];
+    let _: () = msg_send![content_view, addSubview: canvas];
+    install_resize_hit_views(content_view, bounds);
+
+    let delegate = pip_delegate_instance();
+    let _: () = msg_send![window, setDelegate: delegate];
+    *HANDLES.lock().unwrap() = Some(NativeHandles {
+        window: window as usize,
+        canvas: canvas as usize,
+        delegate: delegate as usize,
+    });
+    *VIEW_MODEL.lock().unwrap() = Some(PipViewModel::new(MAX_VISIBLE_PIP_CARDS));
+
+    tracing::info!(
+        target: "pip",
+        width,
+        height,
+        max_cards = MAX_VISIBLE_PIP_CARDS,
+        "native per-app PiP stack initialised"
+    );
 }
 
 unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
 
-    let handles = HANDLES.lock().unwrap().take();
-    if let Some(h) = handles {
-        let win = h.window as *mut AnyObject;
-        if !win.is_null() {
-            let _: () = msg_send![win, orderOut: std::ptr::null_mut::<AnyObject>()];
-            let _: () = msg_send![win, close];
-        }
+    CARD_HANDLES.lock().unwrap().clear();
+    CARD_VIEW_PIDS.lock().unwrap().clear();
+    RESIZE_VIEW_DIRECTIONS.lock().unwrap().clear();
+    VIEW_MODEL.lock().unwrap().take();
+    HIDDEN_APPS.lock().unwrap().clear();
+    if let Some(handles) = HANDLES.lock().unwrap().take() {
+        let window = handles.window as *mut AnyObject;
+        let _: () = msg_send![window, setDelegate: std::ptr::null_mut::<AnyObject>()];
+        let _: () = msg_send![window, orderOut: std::ptr::null_mut::<AnyObject>()];
+        let _: () = msg_send![window, close];
+        let _ = handles.delegate;
     }
 }
 
-// ── AppKit main loop helper for Serve mode ───────────────────────────────
-
-/// Park the main thread in `NSApplication.run()`. Used by `cua-driver
-/// serve --experimental-pip` so the dispatch_async_f → main queue
-/// path PiP frames go through can be drained. Mirrors the cursor
-/// overlay's `run_appkit` startup (Accessory activation policy →
-/// finishLaunching → run) without installing the overlay's
-/// CALayer-backed window itself.
-///
-/// Never returns — the background `serve::run_serve_cmd` thread calls
-/// `std::process::exit` when it finishes, which tears down NSApp at
-/// the same time.
+/// Park the main thread in `NSApplication.run()` so AppKit can service the
+/// asynchronously created stack and live-frame callbacks.
 pub fn run_appkit_main_loop() {
+    use objc2::msg_send;
     use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
 
     let _mtm = objc2_foundation::MainThreadMarker::new()
         .expect("run_appkit_main_loop must be called from the main thread");
     unsafe {
-        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-        // Accessory policy: no Dock icon, no menu bar. Keeps the
-        // daemon out of the user's application switcher, same as
-        // the cursor overlay's NSApp setup.
+        let app: *mut AnyObject = msg_send![objc2::class!(NSApplication), sharedApplication];
         let _: bool = msg_send![app, setActivationPolicy: 1i64];
         let _: () = msg_send![app, finishLaunching];
         let _: () = msg_send![app, run];
     }
-}
-
-// ── Factory ──────────────────────────────────────────────────────────────
-
-pub struct MacosPipBackendFactory;
-
-impl PipBackendFactory for MacosPipBackendFactory {
-    fn start(&self, cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
-        // Window construction must happen on the main thread. We hand
-        // off via dispatch_async_f and return immediately — the first
-        // few frames may be dropped while init races, which is fine
-        // for a live-preview UX.
-        let cfg_clone = cfg.clone();
-        dispatch_to_main(cfg_clone, init_cb);
-        Ok(Box::new(MacosPipBackend))
-    }
-}
-
-unsafe extern "C" fn init_cb(ctx: *mut c_void) {
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
-
-    let cfg: PipConfig = *Box::from_raw(ctx as *mut PipConfig);
-
-    // Idempotency guard — `start()` should only be called once per
-    // process, but cheap to defend against duplicate calls.
-    if HANDLES.lock().unwrap().is_some() {
-        return;
-    }
-
-    // ── Resolve geometry ──
-    // AppKit windows use a bottom-left origin in screen coordinates.
-    // The CLI flag uses a top-left X11-style origin (since that's the
-    // mental model agents have for screenshots). Flip Y here so a
-    // `+0+0` flag puts the window in the top-left corner.
-    let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-    if screen.is_null() {
-        // Headless environment (CI) — skip silently. The daemon keeps
-        // running without a PiP window.
-        return;
-    }
-    let screen_frame: NSRect = msg_send![screen, frame];
-    let backing_scale: f64 = msg_send![screen, backingScaleFactor];
-
-    let w = cfg.geometry.width as f64;
-    let h = cfg.geometry.height as f64;
-    // Default placement: top-right corner with a 24pt inset, mirroring
-    // the macOS conventions for floating utility windows.
-    let inset = 24.0_f64;
-    let (top_left_x, top_left_y) = match (cfg.geometry.x, cfg.geometry.y) {
-        (Some(x), Some(y)) => (x as f64, y as f64),
-        _ => (screen_frame.size.width - w - inset, inset),
-    };
-    // Convert top-left → bottom-left for AppKit.
-    let bottom_y = screen_frame.size.height - top_left_y - h;
-    let rect = NSRect::new(NSPoint::new(top_left_x, bottom_y), NSSize::new(w, h));
-
-    // ── NSWindow ──
-    // Use ordinary macOS window affordances. The preview is auxiliary, but it
-    // must never trap the user behind an immovable borderless always-on-top
-    // surface.
-    //   Titled = 1<<0 | Closable = 1<<1 | Miniaturizable = 1<<2 |
-    //   Resizable = 1<<3
-    let style_mask: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
-    let backing_store_buffered: u64 = 2;
-    let win: *mut AnyObject = {
-        let alloc: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-        msg_send![
-            alloc,
-            initWithContentRect: rect
-            styleMask: style_mask
-            backing: backing_store_buffered
-            defer: false
-        ]
-    };
-    if win.is_null() {
-        return;
-    }
-
-    if let Ok(cstr) = std::ffi::CString::new(cfg.title) {
-        let title: *mut AnyObject = msg_send![
-            class!(NSString),
-            stringWithUTF8String: cstr.as_ptr() as *const u8
-        ];
-        if !title.is_null() {
-            let _: () = msg_send![win, setTitle: title];
-        }
-    }
-    let black: *mut AnyObject = msg_send![class!(NSColor), blackColor];
-    let _: () = msg_send![win, setBackgroundColor: black];
-    let _: () = msg_send![win, setOpaque: true];
-    let _: () = msg_send![win, setHasShadow: true];
-    let _: () = msg_send![win, setIgnoresMouseEvents: false];
-    // In addition to the title bar, allow grabbing unused image background.
-    let _: () = msg_send![win, setMovableByWindowBackground: true];
-
-    // Floating window level (NSFloatingWindowLevel = 3).
-    let _: () = msg_send![win, setLevel: 3i64];
-
-    // Keep the default collection behavior. In particular, do not join every
-    // Space or opt out of normal window cycling: those choices made the
-    // preview feel permanently glued to the screen.
-    let _: () = msg_send![win, setCollectionBehavior: 0u64];
-
-    let _: () = msg_send![win, setReleasedWhenClosed: false];
-    let _: () = msg_send![win, setHidesOnDeactivate: false];
-
-    // ── Content view: black backing behind proportional screenshots ──
-    let content_view: *mut AnyObject = msg_send![win, contentView];
-    let _: () = msg_send![content_view, setWantsLayer: true];
-    let content_layer: *mut AnyObject = msg_send![content_view, layer];
-    let black_cg: *mut CGColor = msg_send![black, CGColor];
-    let _: () = msg_send![content_layer, setBackgroundColor: black_cg];
-
-    // ── NSImageView: fills the entire content view ──
-    let image_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h));
-    let image_view: *mut AnyObject = {
-        let alloc: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-        msg_send![alloc, initWithFrame: image_rect]
-    };
-    // NSImageScaleProportionallyUpOrDown = 3 (preserve aspect ratio).
-    // AppKit types this as NSUInteger — passing signed i64 triggers
-    // an objc2 type-encoding panic on macOS 26+.
-    let _: () = msg_send![image_view, setImageScaling: 3u64];
-    // Follow user-initiated resize operations.
-    let _: () = msg_send![image_view, setAutoresizingMask: 18u64];
-
-    let _: () = msg_send![content_view, addSubview: image_view];
-
-    // Show the window without making it key or activating the app.
-    let _: () = msg_send![win, orderFrontRegardless];
-
-    let window_number: i64 = msg_send![win, windowNumber];
-
-    *HANDLES.lock().unwrap() = Some(NativeHandles {
-        window: win as usize,
-        image_view: image_view as usize,
-    });
-
-    if let Ok(window_id) = u32::try_from(window_number) {
-        let (output_width, output_height) =
-            live_capture_dimensions(cfg.geometry.width, cfg.geometry.height, backing_scale);
-        start_live_capture(window_id, output_width, output_height);
-    } else {
-        tracing::warn!(target: "pip", window_number, "cannot start live PiP capture without a valid window id");
-    }
-
-    tracing::info!(target: "pip", "PiP window initialised ({}x{})", cfg.geometry.width, cfg.geometry.height);
 }
 
 #[cfg(test)]
@@ -566,13 +1347,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_capture_dimensions_follow_backing_scale() {
-        assert_eq!(live_capture_dimensions(320, 200, 2.0), (640, 400));
-        assert_eq!(live_capture_dimensions(320, 200, 1.0), (320, 200));
+    fn capture_dimensions_preserve_aspect_ratio_and_bound_size() {
+        assert_eq!(capture_dimensions(640.0, 400.0), (640, 400));
+        assert_eq!(capture_dimensions(4000.0, 2000.0), (960, 480));
     }
 
     #[test]
-    fn live_capture_dimensions_bound_large_windows_without_changing_aspect_ratio() {
-        assert_eq!(live_capture_dimensions(4000, 2000, 2.0), (1280, 640));
+    fn polling_watchdog_only_takes_over_after_stream_stalls() {
+        assert!(!stream_frame_is_fresh(10_000, 0));
+        assert!(stream_frame_is_fresh(10_000, 9_500));
+        assert!(!stream_frame_is_fresh(10_000, 9_000));
+    }
+
+    #[test]
+    fn grid_gives_every_app_its_own_non_overlapping_card() {
+        let cards = card_layout(620.0, 420.0, 5);
+        assert_eq!(cards.len(), 5);
+        for (index, left) in cards.iter().enumerate() {
+            assert!(left.width > 0.0 && left.height > 0.0);
+            for right in cards.iter().skip(index + 1) {
+                let overlaps = left.x < right.x + right.width
+                    && left.x + left.width > right.x
+                    && left.y < right.y + right.height
+                    && left.y + left.height > right.y;
+                assert!(!overlaps, "cards {left:?} and {right:?} overlap");
+            }
+        }
+    }
+
+    #[test]
+    fn resize_geometry_keeps_far_edges_anchored() {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        let start = NSRect::new(NSPoint::new(100.0, 100.0), NSSize::new(400.0, 260.0));
+        let resized = resized_window_frame(
+            start,
+            40.0,
+            30.0,
+            RESIZE_LEFT | RESIZE_TOP,
+            NSSize::new(320.0, 200.0),
+        );
+        assert_eq!(resized.origin.x, 140.0);
+        assert_eq!(resized.size.width, 360.0);
+        assert_eq!(resized.origin.y, 100.0);
+        assert_eq!(resized.size.height, 290.0);
     }
 }

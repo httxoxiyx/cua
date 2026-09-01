@@ -651,9 +651,9 @@ pub fn parse_command() -> Command {
         );
         println!("  cua-driver history enable   Opt in and initialize encrypted local history.");
         println!("  cua-driver history status|pause|resume|flush|list|show|disable|delete");
-        println!("  --experimental-pip          Show a small always-on-top live screen preview.");
+        println!("  --experimental-pip          Show live per-app Computer Use preview cards.");
         println!(
-            "                              The window is movable, resizable, minimizable, and closable."
+            "                              Borderless stack; drag or resize it, then hover a card to hide it."
         );
         println!(
             "                              macOS only today; Win/Linux print a not-yet-implemented notice."

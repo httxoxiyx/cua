@@ -1,9 +1,10 @@
 //! pip-preview — shared types + trait for the experimental
-//! picture-in-picture agent preview window.
+//! picture-in-picture agent preview stack.
 //!
-//! The PiP window is an opt-in, always-on-top floating window. Platform
-//! backends may provide a live preview; the shared post-action frame hook
-//! remains available as a compatibility fallback. It mirrors the architecture used by
+//! PiP is opt-in and only receives exact application-window targets from
+//! Computer Use actions. Platform backends may provide a live preview; the
+//! shared post-action frame hook remains available as a compatibility fallback.
+//! It mirrors the architecture used by
 //! `cursor-overlay` (shared
 //! config/types here, platform-specific renderer in each `platform-*`
 //! crate) and the registration pattern used by `cua_driver_core::video`
@@ -14,6 +15,7 @@
 //! a clear "not yet implemented" error so the rest of the daemon
 //! continues without a PiP window.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Canonical `~/.cua-driver/config.json` path matching what the per-platform
@@ -250,7 +252,26 @@ impl PipConfig {
     }
 }
 
-/// A single fallback frame pushed into the PiP window after a tool call lands.
+/// Maximum number of simultaneously retained application previews.
+///
+/// This matches the visible stack limit in the OpenAI Codex desktop client and
+/// keeps capture streams, native views, and memory use bounded.
+pub const MAX_VISIBLE_PIP_CARDS: usize = 5;
+
+/// The exact native target represented by one application card.
+///
+/// Cards are keyed by `pid`, matching the user-facing "one card per app"
+/// model. `window_id` may advance when Computer Use moves to another root
+/// window owned by the same application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipTarget {
+    pub pid: i64,
+    pub window_id: u64,
+    pub app_name: String,
+    pub window_title: Option<String>,
+}
+
+/// A single exact-target fallback frame pushed after a tool call lands.
 ///
 /// `png_bytes` are the raw PNG bytes produced by the platform
 /// screenshot callback — the same path that powers `screenshot.png`
@@ -258,10 +279,99 @@ impl PipConfig {
 /// ignore these frames while their stream is active.
 #[derive(Debug, Clone)]
 pub struct PipFrame {
+    pub target: PipTarget,
     pub png_bytes: Vec<u8>,
     /// Wall-clock timestamp (ms since Unix epoch) — used by backends
     /// that want to show "last update Xs ago" in the title bar.
     pub timestamp_ms: u64,
+}
+
+/// Result of inserting a frame into [`PipViewModel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipUpsert {
+    /// The least-recently-updated app evicted to preserve the configured cap.
+    pub evicted_pid: Option<i64>,
+    /// Whether this app's exact root window changed and its live stream should
+    /// be replaced.
+    pub window_changed: bool,
+}
+
+/// Platform-neutral, bounded latest-frame model for the PiP card stack.
+pub struct PipViewModel {
+    max_cards: usize,
+    frames_by_pid: HashMap<i64, PipFrame>,
+    publication_order: Vec<i64>,
+}
+
+impl PipViewModel {
+    pub fn new(max_cards: usize) -> Self {
+        Self {
+            max_cards: max_cards.max(1),
+            frames_by_pid: HashMap::new(),
+            publication_order: Vec::new(),
+        }
+    }
+
+    pub fn upsert(&mut self, frame: PipFrame) -> PipUpsert {
+        let pid = frame.target.pid;
+        let is_new_app = !self.frames_by_pid.contains_key(&pid);
+        let window_changed = self
+            .frames_by_pid
+            .get(&pid)
+            .is_some_and(|previous| previous.target.window_id != frame.target.window_id);
+        self.frames_by_pid.insert(pid, frame);
+        if is_new_app {
+            self.publication_order.push(pid);
+        }
+
+        let evicted_pid = if self.frames_by_pid.len() > self.max_cards {
+            self.frames_by_pid
+                .iter()
+                .filter(|(candidate_pid, _)| **candidate_pid != pid)
+                .min_by_key(|(candidate_pid, candidate)| (candidate.timestamp_ms, **candidate_pid))
+                .map(|(candidate_pid, _)| *candidate_pid)
+        } else {
+            None
+        };
+        if let Some(evicted_pid) = evicted_pid {
+            self.frames_by_pid.remove(&evicted_pid);
+            self.publication_order
+                .retain(|published_pid| *published_pid != evicted_pid);
+        }
+
+        PipUpsert {
+            evicted_pid,
+            window_changed,
+        }
+    }
+
+    pub fn remove_app(&mut self, pid: i64) -> bool {
+        let removed = self.frames_by_pid.remove(&pid).is_some();
+        if removed {
+            self.publication_order
+                .retain(|published_pid| *published_pid != pid);
+        }
+        removed
+    }
+
+    pub fn frame_for_app(&self, pid: i64) -> Option<&PipFrame> {
+        self.frames_by_pid.get(&pid)
+    }
+
+    pub fn ordered_frames(&self) -> Vec<&PipFrame> {
+        self.publication_order
+            .iter()
+            .filter_map(|pid| self.frames_by_pid.get(pid))
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.frames_by_pid.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames_by_pid.is_empty()
+    }
 }
 
 /// A live PiP window. Owned by `main.rs` for the lifetime of the
@@ -272,6 +382,13 @@ pub trait PipBackend: Send + Sync {
     /// its UI toolkit requires (the macOS impl dispatches to the main
     /// queue via `dispatch_async`).
     fn push_frame(&self, frame: PipFrame);
+
+    /// Synchronously make the presentation input-transparent while Computer
+    /// Use performs a physical desktop action. This prevents an overlapping
+    /// card from intercepting a click intended for the controlled app.
+    fn set_input_passthrough(&self, _passthrough: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Close the window and release native resources. Called from
     /// `main.rs` on shutdown.
@@ -302,4 +419,67 @@ pub fn start_pip(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
         .get()
         .ok_or_else(|| anyhow::anyhow!("no PiP backend registered for this platform"))?;
     factory.start(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(pid: i64, window_id: u64, timestamp_ms: u64) -> PipFrame {
+        PipFrame {
+            target: PipTarget {
+                pid,
+                window_id,
+                app_name: format!("app-{pid}"),
+                window_title: None,
+            },
+            png_bytes: vec![pid as u8],
+            timestamp_ms,
+        }
+    }
+
+    #[test]
+    fn one_card_per_app_tracks_the_latest_root_window() {
+        let mut model = PipViewModel::new(5);
+        assert_eq!(model.upsert(frame(42, 7, 10)).window_changed, false);
+        assert_eq!(model.upsert(frame(42, 8, 20)).window_changed, true);
+        assert_eq!(model.len(), 1);
+        assert_eq!(model.frame_for_app(42).unwrap().target.window_id, 8);
+    }
+
+    #[test]
+    fn evicts_the_least_recently_updated_app_at_the_visible_limit() {
+        let mut model = PipViewModel::new(2);
+        model.upsert(frame(1, 11, 10));
+        model.upsert(frame(2, 22, 20));
+        let outcome = model.upsert(frame(3, 33, 30));
+        assert_eq!(outcome.evicted_pid, Some(1));
+        assert!(model.frame_for_app(1).is_none());
+        assert_eq!(model.len(), 2);
+    }
+
+    #[test]
+    fn current_app_is_not_immediately_evicted_when_refreshing_at_capacity() {
+        let mut model = PipViewModel::new(2);
+        model.upsert(frame(1, 11, 10));
+        model.upsert(frame(2, 22, 20));
+        let outcome = model.upsert(frame(1, 11, 30));
+        assert_eq!(outcome.evicted_pid, None);
+        let ordered = model.ordered_frames();
+        assert_eq!(ordered[0].target.pid, 1);
+    }
+
+    #[test]
+    fn refreshing_an_app_does_not_move_its_card() {
+        let mut model = PipViewModel::new(5);
+        model.upsert(frame(1, 11, 10));
+        model.upsert(frame(2, 22, 20));
+        model.upsert(frame(1, 11, 30));
+        let order = model
+            .ordered_frames()
+            .into_iter()
+            .map(|frame| frame.target.pid)
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![1, 2]);
+    }
 }

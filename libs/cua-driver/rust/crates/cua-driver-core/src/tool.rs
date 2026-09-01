@@ -1510,6 +1510,18 @@ impl ToolRegistry {
         } else {
             None
         };
+        let pip_input_passthrough = if _desktop_action.is_some() {
+            match pip_hook::begin_pip_input_passthrough() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "PiP preview could not yield pointer input before {resolved_name}: {error}"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let pending_turn = should_record
             .then(|| {
                 if private_consent_turn {
@@ -1523,6 +1535,7 @@ impl ToolRegistry {
             .flatten();
 
         let mut result = tool.invoke(args.clone()).await;
+        drop(pip_input_passthrough);
         drop(lifecycle_dispatch);
         // The platform worker has exited, so another text operation for this
         // pid may now start even while result projection and evidence capture
@@ -1653,10 +1666,15 @@ impl ToolRegistry {
         // not the recording-control meta-tools) so the live view matches
         // what the recorder would have captured for the turn.
         if pip_hook::pip_enabled() && should_record && !private_consent_turn {
-            let window_id = args.opt_u64("window_id");
-            let pid = args.opt_i64("pid");
-            if let Some(png_bytes) = screenshot_for(window_id, pid) {
+            let exact_target = pip_exact_native_target(&args);
+            if let Some(((window_id, pid), png_bytes)) =
+                exact_target.and_then(|(window_id, pid)| {
+                    screenshot_for(Some(window_id), Some(pid))
+                        .map(|png_bytes| ((window_id, pid), png_bytes))
+                })
+            {
                 pip_hook::push_pip_frame(pip_hook::PipHookFrame {
+                    target: pip_hook::PipHookTarget { pid, window_id },
                     png_bytes,
                     timestamp_ms: now_ms(),
                 });
@@ -2557,6 +2575,28 @@ fn is_physical_desktop_action(tool: &str) -> bool {
             | "bring_to_front"
             | "set_window_frame"
     )
+}
+
+/// Resolve the exact native window target accepted by both the canonical
+/// `target:{kind:"window", ...}` envelope and the legacy flat arguments.
+/// PiP never falls back to an ambient desktop capture.
+fn pip_exact_native_target(args: &Value) -> Option<(u64, i64)> {
+    let nested = args
+        .get("target")
+        .and_then(Value::as_object)
+        .and_then(|target| {
+            (target.get("kind").and_then(Value::as_str) == Some("window"))
+                .then(|| {
+                    target
+                        .get("window_id")
+                        .and_then(Value::as_u64)
+                        .zip(target.get("pid").and_then(Value::as_i64))
+                })
+                .flatten()
+        });
+    nested
+        .or_else(|| args.opt_u64("window_id").zip(args.opt_i64("pid")))
+        .filter(|(window_id, pid)| *window_id > 0 && *pid > 0)
 }
 
 /// Bucket that owns the processes a call is allowed to terminate.
@@ -5457,6 +5497,34 @@ mod capability_tests {
         assert!(
             !cap_strs.contains(&"input.keyboard.type.terminal_safe"),
             "type_text_chars must NOT claim terminal_safe: {cap_strs:?}"
+        );
+    }
+
+    #[test]
+    fn pip_prefers_the_canonical_exact_window_target() {
+        let args = serde_json::json!({
+            "pid": 1,
+            "window_id": 2,
+            "target": {"kind": "window", "pid": 42, "window_id": 77}
+        });
+        assert_eq!(pip_exact_native_target(&args), Some((77, 42)));
+    }
+
+    #[test]
+    fn pip_accepts_legacy_flat_exact_window_arguments_only() {
+        assert_eq!(
+            pip_exact_native_target(&serde_json::json!({"pid": 42, "window_id": 77})),
+            Some((77, 42))
+        );
+        assert_eq!(
+            pip_exact_native_target(&serde_json::json!({
+                "target": {"kind": "desktop", "display_id": "primary"}
+            })),
+            None
+        );
+        assert_eq!(
+            pip_exact_native_target(&serde_json::json!({"pid": 42})),
+            None
         );
     }
 
