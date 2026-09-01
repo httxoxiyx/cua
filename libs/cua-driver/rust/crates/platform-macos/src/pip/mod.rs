@@ -43,6 +43,7 @@ struct NativeHandles {
     window: usize,
     canvas: usize,
     delegate: usize,
+    global_mouse_monitor: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -98,6 +99,7 @@ static VIEW_MODEL: Mutex<Option<PipViewModel>> = Mutex::new(None);
 static HIDDEN_APPS: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static HOVERED_APP: Mutex<Option<i64>> = Mutex::new(None);
 static CARD_GESTURE: Mutex<Option<CardGesture>> = Mutex::new(None);
+static CURSOR_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 static LIVE_STREAMS: LazyLock<Mutex<HashMap<i64, LiveStreamEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -589,6 +591,10 @@ fn pip_card_view_class() -> &'static objc2::runtime::AnyClass {
                 card_mouse_entered as extern "C" fn(_, _, _),
             );
             builder.add_method(
+                objc2::sel!(cursorUpdate:),
+                card_mouse_entered as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
                 objc2::sel!(mouseDown:),
                 card_mouse_down as extern "C" fn(_, _, _),
             );
@@ -886,9 +892,71 @@ unsafe fn show_custom_cursor(
         return;
     }
     // Never hide or obscure the foreground application's cursor from this
-    // non-activating panel. AppKit may honor this safe best-effort cursor set;
-    // if it does not, the ordinary arrow remains visible.
+    // non-activating panel. AppKit cursor updates are safe even if the active
+    // application later replaces the requested image.
     let _: () = msg_send![cursor, set];
+}
+
+fn schedule_cursor_refresh() {
+    if !CURSOR_REFRESH_PENDING.swap(true, Ordering::SeqCst) {
+        dispatch_to_main((), cursor_refresh_cb);
+    }
+}
+
+unsafe fn current_pip_cursor_location(
+) -> Option<(*mut objc2::runtime::AnyObject, objc2_foundation::NSPoint)> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let window = HANDLES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|handles| handles.window)
+        .unwrap_or(0) as *mut AnyObject;
+    if window.is_null() {
+        return None;
+    }
+    let visible: objc2::runtime::Bool = msg_send![window, isVisible];
+    if !visible.as_bool() {
+        return None;
+    }
+    let frame: objc2_foundation::NSRect = msg_send![window, frame];
+    let mouse: objc2_foundation::NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
+    let inside = mouse.x >= frame.origin.x
+        && mouse.x < frame.origin.x + frame.size.width
+        && mouse.y >= frame.origin.y
+        && mouse.y < frame.origin.y + frame.size.height;
+    inside.then_some((
+        window,
+        objc2_foundation::NSPoint::new(mouse.x - frame.origin.x, mouse.y - frame.origin.y),
+    ))
+}
+
+unsafe extern "C" fn cursor_refresh_cb(ctx: *mut c_void) {
+    drop(Box::from_raw(ctx as *mut ()));
+    CURSOR_REFRESH_PENDING.store(false, Ordering::SeqCst);
+    let Some((window, location)) = current_pip_cursor_location() else {
+        hide_custom_cursor();
+        return;
+    };
+    refresh_cursor_at_window_point(window, location);
+}
+
+unsafe fn install_global_mouse_monitor() -> usize {
+    use block2::RcBlock;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let block = RcBlock::new(move |_event: *mut AnyObject| {
+        schedule_cursor_refresh();
+    });
+    let monitor: *mut AnyObject = msg_send![
+        objc2::class!(NSEvent),
+        addGlobalMonitorForEventsMatchingMask: 0x20u64
+        handler: &*block
+    ];
+    monitor as usize
 }
 
 fn hide_custom_cursor() {
@@ -1117,6 +1185,10 @@ fn resize_hit_view_class() -> &'static objc2::runtime::AnyClass {
             );
             builder.add_method(
                 objc2::sel!(mouseMoved:),
+                refresh_resize_cursor as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(cursorUpdate:),
                 refresh_resize_cursor as extern "C" fn(_, _, _),
             );
             builder.add_method(
@@ -1353,7 +1425,7 @@ unsafe fn add_resize_hit_view(
         positioned: 1i64
         relativeTo: std::ptr::null_mut::<AnyObject>()
     ];
-    let tracking_options: u64 = 0x1 | 0x2 | 0x80 | 0x200;
+    let tracking_options: u64 = 0x1 | 0x2 | 0x4 | 0x80 | 0x200 | 0x400;
     let tracking_allocated: *mut AnyObject = msg_send![objc2::class!(NSTrackingArea), alloc];
     let tracking: *mut AnyObject = msg_send![
         tracking_allocated,
@@ -1579,7 +1651,9 @@ unsafe fn install_tracking_area(card: *mut objc2::runtime::AnyObject) {
     use objc2::runtime::AnyObject;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-    let options: u64 = 0x1 | 0x2 | 0x80 | 0x200;
+    // Mouse enter/exit, move, cursor-update, always-active, visible-rect, and
+    // during-drag tracking. This matches Codex's native PIPStackContentView.
+    let options: u64 = 0x1 | 0x2 | 0x4 | 0x80 | 0x200 | 0x400;
     let allocated: *mut AnyObject = msg_send![objc2::class!(NSTrackingArea), alloc];
     let area: *mut AnyObject = msg_send![
         allocated,
@@ -1893,10 +1967,12 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
 
     let delegate = pip_delegate_instance();
     let _: () = msg_send![window, setDelegate: delegate];
+    let global_mouse_monitor = install_global_mouse_monitor();
     *HANDLES.lock().unwrap() = Some(NativeHandles {
         window: window as usize,
         canvas: canvas as usize,
         delegate: delegate as usize,
+        global_mouse_monitor,
     });
     *VIEW_MODEL.lock().unwrap() = Some(PipViewModel::new(MAX_VISIBLE_PIP_CARDS));
 
@@ -1923,6 +1999,13 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
     CARD_GESTURE.lock().unwrap().take();
     if let Some(handles) = HANDLES.lock().unwrap().take() {
         let window = handles.window as *mut AnyObject;
+        let global_mouse_monitor = handles.global_mouse_monitor as *mut AnyObject;
+        if !global_mouse_monitor.is_null() {
+            let _: () = msg_send![
+                objc2::class!(NSEvent),
+                removeMonitor: global_mouse_monitor
+            ];
+        }
         let _: () = msg_send![window, setDelegate: std::ptr::null_mut::<AnyObject>()];
         let _: () = msg_send![window, orderOut: std::ptr::null_mut::<AnyObject>()];
         let _: () = msg_send![window, close];
