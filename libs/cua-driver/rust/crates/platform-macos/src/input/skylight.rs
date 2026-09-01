@@ -44,7 +44,7 @@ type ConnectionIDFn = unsafe extern "C" fn() -> u32;
 /// `CGError SLSGetConnectionIDForPSN(uint32_t cid, const void *psn, uint32_t *out_cid)`
 type GetConnectionIDForPsnFn = unsafe extern "C" fn(u32, *const c_void, *mut u32) -> i32;
 
-/// `CGError CGSHideCursor(CGSConnectionID cid)` / `CGSShowCursor`.
+/// `CGError CGSObscureCursor(CGSConnectionID cid)` / `CGSRevealCursor`.
 type CursorVisibilityFn = unsafe extern "C" fn(u32) -> i32;
 
 /// `uint64_t CGSGetActiveSpace(uint32_t cid)`
@@ -167,20 +167,20 @@ fn get_connection_id_for_psn_fn() -> Option<GetConnectionIDForPsnFn> {
     })
 }
 
-fn hide_cursor_fn() -> Option<CursorVisibilityFn> {
+fn obscure_cursor_fn() -> Option<CursorVisibilityFn> {
     static SYM: OnceLock<Option<CursorVisibilityFn>> = OnceLock::new();
     *SYM.get_or_init(|| {
-        find_sym(b"SLSHideCursor\0")
-            .or_else(|| find_sym(b"CGSHideCursor\0"))
+        find_sym(b"SLSObscureCursor\0")
+            .or_else(|| find_sym(b"CGSObscureCursor\0"))
             .map(|p| unsafe { as_fn(p) })
     })
 }
 
-fn show_cursor_fn() -> Option<CursorVisibilityFn> {
+fn reveal_cursor_fn() -> Option<CursorVisibilityFn> {
     static SYM: OnceLock<Option<CursorVisibilityFn>> = OnceLock::new();
     *SYM.get_or_init(|| {
-        find_sym(b"SLSShowCursor\0")
-            .or_else(|| find_sym(b"CGSShowCursor\0"))
+        find_sym(b"SLSRevealCursor\0")
+            .or_else(|| find_sym(b"CGSRevealCursor\0"))
             .map(|p| unsafe { as_fn(p) })
     })
 }
@@ -261,18 +261,11 @@ pub fn is_available() -> bool {
     post_to_pid_fn().is_some()
 }
 
-/// Hide the cursor owned by the process WindowServer currently considers
-/// frontmost, returning that connection id so it can be restored later.
-///
-/// On macOS 26 an inactive non-activating panel can receive hover events, but
-/// AppKit cursor rectangles still leave the foreground application's cursor
-/// visible. Addressing that foreground connection avoids a doubled cursor.
-pub(crate) fn hide_front_process_cursor() -> Option<u32> {
-    let (Some(main_connection), Some(get_front), Some(get_connection), Some(hide_cursor)) = (
+fn front_process_connection() -> Option<u32> {
+    let (Some(main_connection), Some(get_front), Some(get_connection)) = (
         connection_id_fn(),
         get_front_process_fn(),
         get_connection_id_for_psn_fn(),
-        hide_cursor_fn(),
     ) else {
         return None;
     };
@@ -292,14 +285,34 @@ pub(crate) fn hide_front_process_cursor() -> Option<u32> {
     {
         return None;
     }
-    (unsafe { hide_cursor(front_connection) } == 0).then_some(front_connection)
+    Some(front_connection)
 }
 
-pub(crate) fn show_cursor_for_connection(connection: u32) -> bool {
-    connection != 0
-        && show_cursor_fn()
-            .map(|show_cursor| unsafe { show_cursor(connection) == 0 })
-            .unwrap_or(false)
+/// Hide the foreground application's cursor until the next physical mouse
+/// movement. Unlike `CGSHideCursor`, this does not leave a persistent hide
+/// count behind if the PiP process exits unexpectedly.
+pub(crate) fn obscure_front_process_cursor() -> Option<u32> {
+    let (Some(connection), Some(obscure_cursor)) =
+        (front_process_connection(), obscure_cursor_fn())
+    else {
+        return None;
+    };
+    (unsafe { obscure_cursor(connection) } == 0).then_some(connection)
+}
+
+pub(crate) fn reveal_cursor_for_connection(connection: u32) -> bool {
+    if connection == 0 {
+        return false;
+    }
+    reveal_cursor_fn()
+        .map(|reveal_cursor| unsafe { reveal_cursor(connection) == 0 })
+        .unwrap_or(false)
+}
+
+pub(crate) fn reveal_front_process_cursor() -> bool {
+    front_process_connection()
+        .map(reveal_cursor_for_connection)
+        .unwrap_or(false)
 }
 
 /// `true` when the focus-without-raise SPIs resolved, including either the

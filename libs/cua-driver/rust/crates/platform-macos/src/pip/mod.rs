@@ -125,6 +125,8 @@ const MINIMUM_PIP_HEIGHT: f64 = 180.0;
 const MAXIMUM_DEFAULT_PIP_WIDTH: f64 = 480.0;
 const MAXIMUM_DEFAULT_PIP_HEIGHT: f64 = 300.0;
 const CLICK_DRAG_THRESHOLD: f64 = 4.0;
+const CURSOR_WATCHDOG_INITIAL_DELAY: Duration = Duration::from_millis(35);
+const CURSOR_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
 const RESIZE_LEFT: isize = 1;
 const RESIZE_RIGHT: isize = 2;
@@ -933,30 +935,67 @@ unsafe fn show_custom_cursor(
     let _: () = msg_send![image_view, setFrame: frame];
     let _: () = msg_send![image_view, setHidden: false];
     SYSTEM_CURSOR_HIDDEN.store(true, Ordering::SeqCst);
-    if HIDDEN_CURSOR_CONNECTION.load(Ordering::SeqCst) == 0 {
-        if let Some(connection) = crate::input::skylight::hide_front_process_cursor() {
-            HIDDEN_CURSOR_CONNECTION.store(u64::from(connection), Ordering::SeqCst);
-        }
-    }
-    if !SYSTEM_CURSOR_HIDE_PENDING.swap(true, Ordering::SeqCst) {
-        // The foreground app may update its cursor after this inactive
-        // panel's mouseMoved callback. Reassert once that event has drained.
-        dispatch_to_main_after(Duration::from_millis(35), (), hide_system_cursor_cb);
+    obscure_system_cursor();
+    schedule_cursor_watchdog(CURSOR_WATCHDOG_INITIAL_DELAY);
+}
+
+fn obscure_system_cursor() {
+    let Some(connection) = crate::input::skylight::obscure_front_process_cursor() else {
+        return;
+    };
+    let previous = HIDDEN_CURSOR_CONNECTION.swap(u64::from(connection), Ordering::SeqCst) as u32;
+    if previous != 0 && previous != connection {
+        crate::input::skylight::reveal_cursor_for_connection(previous);
     }
 }
 
-unsafe extern "C" fn hide_system_cursor_cb(ctx: *mut c_void) {
+fn schedule_cursor_watchdog(delay: Duration) {
+    if !SYSTEM_CURSOR_HIDE_PENDING.swap(true, Ordering::SeqCst) {
+        dispatch_to_main_after(delay, (), cursor_watchdog_cb);
+    }
+}
+
+unsafe fn pointer_is_inside_pip_window() -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let window = HANDLES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|handles| handles.window)
+        .unwrap_or(0) as *mut AnyObject;
+    if window.is_null() {
+        return false;
+    }
+    let visible: objc2::runtime::Bool = msg_send![window, isVisible];
+    if !visible.as_bool() {
+        return false;
+    }
+    let frame: objc2_foundation::NSRect = msg_send![window, frame];
+    let mouse: objc2_foundation::NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
+    mouse.x >= frame.origin.x
+        && mouse.x < frame.origin.x + frame.size.width
+        && mouse.y >= frame.origin.y
+        && mouse.y < frame.origin.y + frame.size.height
+}
+
+unsafe extern "C" fn cursor_watchdog_cb(ctx: *mut c_void) {
     drop(Box::from_raw(ctx as *mut ()));
     SYSTEM_CURSOR_HIDE_PENDING.store(false, Ordering::SeqCst);
-    if SYSTEM_CURSOR_HIDDEN.load(Ordering::SeqCst) {
-        let previous = HIDDEN_CURSOR_CONNECTION.swap(0, Ordering::SeqCst) as u32;
-        if previous != 0 {
-            crate::input::skylight::show_cursor_for_connection(previous);
-        }
-        if let Some(connection) = crate::input::skylight::hide_front_process_cursor() {
-            HIDDEN_CURSOR_CONNECTION.store(u64::from(connection), Ordering::SeqCst);
-        }
+    if !SYSTEM_CURSOR_HIDDEN.load(Ordering::SeqCst) {
+        return;
     }
+    if !pointer_is_inside_pip_window() {
+        hide_custom_cursor();
+        return;
+    }
+
+    // The foreground app can replace its cursor after this inactive panel's
+    // mouseMoved callback. Reassert while the pointer is actually over the
+    // PiP, and stop immediately if an AppKit exit event was missed.
+    obscure_system_cursor();
+    schedule_cursor_watchdog(CURSOR_WATCHDOG_INTERVAL);
 }
 
 fn hide_custom_cursor() {
@@ -973,10 +1012,13 @@ fn hide_custom_cursor() {
         if !image_view.is_null() {
             let _: () = msg_send![image_view, setHidden: true];
         }
-        SYSTEM_CURSOR_HIDDEN.store(false, Ordering::SeqCst);
+        let was_active = SYSTEM_CURSOR_HIDDEN.swap(false, Ordering::SeqCst);
         let connection = HIDDEN_CURSOR_CONNECTION.swap(0, Ordering::SeqCst) as u32;
         if connection != 0 {
-            crate::input::skylight::show_cursor_for_connection(connection);
+            crate::input::skylight::reveal_cursor_for_connection(connection);
+        }
+        if was_active {
+            crate::input::skylight::reveal_front_process_cursor();
         }
     }
 }
@@ -1845,6 +1887,10 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
     if HANDLES.lock().unwrap().is_some() {
         return;
     }
+
+    // Repair any transient cursor state left by an interrupted prior PiP
+    // instance before installing this window's custom cursor overlay.
+    crate::input::skylight::reveal_front_process_cursor();
 
     let screen: *mut AnyObject = msg_send![objc2::class!(NSScreen), mainScreen];
     if screen.is_null() {
