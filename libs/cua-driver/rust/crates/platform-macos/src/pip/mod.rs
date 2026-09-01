@@ -43,7 +43,6 @@ struct NativeHandles {
     window: usize,
     canvas: usize,
     delegate: usize,
-    cursor_image_view: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -601,35 +600,13 @@ fn pip_card_view_class() -> &'static objc2::runtime::AnyClass {
                 objc2::sel!(mouseUp:),
                 card_mouse_up as extern "C" fn(_, _, _),
             );
-        }
-        builder.register()
-    })
-}
-
-fn pip_cursor_image_view_class() -> &'static objc2::runtime::AnyClass {
-    use objc2::class;
-    use objc2::declare::ClassBuilder;
-
-    static CLASS: OnceLock<&'static objc2::runtime::AnyClass> = OnceLock::new();
-    CLASS.get_or_init(|| {
-        let mut builder = ClassBuilder::new("CuaDriverPipCursorImageView", class!(NSImageView))
-            .expect("CuaDriverPipCursorImageView already registered");
-        unsafe {
             builder.add_method(
-                objc2::sel!(hitTest:),
-                cursor_image_hit_test as extern "C" fn(_, _, _) -> _,
+                objc2::sel!(resetCursorRects),
+                card_reset_cursor_rects as extern "C" fn(_, _),
             );
         }
         builder.register()
     })
-}
-
-extern "C" fn cursor_image_hit_test(
-    _view: *mut objc2::runtime::AnyObject,
-    _selector: objc2::runtime::Sel,
-    _point: objc2_foundation::NSPoint,
-) -> *mut objc2::runtime::AnyObject {
-    std::ptr::null_mut()
 }
 
 extern "C" fn accepts_first_mouse(
@@ -866,6 +843,38 @@ unsafe fn refresh_cursor_at_window_point(
     hide_custom_cursor();
 }
 
+extern "C" fn card_reset_cursor_rects(
+    view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    if view.is_null() {
+        return;
+    }
+    unsafe {
+        let _: () = msg_send![view, discardCursorRects];
+        let bounds: objc2_foundation::NSRect = msg_send![view, bounds];
+        let pid = CARD_VIEW_PIDS
+            .lock()
+            .unwrap()
+            .get(&(view as usize))
+            .copied();
+        let front_pid = VIEW_MODEL
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|model| model.ordered_frames().last().map(|frame| frame.target.pid));
+        let cursor: *mut AnyObject = if pid.is_some() && pid == front_pid {
+            msg_send![objc2::class!(NSCursor), pointingHandCursor]
+        } else {
+            msg_send![objc2::class!(NSCursor), arrowCursor]
+        };
+        let _: () = msg_send![view, addCursorRect: bounds cursor: cursor];
+    }
+}
+
 unsafe fn show_custom_cursor(
     _owner_window: *mut objc2::runtime::AnyObject,
     _location: objc2_foundation::NSPoint,
@@ -886,15 +895,10 @@ fn hide_custom_cursor() {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
 
-    let image_view = HANDLES
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|handles| handles.cursor_image_view)
-        .unwrap_or(0) as *mut AnyObject;
     unsafe {
-        if !image_view.is_null() {
-            let _: () = msg_send![image_view, setHidden: true];
+        let arrow: *mut AnyObject = msg_send![objc2::class!(NSCursor), arrowCursor];
+        if !arrow.is_null() {
+            let _: () = msg_send![arrow, set];
         }
     }
 }
@@ -1115,9 +1119,39 @@ fn resize_hit_view_class() -> &'static objc2::runtime::AnyClass {
                 objc2::sel!(mouseMoved:),
                 refresh_resize_cursor as extern "C" fn(_, _, _),
             );
+            builder.add_method(
+                objc2::sel!(resetCursorRects),
+                resize_reset_cursor_rects as extern "C" fn(_, _),
+            );
         }
         builder.register()
     })
+}
+
+extern "C" fn resize_reset_cursor_rects(
+    view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+) {
+    use objc2::msg_send;
+
+    if view.is_null() {
+        return;
+    }
+    unsafe {
+        let _: () = msg_send![view, discardCursorRects];
+        let bounds: objc2_foundation::NSRect = msg_send![view, bounds];
+        let direction = RESIZE_VIEW_DIRECTIONS
+            .lock()
+            .unwrap()
+            .get(&(view as usize))
+            .copied()
+            .unwrap_or(0);
+        let mut cursor = resize_cursor_for_direction(direction);
+        if cursor.is_null() {
+            cursor = msg_send![objc2::class!(NSCursor), arrowCursor];
+        }
+        let _: () = msg_send![view, addCursorRect: bounds cursor: cursor];
+    }
 }
 
 extern "C" fn refresh_resize_cursor(
@@ -1330,6 +1364,10 @@ unsafe fn add_resize_hit_view(
     ];
     let _: () = msg_send![view, addTrackingArea: tracking];
     let _: () = msg_send![tracking, release];
+    let window: *mut AnyObject = msg_send![view, window];
+    if !window.is_null() {
+        let _: () = msg_send![window, invalidateCursorRectsForView: view];
+    }
 }
 
 unsafe fn install_resize_hit_views(
@@ -1691,6 +1729,11 @@ unsafe fn render_card(
     let _: () = msg_send![clip, addSubview: controls];
 
     let _: () = msg_send![canvas, addSubview: card];
+    let window: *mut AnyObject = msg_send![card, window];
+    if !window.is_null() {
+        let _: () = msg_send![window, invalidateCursorRectsForView: card];
+        let _: () = msg_send![window, invalidateCursorRectsForView: drag_surface];
+    }
     NativeCardHandles {
         card: card as usize,
         image_view: image_view as usize,
@@ -1835,14 +1878,6 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
     let _: () = msg_send![window, setHidesOnDeactivate: false];
     let _: () = msg_send![window, setMinSize: minimum];
 
-    let cursor_image_view: *mut AnyObject = {
-        let allocated: *mut AnyObject = msg_send![pip_cursor_image_view_class(), alloc];
-        msg_send![allocated, initWithFrame: NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(1.0, 1.0),
-        )]
-    };
-
     let content_view: *mut AnyObject = msg_send![window, contentView];
     let _: () = msg_send![content_view, setWantsLayer: true];
     let content_layer: *mut AnyObject = msg_send![content_view, layer];
@@ -1855,13 +1890,6 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
     };
     let _: () = msg_send![canvas, setAutoresizingMask: 18u64];
     let _: () = msg_send![content_view, addSubview: canvas];
-    let _: () = msg_send![cursor_image_view, setHidden: true];
-    let _: () = msg_send![
-        content_view,
-        addSubview: cursor_image_view
-        positioned: 1i64
-        relativeTo: std::ptr::null_mut::<AnyObject>()
-    ];
 
     let delegate = pip_delegate_instance();
     let _: () = msg_send![window, setDelegate: delegate];
@@ -1869,7 +1897,6 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
         window: window as usize,
         canvas: canvas as usize,
         delegate: delegate as usize,
-        cursor_image_view: cursor_image_view as usize,
     });
     *VIEW_MODEL.lock().unwrap() = Some(PipViewModel::new(MAX_VISIBLE_PIP_CARDS));
 
