@@ -384,6 +384,25 @@ fn history_admission_requested(explicit: bool, persisted: bool) -> bool {
     explicit || persisted
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosAppKitHost {
+    CursorOverlay,
+    PipOnly,
+    None,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_appkit_host(cursor_enabled: bool, pip_enabled: bool) -> MacosAppKitHost {
+    if cursor_enabled {
+        MacosAppKitHost::CursorOverlay
+    } else if pip_enabled {
+        MacosAppKitHost::PipOnly
+    } else {
+        MacosAppKitHost::None
+    }
+}
+
 #[cfg(test)]
 mod history_admission_tests {
     use super::history_admission_requested;
@@ -398,6 +417,25 @@ mod history_admission_tests {
         assert!(!history_admission_requested(false, false));
         assert!(history_admission_requested(true, false));
         assert!(history_admission_requested(true, true));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_appkit_host_tests {
+    use super::{macos_appkit_host, MacosAppKitHost};
+
+    #[test]
+    fn cursor_renderer_owns_the_shared_appkit_loop_when_pip_is_also_enabled() {
+        assert_eq!(
+            macos_appkit_host(true, true),
+            MacosAppKitHost::CursorOverlay
+        );
+        assert_eq!(
+            macos_appkit_host(true, false),
+            MacosAppKitHost::CursorOverlay
+        );
+        assert_eq!(macos_appkit_host(false, true), MacosAppKitHost::PipOnly);
+        assert_eq!(macos_appkit_host(false, false), MacosAppKitHost::None);
     }
 }
 
@@ -724,26 +762,24 @@ fn main() {
                 );
             }
 
-            // Keep the main thread alive for the daemon.
-            //
-            // PiP needs the AppKit main run loop to process the
-            // dispatch_async_f calls that push frames into NSImageView;
-            // park main in NSApplication.run() when --experimental-pip is
-            // on. Otherwise just join the serve thread so the process
-            // stays up as long as the daemon does.
-            if pip_cfg.enabled {
-                platform_macos::pip::run_appkit_main_loop();
-            } else if cursor_cfg.enabled {
-                // Render the agent-cursor overlay: park the main thread in the
-                // AppKit run loop so the overlay NSWindow draws. `run_on_main_thread`
-                // self-guards on `has_graphic_access()` and returns immediately
-                // when the daemon has no Window Server session — fall through to
-                // join so the daemon still serves headless. The serve thread runs
-                // on its background thread regardless.
-                platform_macos::cursor::overlay::run_on_main_thread();
-                let _ = serve_handle.join();
-            } else {
-                let _ = serve_handle.join();
+            // Keep one AppKit main loop alive for every enabled observer UI.
+            // The cursor renderer owns its own command-draining render pump;
+            // choosing the PiP-only loop while cursor support is enabled would
+            // leave physical actions waiting forever for cursor arrival. PiP
+            // windows use the same NSApplication loop through main-queue
+            // callbacks, so the cursor host can service both surfaces.
+            match macos_appkit_host(cursor_cfg.enabled, pip_cfg.enabled) {
+                MacosAppKitHost::CursorOverlay => {
+                    if pip_cfg.enabled {
+                        platform_macos::pip::prepare_for_shared_appkit_main_loop();
+                    }
+                    platform_macos::cursor::overlay::run_on_main_thread();
+                    let _ = serve_handle.join();
+                }
+                MacosAppKitHost::PipOnly => platform_macos::pip::run_appkit_main_loop(),
+                MacosAppKitHost::None => {
+                    let _ = serve_handle.join();
+                }
             }
         }
         cli::Command::Stop {

@@ -1659,13 +1659,13 @@ impl ToolRegistry {
             );
         }
 
-        // Experimental PiP push — only when --experimental-pip is on argv
-        // (otherwise `pip_enabled()` is false and we skip the screenshot
-        // entirely to avoid wasted capture work). We push for the same set
-        // of action tools the recording pipeline cares about (non-read-only,
-        // not the recording-control meta-tools) so the live view matches
-        // what the recorder would have captured for the turn.
-        if pip_hook::pip_enabled() && should_record && !private_consent_turn {
+        // Experimental PiP push — only when --experimental-pip is on argv.
+        // In addition to post-action frames, a successful exact-window
+        // observation seeds the preview before the first mutation. Other
+        // read-only tools remain excluded to avoid ambient/duplicate capture.
+        let should_publish_pip =
+            pip_frame_should_publish(resolved_name, should_record, result.is_error == Some(true));
+        if pip_hook::pip_enabled() && should_publish_pip && !private_consent_turn {
             let exact_target = pip_exact_native_target(&args);
             if let Some(((window_id, pid), png_bytes)) =
                 exact_target.and_then(|(window_id, pid)| {
@@ -2597,6 +2597,10 @@ fn pip_exact_native_target(args: &Value) -> Option<(u64, i64)> {
     nested
         .or_else(|| args.opt_u64("window_id").zip(args.opt_i64("pid")))
         .filter(|(window_id, pid)| *window_id > 0 && *pid > 0)
+}
+
+fn pip_frame_should_publish(tool_name: &str, should_record: bool, result_is_error: bool) -> bool {
+    should_record || (tool_name == "get_window_state" && !result_is_error)
 }
 
 /// Bucket that owns the processes a call is allowed to terminate.
@@ -5526,6 +5530,22 @@ mod capability_tests {
             pip_exact_native_target(&serde_json::json!({"pid": 42})),
             None
         );
+    }
+
+    #[test]
+    fn pip_frame_policy_includes_exact_window_observations() {
+        assert!(super::pip_frame_should_publish("click", true, true));
+        assert!(super::pip_frame_should_publish(
+            "get_window_state",
+            false,
+            false
+        ));
+        assert!(!super::pip_frame_should_publish(
+            "get_window_state",
+            false,
+            true
+        ));
+        assert!(!super::pip_frame_should_publish("list_apps", false, false));
     }
 
     #[test]

@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -74,6 +75,8 @@ static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<OverlayMsg>> = OnceLock::new
 // Single-consumer slot; receiver is moved into run_on_main_thread().
 static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<OverlayMsg>>> = Mutex::new(None);
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
+static RENDER_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
+const CURSOR_ARRIVAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The keyed, insertion-ordered collection of owned cursors that the render
 /// loop composites every frame. Insertion order = stable z-order (later keys
@@ -409,6 +412,14 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     if !should_animate {
         return;
     }
+    if !RENDER_LOOP_RUNNING.load(Ordering::Acquire) {
+        tracing::warn!(
+            target: "cursor",
+            cursor = %key,
+            "cursor renderer is unavailable; continuing without animation"
+        );
+        return;
+    }
 
     // Create a one-shot channel; store the sender (keyed) so the render thread
     // can fire it when this cursor's path finishes.
@@ -417,7 +428,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
 
     // Send the MoveTo command (click offset applied inside apply_command).
     send_command(
-        key,
+        key.clone(),
         OverlayCommand::MoveTo {
             x,
             y,
@@ -427,8 +438,19 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
         },
     );
 
-    // Await arrival signal (fired from render thread when Dubins path ends).
-    let _ = rx.await;
+    // Visual feedback must never hold the real desktop action indefinitely.
+    // The renderer normally fires this promptly; the timeout is a final guard
+    // against a stopped or wedged UI pump.
+    if tokio::time::timeout(CURSOR_ARRIVAL_TIMEOUT, rx)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            target: "cursor",
+            cursor = %key,
+            "cursor animation timed out; continuing with the desktop action"
+        );
+    }
 }
 
 /// Block the calling thread (must be the OS main thread) running the AppKit
@@ -682,8 +704,10 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     // ---- Render thread (60 fps) ----
     let layer_ptr = layer as usize;
     let win_ptr = win as usize;
+    RENDER_LOOP_RUNNING.store(true, Ordering::Release);
     std::thread::spawn(move || {
         render_loop(layer_ptr, win_ptr, rx, win_w, win_h);
+        RENDER_LOOP_RUNNING.store(false, Ordering::Release);
     });
 
     // ---- NSApplication run loop (blocks until process exits) ----

@@ -2,8 +2,8 @@
 //! picture-in-picture agent preview stack.
 //!
 //! PiP is opt-in and only receives exact application-window targets from
-//! Computer Use actions. Platform backends may provide a live preview; the
-//! shared post-action frame hook remains available as a compatibility fallback.
+//! Computer Use observations and actions. Platform backends may provide a live
+//! preview; the shared frame hook remains available as a compatibility fallback.
 //! It mirrors the architecture used by
 //! `cursor-overlay` (shared
 //! config/types here, platform-specific renderer in each `platform-*`

@@ -753,8 +753,20 @@ fn stop_live_capture_for(pid: i64) {
         entry.cancelled.store(true, Ordering::Release);
         entry.frame_pending.store(false, Ordering::Release);
         if let Some(stream) = entry.stream {
-            if let Err(error) = stream.stop_capture() {
-                tracing::debug!(target: "pip", pid, %error, "failed to stop app PiP capture cleanly");
+            // SCStream::stop_capture is a blocking wait. Foreground visibility
+            // reconciliation runs on AppKit's main queue, so stopping inline
+            // can freeze both PiP and the shared cursor UI pump. Cancellation
+            // already prevents late frames from being rendered; finish the
+            // native teardown away from the main thread.
+            if let Err(error) = std::thread::Builder::new()
+                .name(format!("cua-pip-stop-{pid}"))
+                .spawn(move || {
+                    if let Err(error) = stream.stop_capture() {
+                        tracing::debug!(target: "pip", pid, %error, "failed to stop app PiP capture cleanly");
+                    }
+                })
+            {
+                tracing::warn!(target: "pip", pid, %error, "failed to schedule app PiP capture teardown");
             }
         }
     }
@@ -2378,14 +2390,14 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
     }
 }
 
-/// Park the main thread in `NSApplication.run()` so AppKit can service the
-/// asynchronously created stack and live-frame callbacks.
-pub fn run_appkit_main_loop() {
+/// Prepare the process-wide AppKit host when another observer (currently the
+/// agent cursor) owns the actual `NSApplication.run()` call.
+pub fn prepare_for_shared_appkit_main_loop() {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
 
     let _mtm = objc2_foundation::MainThreadMarker::new()
-        .expect("run_appkit_main_loop must be called from the main thread");
+        .expect("prepare_for_shared_appkit_main_loop must run on the main thread");
     unsafe {
         let app: *mut AnyObject = msg_send![objc2::class!(NSApplication), sharedApplication];
         let _: bool = msg_send![app, setActivationPolicy: 1i64];
@@ -2404,6 +2416,18 @@ pub fn run_appkit_main_loop() {
                 "WindowServer rejected background cursor ownership; PiP hover cursors may be unavailable"
             );
         }
+    }
+}
+
+/// Park the main thread in `NSApplication.run()` so AppKit can service the
+/// asynchronously created stack and live-frame callbacks.
+pub fn run_appkit_main_loop() {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    prepare_for_shared_appkit_main_loop();
+    unsafe {
+        let app: *mut AnyObject = msg_send![objc2::class!(NSApplication), sharedApplication];
         let _: () = msg_send![app, finishLaunching];
         let _: () = msg_send![app, run];
     }
