@@ -41,6 +41,9 @@ type SetIntFieldFn = unsafe extern "C" fn(*mut c_void, u32, i64);
 /// `uint32_t CGSMainConnectionID(void)`
 type ConnectionIDFn = unsafe extern "C" fn() -> u32;
 
+/// `CGError CGSSetConnectionProperty(CGSConnectionID, CGSConnectionID, CFStringRef, CFTypeRef)`
+type SetConnectionPropertyFn = unsafe extern "C" fn(u32, u32, *const c_void, *const c_void) -> i32;
+
 /// `uint64_t CGSGetActiveSpace(uint32_t cid)`
 type GetActiveSpaceFn = unsafe extern "C" fn(u32) -> u64;
 
@@ -150,6 +153,29 @@ fn set_int_field_fn() -> Option<SetIntFieldFn> {
 fn connection_id_fn() -> Option<ConnectionIDFn> {
     static SYM: OnceLock<Option<ConnectionIDFn>> = OnceLock::new();
     *SYM.get_or_init(|| find_sym(b"CGSMainConnectionID\0").map(|p| unsafe { as_fn(p) }))
+}
+
+fn set_connection_property_fn() -> Option<SetConnectionPropertyFn> {
+    static SYM: OnceLock<Option<SetConnectionPropertyFn>> = OnceLock::new();
+    *SYM.get_or_init(|| {
+        find_sym(b"SLSSetConnectionProperty\0")
+            .or_else(|| find_sym(b"CGSSetConnectionProperty\0"))
+            .map(|p| unsafe { as_fn(p) })
+    })
+}
+
+/// Allow this process's AppKit cursor requests to win while its nonactivating
+/// PiP panel is above a foreground application.
+pub(crate) fn enable_background_cursor_updates(
+    property: *const c_void,
+    value: *const c_void,
+) -> bool {
+    let (Some(connection), Some(set_property)) = (connection_id_fn(), set_connection_property_fn())
+    else {
+        return false;
+    };
+    let connection = unsafe { connection() };
+    connection != 0 && unsafe { set_property(connection, connection, property, value) } == 0
 }
 
 fn get_active_space_fn() -> Option<GetActiveSpaceFn> {

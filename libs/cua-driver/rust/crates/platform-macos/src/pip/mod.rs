@@ -44,6 +44,7 @@ struct NativeHandles {
     canvas: usize,
     delegate: usize,
     global_mouse_monitor: usize,
+    local_mouse_monitor: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -606,9 +607,43 @@ fn pip_card_view_class() -> &'static objc2::runtime::AnyClass {
                 objc2::sel!(mouseUp:),
                 card_mouse_up as extern "C" fn(_, _, _),
             );
+        }
+        builder.register()
+    })
+}
+
+fn pip_canvas_view_class() -> &'static objc2::runtime::AnyClass {
+    use objc2::class;
+    use objc2::declare::ClassBuilder;
+
+    static CLASS: OnceLock<&'static objc2::runtime::AnyClass> = OnceLock::new();
+    CLASS.get_or_init(|| {
+        let mut builder = ClassBuilder::new("CuaDriverPipCanvasView", class!(NSView))
+            .expect("CuaDriverPipCanvasView already registered");
+        unsafe {
+            builder.add_method(
+                objc2::sel!(acceptsFirstMouse:),
+                accepts_first_mouse as extern "C" fn(_, _, _) -> objc2::runtime::Bool,
+            );
+            builder.add_method(
+                objc2::sel!(mouseEntered:),
+                canvas_mouse_moved as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(mouseExited:),
+                canvas_mouse_moved as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(mouseMoved:),
+                canvas_mouse_moved as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(cursorUpdate:),
+                canvas_mouse_moved as extern "C" fn(_, _, _),
+            );
             builder.add_method(
                 objc2::sel!(resetCursorRects),
-                card_reset_cursor_rects as extern "C" fn(_, _),
+                canvas_reset_cursor_rects as extern "C" fn(_, _),
             );
         }
         builder.register()
@@ -782,6 +817,19 @@ extern "C" fn card_mouse_exited(
     unsafe { refresh_cursor_at_event(view, event) };
 }
 
+extern "C" fn canvas_mouse_moved(
+    view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    event: *mut objc2::runtime::AnyObject,
+) {
+    if view.is_null() || event.is_null() {
+        return;
+    }
+    let pid = unsafe { hovered_pid_at_event(view, event) };
+    set_hovered_app(pid);
+    unsafe { refresh_cursor_at_event(view, event) };
+}
+
 unsafe fn refresh_cursor_at_event(
     view: *mut objc2::runtime::AnyObject,
     event: *mut objc2::runtime::AnyObject,
@@ -793,11 +841,20 @@ unsafe fn refresh_cursor_at_event(
     if window.is_null() {
         return;
     }
-    let location: objc2_foundation::NSPoint = msg_send![event, locationInWindow];
-    refresh_cursor_at_window_point(window, location);
+    let content: *mut AnyObject = msg_send![window, contentView];
+    if content.is_null() {
+        return;
+    }
+    let window_point: objc2_foundation::NSPoint = msg_send![event, locationInWindow];
+    let content_point: objc2_foundation::NSPoint = msg_send![
+        content,
+        convertPoint: window_point
+        fromView: std::ptr::null_mut::<AnyObject>()
+    ];
+    refresh_cursor_at_content_point(window, content_point);
 }
 
-unsafe fn refresh_cursor_at_window_point(
+unsafe fn refresh_cursor_at_content_point(
     window: *mut objc2::runtime::AnyObject,
     location: objc2_foundation::NSPoint,
 ) {
@@ -849,12 +906,13 @@ unsafe fn refresh_cursor_at_window_point(
     hide_custom_cursor();
 }
 
-extern "C" fn card_reset_cursor_rects(
+extern "C" fn canvas_reset_cursor_rects(
     view: *mut objc2::runtime::AnyObject,
     _selector: objc2::runtime::Sel,
 ) {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     if view.is_null() {
         return;
@@ -862,22 +920,33 @@ extern "C" fn card_reset_cursor_rects(
     unsafe {
         let _: () = msg_send![view, discardCursorRects];
         let bounds: objc2_foundation::NSRect = msg_send![view, bounds];
-        let pid = CARD_VIEW_PIDS
-            .lock()
-            .unwrap()
-            .get(&(view as usize))
-            .copied();
-        let front_pid = VIEW_MODEL
+        let count = VIEW_MODEL
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|model| model.ordered_frames().last().map(|frame| frame.target.pid));
-        let cursor: *mut AnyObject = if pid.is_some() && pid == front_pid {
-            msg_send![objc2::class!(NSCursor), pointingHandCursor]
-        } else {
-            msg_send![objc2::class!(NSCursor), arrowCursor]
-        };
-        let _: () = msg_send![view, addCursorRect: bounds cursor: cursor];
+            .map(|model| model.ordered_frames().len())
+            .unwrap_or(0);
+        let layout = card_layout(bounds.size.width, bounds.size.height, count);
+        let hand: *mut AnyObject = msg_send![objc2::class!(NSCursor), pointingHandCursor];
+
+        if let Some(front) = layout.last() {
+            let inset = RESIZE_HIT_INSET;
+            let front_rect = NSRect::new(
+                NSPoint::new(front.x + inset, front.y + inset),
+                NSSize::new(
+                    (front.width - inset * 2.0).max(0.0),
+                    (front.height - inset * 2.0).max(0.0),
+                ),
+            );
+            let _: () = msg_send![view, addCursorRect: front_rect cursor: hand];
+        }
+
+        for (rect, direction) in resize_cursor_rects(bounds, &layout) {
+            let cursor = resize_cursor_for_direction(direction);
+            if !cursor.is_null() {
+                let _: () = msg_send![view, addCursorRect: rect cursor: cursor];
+            }
+        }
     }
 }
 
@@ -921,16 +990,23 @@ unsafe fn current_pip_cursor_location(
     if !visible.as_bool() {
         return None;
     }
-    let frame: objc2_foundation::NSRect = msg_send![window, frame];
-    let mouse: objc2_foundation::NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
-    let inside = mouse.x >= frame.origin.x
-        && mouse.x < frame.origin.x + frame.size.width
-        && mouse.y >= frame.origin.y
-        && mouse.y < frame.origin.y + frame.size.height;
-    inside.then_some((
-        window,
-        objc2_foundation::NSPoint::new(mouse.x - frame.origin.x, mouse.y - frame.origin.y),
-    ))
+    let content: *mut AnyObject = msg_send![window, contentView];
+    if content.is_null() {
+        return None;
+    }
+    let window_point: objc2_foundation::NSPoint =
+        msg_send![window, mouseLocationOutsideOfEventStream];
+    let content_point: objc2_foundation::NSPoint = msg_send![
+        content,
+        convertPoint: window_point
+        fromView: std::ptr::null_mut::<AnyObject>()
+    ];
+    let bounds: objc2_foundation::NSRect = msg_send![content, bounds];
+    let inside = content_point.x >= bounds.origin.x
+        && content_point.x < bounds.origin.x + bounds.size.width
+        && content_point.y >= bounds.origin.y
+        && content_point.y < bounds.origin.y + bounds.size.height;
+    inside.then_some((window, content_point))
 }
 
 unsafe extern "C" fn cursor_refresh_cb(ctx: *mut c_void) {
@@ -940,10 +1016,10 @@ unsafe extern "C" fn cursor_refresh_cb(ctx: *mut c_void) {
         hide_custom_cursor();
         return;
     };
-    refresh_cursor_at_window_point(window, location);
+    refresh_cursor_at_content_point(window, location);
 }
 
-unsafe fn install_global_mouse_monitor() -> usize {
+unsafe fn install_mouse_monitors() -> (usize, usize) {
     use block2::RcBlock;
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
@@ -951,12 +1027,21 @@ unsafe fn install_global_mouse_monitor() -> usize {
     let block = RcBlock::new(move |_event: *mut AnyObject| {
         schedule_cursor_refresh();
     });
-    let monitor: *mut AnyObject = msg_send![
+    let global_monitor: *mut AnyObject = msg_send![
         objc2::class!(NSEvent),
         addGlobalMonitorForEventsMatchingMask: 0x20u64
         handler: &*block
     ];
-    monitor as usize
+    let local_block = RcBlock::new(move |event: *mut AnyObject| -> *mut AnyObject {
+        schedule_cursor_refresh();
+        event
+    });
+    let local_monitor: *mut AnyObject = msg_send![
+        objc2::class!(NSEvent),
+        addLocalMonitorForEventsMatchingMask: 0x20u64
+        handler: &*local_block
+    ];
+    (global_monitor as usize, local_monitor as usize)
 }
 
 fn hide_custom_cursor() {
@@ -1093,9 +1178,9 @@ extern "C" fn card_mouse_up(
                 }
             }
         }
-        let location: objc2_foundation::NSPoint =
-            msg_send![window, mouseLocationOutsideOfEventStream];
-        refresh_cursor_at_window_point(window, location);
+        if let Some((window, location)) = current_pip_cursor_location() {
+            refresh_cursor_at_content_point(window, location);
+        }
     }
 }
 
@@ -1191,39 +1276,9 @@ fn resize_hit_view_class() -> &'static objc2::runtime::AnyClass {
                 objc2::sel!(cursorUpdate:),
                 refresh_resize_cursor as extern "C" fn(_, _, _),
             );
-            builder.add_method(
-                objc2::sel!(resetCursorRects),
-                resize_reset_cursor_rects as extern "C" fn(_, _),
-            );
         }
         builder.register()
     })
-}
-
-extern "C" fn resize_reset_cursor_rects(
-    view: *mut objc2::runtime::AnyObject,
-    _selector: objc2::runtime::Sel,
-) {
-    use objc2::msg_send;
-
-    if view.is_null() {
-        return;
-    }
-    unsafe {
-        let _: () = msg_send![view, discardCursorRects];
-        let bounds: objc2_foundation::NSRect = msg_send![view, bounds];
-        let direction = RESIZE_VIEW_DIRECTIONS
-            .lock()
-            .unwrap()
-            .get(&(view as usize))
-            .copied()
-            .unwrap_or(0);
-        let mut cursor = resize_cursor_for_direction(direction);
-        if cursor.is_null() {
-            cursor = msg_send![objc2::class!(NSCursor), arrowCursor];
-        }
-        let _: () = msg_send![view, addCursorRect: bounds cursor: cursor];
-    }
 }
 
 extern "C" fn refresh_resize_cursor(
@@ -1436,10 +1491,6 @@ unsafe fn add_resize_hit_view(
     ];
     let _: () = msg_send![view, addTrackingArea: tracking];
     let _: () = msg_send![tracking, release];
-    let window: *mut AnyObject = msg_send![view, window];
-    if !window.is_null() {
-        let _: () = msg_send![window, invalidateCursorRectsForView: view];
-    }
 }
 
 unsafe fn install_resize_hit_views(
@@ -1447,57 +1498,60 @@ unsafe fn install_resize_hit_views(
     bounds: objc2_foundation::NSRect,
     layout: &[CardRect],
 ) {
+    for (rect, direction) in resize_cursor_rects(bounds, layout) {
+        add_resize_hit_view(canvas, rect, direction, 0);
+    }
+}
+
+fn resize_cursor_rects(
+    bounds: objc2_foundation::NSRect,
+    layout: &[CardRect],
+) -> Vec<(objc2_foundation::NSRect, isize)> {
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     let (Some(back), Some(front)) = (layout.first(), layout.last()) else {
-        return;
+        return Vec::new();
     };
     let edge = RESIZE_HIT_INSET;
     let half = edge / 2.0;
     let clamp_x = |x: f64| x.clamp(0.0, (bounds.size.width - edge).max(0.0));
     let clamp_y = |y: f64| y.clamp(0.0, (bounds.size.height - edge).max(0.0));
-    add_resize_hit_view(
-        canvas,
-        NSRect::new(
-            NSPoint::new(clamp_x(front.x - half), clamp_y(front.y - half)),
-            NSSize::new(edge, edge),
-        ),
-        RESIZE_LEFT | RESIZE_BOTTOM,
-        0,
-    );
-    add_resize_hit_view(
-        canvas,
-        NSRect::new(
-            NSPoint::new(
-                clamp_x(front.x + front.width - half),
-                clamp_y(front.y - half),
+    vec![
+        (
+            NSRect::new(
+                NSPoint::new(clamp_x(front.x - half), clamp_y(front.y - half)),
+                NSSize::new(edge, edge),
             ),
-            NSSize::new(edge, edge),
+            RESIZE_LEFT | RESIZE_BOTTOM,
         ),
-        RESIZE_RIGHT | RESIZE_BOTTOM,
-        0,
-    );
-    add_resize_hit_view(
-        canvas,
-        NSRect::new(
-            NSPoint::new(clamp_x(back.x - half), clamp_y(back.y + back.height - half)),
-            NSSize::new(edge, edge),
-        ),
-        RESIZE_LEFT | RESIZE_TOP,
-        0,
-    );
-    add_resize_hit_view(
-        canvas,
-        NSRect::new(
-            NSPoint::new(
-                clamp_x(back.x + back.width - half),
-                clamp_y(back.y + back.height - half),
+        (
+            NSRect::new(
+                NSPoint::new(
+                    clamp_x(front.x + front.width - half),
+                    clamp_y(front.y - half),
+                ),
+                NSSize::new(edge, edge),
             ),
-            NSSize::new(edge, edge),
+            RESIZE_RIGHT | RESIZE_BOTTOM,
         ),
-        RESIZE_RIGHT | RESIZE_TOP,
-        0,
-    );
+        (
+            NSRect::new(
+                NSPoint::new(clamp_x(back.x - half), clamp_y(back.y + back.height - half)),
+                NSSize::new(edge, edge),
+            ),
+            RESIZE_LEFT | RESIZE_TOP,
+        ),
+        (
+            NSRect::new(
+                NSPoint::new(
+                    clamp_x(back.x + back.width - half),
+                    clamp_y(back.y + back.height - half),
+                ),
+                NSSize::new(edge, edge),
+            ),
+            RESIZE_RIGHT | RESIZE_TOP,
+        ),
+    ]
 }
 
 unsafe fn ns_string(value: &str) -> *mut objc2::runtime::AnyObject {
@@ -1803,11 +1857,6 @@ unsafe fn render_card(
     let _: () = msg_send![clip, addSubview: controls];
 
     let _: () = msg_send![canvas, addSubview: card];
-    let window: *mut AnyObject = msg_send![card, window];
-    if !window.is_null() {
-        let _: () = msg_send![window, invalidateCursorRectsForView: card];
-        let _: () = msg_send![window, invalidateCursorRectsForView: drag_surface];
-    }
     NativeCardHandles {
         card: card as usize,
         image_view: image_view as usize,
@@ -1847,9 +1896,10 @@ unsafe fn render_snapshot(snapshot: &[PipFrame]) {
             .insert(frame.target.pid, handles);
     }
     install_resize_hit_views(canvas, bounds, &layout);
-    let mouse_location: objc2_foundation::NSPoint =
-        msg_send![window, mouseLocationOutsideOfEventStream];
-    refresh_cursor_at_window_point(window, mouse_location);
+    let _: () = msg_send![window, invalidateCursorRectsForView: canvas];
+    if let Some((window, location)) = current_pip_cursor_location() {
+        refresh_cursor_at_content_point(window, location);
+    }
 
     let hovered_pid = HOVERED_APP.lock().unwrap().take();
     set_hovered_app(hovered_pid);
@@ -1905,7 +1955,7 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
 
     // Borderless, non-activating panel. Movement and resizing are handled by
     // custom hit views, so no standard traffic-light controls cover previews.
-    let style_mask: u64 = (1 << 7) | (1 << 3);
+    let style_mask: u64 = 1 << 7;
     let window: *mut AnyObject = {
         let allocated: *mut AnyObject = msg_send![objc2::class!(NSPanel), alloc];
         msg_send![
@@ -1959,20 +2009,22 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
 
     let bounds: NSRect = msg_send![content_view, bounds];
     let canvas: *mut AnyObject = {
-        let allocated: *mut AnyObject = msg_send![objc2::class!(NSView), alloc];
+        let allocated: *mut AnyObject = msg_send![pip_canvas_view_class(), alloc];
         msg_send![allocated, initWithFrame: bounds]
     };
     let _: () = msg_send![canvas, setAutoresizingMask: 18u64];
     let _: () = msg_send![content_view, addSubview: canvas];
+    install_tracking_area(canvas);
 
     let delegate = pip_delegate_instance();
     let _: () = msg_send![window, setDelegate: delegate];
-    let global_mouse_monitor = install_global_mouse_monitor();
+    let (global_mouse_monitor, local_mouse_monitor) = install_mouse_monitors();
     *HANDLES.lock().unwrap() = Some(NativeHandles {
         window: window as usize,
         canvas: canvas as usize,
         delegate: delegate as usize,
         global_mouse_monitor,
+        local_mouse_monitor,
     });
     *VIEW_MODEL.lock().unwrap() = Some(PipViewModel::new(MAX_VISIBLE_PIP_CARDS));
 
@@ -2006,6 +2058,13 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
                 removeMonitor: global_mouse_monitor
             ];
         }
+        let local_mouse_monitor = handles.local_mouse_monitor as *mut AnyObject;
+        if !local_mouse_monitor.is_null() {
+            let _: () = msg_send![
+                objc2::class!(NSEvent),
+                removeMonitor: local_mouse_monitor
+            ];
+        }
         let _: () = msg_send![window, setDelegate: std::ptr::null_mut::<AnyObject>()];
         let _: () = msg_send![window, orderOut: std::ptr::null_mut::<AnyObject>()];
         let _: () = msg_send![window, close];
@@ -2024,6 +2083,21 @@ pub fn run_appkit_main_loop() {
     unsafe {
         let app: *mut AnyObject = msg_send![objc2::class!(NSApplication), sharedApplication];
         let _: bool = msg_send![app, setActivationPolicy: 1i64];
+        let cursor_property = ns_string("SetsCursorInBackground");
+        let enabled: *mut AnyObject = msg_send![
+            objc2::class!(NSNumber),
+            numberWithBool: objc2::runtime::Bool::YES
+        ];
+        let background_cursor_updates = crate::input::skylight::enable_background_cursor_updates(
+            cursor_property as *const c_void,
+            enabled as *const c_void,
+        );
+        if !background_cursor_updates {
+            tracing::warn!(
+                target: "pip",
+                "WindowServer rejected background cursor ownership; PiP hover cursors may be unavailable"
+            );
+        }
         let _: () = msg_send![app, finishLaunching];
         let _: () = msg_send![app, run];
     }
