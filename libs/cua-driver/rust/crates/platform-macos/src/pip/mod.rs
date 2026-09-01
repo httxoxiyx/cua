@@ -74,6 +74,15 @@ struct ClickedTarget {
     window_id: u64,
 }
 
+#[derive(Clone, Copy)]
+struct CardGesture {
+    target: Option<ClickedTarget>,
+    front_pid: Option<i64>,
+    start_mouse: objc2_foundation::NSPoint,
+    start_window_origin: objc2_foundation::NSPoint,
+    dragged: bool,
+}
+
 enum LiveFrameImage {
     CgImage(screencapturekit::CGImage),
     Png(Vec<u8>),
@@ -89,6 +98,7 @@ static RESIZE_VIEW_DIRECTIONS: LazyLock<Mutex<HashMap<usize, isize>>> =
 static VIEW_MODEL: Mutex<Option<PipViewModel>> = Mutex::new(None);
 static HIDDEN_APPS: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static HOVERED_APP: Mutex<Option<i64>> = Mutex::new(None);
+static CARD_GESTURE: Mutex<Option<CardGesture>> = Mutex::new(None);
 static SYSTEM_CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 static SYSTEM_CURSOR_HIDE_PENDING: AtomicBool = AtomicBool::new(false);
 static HIDDEN_CURSOR_CONNECTION: AtomicU64 = AtomicU64::new(0);
@@ -611,6 +621,14 @@ fn pip_card_view_class() -> &'static objc2::runtime::AnyClass {
                 objc2::sel!(mouseDown:),
                 card_mouse_down as extern "C" fn(_, _, _),
             );
+            builder.add_method(
+                objc2::sel!(mouseDragged:),
+                card_mouse_dragged as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(mouseUp:),
+                card_mouse_up as extern "C" fn(_, _, _),
+            );
         }
         builder.register()
     })
@@ -992,34 +1010,102 @@ extern "C" fn card_mouse_down(
                 )
             })
             .unwrap_or((None, None));
-        if let Some(target) = target.filter(|target| Some(target.pid) != front_pid) {
-            dispatch_to_main(target, promote_clicked_app_cb);
-            return;
-        }
         let window: *mut AnyObject = msg_send![view, window];
         if !window.is_null() {
             let start_mouse: objc2_foundation::NSPoint =
                 msg_send![objc2::class!(NSEvent), mouseLocation];
             let start_frame: objc2_foundation::NSRect = msg_send![window, frame];
-            hide_custom_cursor();
-            let _: () = msg_send![window, performWindowDragWithEvent: event];
-            let end_mouse: objc2_foundation::NSPoint =
-                msg_send![objc2::class!(NSEvent), mouseLocation];
-            let end_frame: objc2_foundation::NSRect = msg_send![window, frame];
-            if pointer_gesture_is_click(
+            *CARD_GESTURE.lock().unwrap() = Some(CardGesture {
+                target,
+                front_pid,
                 start_mouse,
+                start_window_origin: start_frame.origin,
+                dragged: false,
+            });
+        }
+    }
+}
+
+extern "C" fn card_mouse_dragged(
+    view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    _event: *mut objc2::runtime::AnyObject,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSPoint;
+
+    if view.is_null() {
+        return;
+    }
+    unsafe {
+        let window: *mut AnyObject = msg_send![view, window];
+        if window.is_null() {
+            return;
+        }
+        let mouse: NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
+        let mut gesture = CARD_GESTURE.lock().unwrap();
+        let Some(gesture) = gesture.as_mut() else {
+            return;
+        };
+        let delta_x = mouse.x - gesture.start_mouse.x;
+        let delta_y = mouse.y - gesture.start_mouse.y;
+        if !gesture.dragged && delta_x.hypot(delta_y) < CLICK_DRAG_THRESHOLD {
+            return;
+        }
+        if !gesture.dragged {
+            gesture.dragged = true;
+            hide_custom_cursor();
+        }
+        let origin = NSPoint::new(
+            gesture.start_window_origin.x + delta_x,
+            gesture.start_window_origin.y + delta_y,
+        );
+        let _: () = msg_send![window, setFrameOrigin: origin];
+    }
+}
+
+extern "C" fn card_mouse_up(
+    view: *mut objc2::runtime::AnyObject,
+    _selector: objc2::runtime::Sel,
+    _event: *mut objc2::runtime::AnyObject,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    if view.is_null() {
+        CARD_GESTURE.lock().unwrap().take();
+        return;
+    }
+    unsafe {
+        let window: *mut AnyObject = msg_send![view, window];
+        let Some(gesture) = CARD_GESTURE.lock().unwrap().take() else {
+            return;
+        };
+        if window.is_null() {
+            return;
+        }
+        let end_mouse: objc2_foundation::NSPoint = msg_send![objc2::class!(NSEvent), mouseLocation];
+        let end_frame: objc2_foundation::NSRect = msg_send![window, frame];
+        let clicked = !gesture.dragged
+            && pointer_gesture_is_click(
+                gesture.start_mouse,
                 end_mouse,
-                start_frame.origin,
+                gesture.start_window_origin,
                 end_frame.origin,
-            ) {
-                if let Some(target) = target {
+            );
+        if clicked {
+            if let Some(target) = gesture.target {
+                if Some(target.pid) == gesture.front_pid {
                     activate_target_window(target);
+                } else {
+                    dispatch_to_main(target, promote_clicked_app_cb);
                 }
             }
-            let location: objc2_foundation::NSPoint =
-                msg_send![window, mouseLocationOutsideOfEventStream];
-            refresh_cursor_at_window_point(window, location);
         }
+        let location: objc2_foundation::NSPoint =
+            msg_send![window, mouseLocationOutsideOfEventStream];
+        refresh_cursor_at_window_point(window, location);
     }
 }
 
@@ -1889,6 +1975,7 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
     VIEW_MODEL.lock().unwrap().take();
     HIDDEN_APPS.lock().unwrap().clear();
     HOVERED_APP.lock().unwrap().take();
+    CARD_GESTURE.lock().unwrap().take();
     if let Some(handles) = HANDLES.lock().unwrap().take() {
         let window = handles.window as *mut AnyObject;
         let _: () = msg_send![window, setDelegate: std::ptr::null_mut::<AnyObject>()];
