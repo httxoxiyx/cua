@@ -98,6 +98,15 @@ fn pixel_activation_policy(
     }
 }
 
+/// A visually targeted background click may use AX as its delivery backend
+/// only when the exact hit-tested element explicitly advertises AXPress.
+/// macOS can return kAXErrorSuccess for AXPress on containers such as
+/// AXWebArea even though no page pointer event is produced; treating that as
+/// delivery would turn a coordinate click into a silent no-op.
+fn background_pixel_ax_press_eligible(advertised_actions: &[String]) -> bool {
+    advertised_actions.iter().any(|action| action == "AXPress")
+}
+
 /// Return the prior foreground pid that should be restored after a raw
 /// background pixel click.
 ///
@@ -912,8 +921,11 @@ impl Tool for ClickTool {
                         CFRelease(element as _);
                         return Ok(false);
                     }
+                    let advertised_actions = copy_action_names(element);
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
+                    } else if !background_pixel_ax_press_eligible(&advertised_actions) {
+                        false
                     } else {
                         let press = core_foundation::string::CFString::new("AXPress");
                         AXUIElementPerformAction(element, press.as_concrete_TypeRef())
@@ -940,13 +952,15 @@ impl Tool for ClickTool {
                             "Background PX focus is unavailable at the requested point.".to_owned(),
                         )
                         .with_structured(serde_json::json!({
-                            "code": "background_unavailable"
+                            "code": "background_unavailable",
+                            "effect": "refused"
                         }));
                     }
                     Ok(Err(error)) if focus_only => {
                         return ToolResult::error(format!("Background PX focus failed: {error}"))
                             .with_structured(serde_json::json!({
-                                "code": "background_unavailable"
+                                "code": "background_unavailable",
+                                "effect": "refused"
                             }));
                     }
                     _ => {}
@@ -1624,5 +1638,18 @@ mod tests {
             None,
             "strict-suppression paths retain their existing ownership"
         );
+    }
+
+    #[test]
+    fn background_pixel_ax_bridge_requires_advertised_press() {
+        assert!(background_pixel_ax_press_eligible(&[
+            "AXPress".to_owned(),
+            "AXShowMenu".to_owned(),
+        ]));
+        assert!(!background_pixel_ax_press_eligible(&[]));
+        assert!(!background_pixel_ax_press_eligible(&[
+            "AXShowMenu".to_owned(),
+            "AXScrollToVisible".to_owned(),
+        ]));
     }
 }
