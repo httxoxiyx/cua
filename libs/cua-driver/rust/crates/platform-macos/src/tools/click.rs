@@ -1006,7 +1006,8 @@ impl Tool for ClickTool {
                                 "Background click target-only focus failed: {error}"
                             ))
                             .with_structured(serde_json::json!({
-                                "code": "background_unavailable"
+                                "code": "background_unavailable",
+                                "effect": "refused"
                             }));
                         }
                         Err(error) => {
