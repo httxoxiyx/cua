@@ -116,7 +116,6 @@ struct CardGesture {
 
 enum LiveFrameImage {
     CgImage(screencapturekit::CGImage),
-    Png(Vec<u8>),
 }
 
 static HANDLES: Mutex<Option<NativeHandles>> = Mutex::new(None);
@@ -142,14 +141,10 @@ static FOREGROUND_VISIBILITY_STATE: Mutex<ForegroundVisibilityState> =
 static SUPPRESSED_FOREGROUND_WATCHER: Mutex<Option<SuppressedForegroundWatcher>> = Mutex::new(None);
 static LIVE_STREAMS: LazyLock<Mutex<HashMap<i64, LiveStreamEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static PENDING_TARGET_SEEDS: LazyLock<Mutex<HashSet<(i64, u64)>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 const LIVE_CAPTURE_FPS: i32 = 12;
 const LIVE_CAPTURE_MAX_SIDE: f64 = 960.0;
 const LIVE_CAPTURE_WINDOW_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
-const LIVE_CAPTURE_WATCHDOG: Duration = Duration::from_millis(750);
-const FALLBACK_CAPTURE_INTERVAL: Duration = Duration::from_millis(500);
 const FOREGROUND_VISIBILITY_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const FOREGROUND_HIDE_STABLE_INTERVAL: Duration = Duration::from_millis(100);
 const FOREGROUND_CONFIRMATION_DELAY: Duration = Duration::from_millis(300);
@@ -246,53 +241,30 @@ impl PipBackend for MacosPipBackend {
             return;
         }
 
-        let already_seeded = VIEW_MODEL
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|model| model.frame_for_app(target.pid))
-            .is_some_and(|frame| exact_target_matches(frame, &target));
-        if already_seeded {
+        let seed_policy = {
+            let model = VIEW_MODEL.lock().unwrap();
+            pip_target_seed_policy(
+                model
+                    .as_ref()
+                    .and_then(|model| model.frame_for_app(target.pid)),
+                &target,
+            )
+        };
+        if seed_policy == PipTargetSeedPolicy::ReuseObservationAndLiveStream {
             // The observation seed already started native live capture. The
             // stream owns subsequent frames, so there is nothing to recapture.
             return;
         }
-
-        let target_pid = target.pid;
-        let target_window_id = target.window_id;
-        let key = (target_pid, target_window_id);
-        if !PENDING_TARGET_SEEDS.lock().unwrap().insert(key) {
-            return;
-        }
-        let spawn = std::thread::Builder::new()
-            .name(format!("cua-pip-seed-{target_pid}"))
-            .spawn(move || {
-                let png = if exact_window_is_owned(target.pid, target.window_id) {
-                    u32::try_from(target.window_id)
-                        .ok()
-                        .and_then(|window_id| {
-                            crate::capture::screenshot_window_bytes(window_id).ok()
-                        })
-                        .filter(|_| exact_window_is_owned(target.pid, target.window_id))
-                } else {
-                    None
-                };
-                PENDING_TARGET_SEEDS.lock().unwrap().remove(&key);
-                if let Some(png_bytes) = png {
-                    PipBackend::push_frame(
-                        &MacosPipBackend,
-                        PipFrame {
-                            target,
-                            png_bytes,
-                            timestamp_ms: wall_clock_ms(),
-                        },
-                    );
-                }
-            });
-        if let Err(error) = spawn {
-            PENDING_TARGET_SEEDS.lock().unwrap().remove(&key);
-            tracing::warn!(target: "pip", target_pid, target_window_id, %error, "failed to schedule PiP target seed");
-        }
+        // PiP is strictly downstream of authoritative observations. Without a
+        // response image there is nothing safe to seed: wait for the next full
+        // or screenshot-only observation rather than competing with its fresh
+        // capture (or click calibration) through the single-frame API.
+        tracing::debug!(
+            target: "pip",
+            pid = target.pid,
+            window_id = target.window_id,
+            "PiP target has no observation seed yet; retaining existing cards"
+        );
     }
 
     fn set_input_passthrough(&self, passthrough: bool) -> anyhow::Result<()> {
@@ -311,13 +283,21 @@ fn exact_target_matches(frame: &PipFrame, target: &pip_preview::PipTarget) -> bo
     frame.target.pid == target.pid && frame.target.window_id == target.window_id
 }
 
-fn exact_window_is_owned(pid: i64, window_id: u64) -> bool {
-    let (Ok(pid), Ok(window_id)) = (i32::try_from(pid), u32::try_from(window_id)) else {
-        return false;
-    };
-    crate::windows::all_windows()
-        .into_iter()
-        .any(|window| window.pid == pid && window.window_id == window_id)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipTargetSeedPolicy {
+    ReuseObservationAndLiveStream,
+    AwaitObservationSeed,
+}
+
+fn pip_target_seed_policy(
+    frame: Option<&PipFrame>,
+    target: &pip_preview::PipTarget,
+) -> PipTargetSeedPolicy {
+    if frame.is_some_and(|frame| exact_target_matches(frame, target)) {
+        PipTargetSeedPolicy::ReuseObservationAndLiveStream
+    } else {
+        PipTargetSeedPolicy::AwaitObservationSeed
+    }
 }
 
 unsafe extern "C" fn set_input_passthrough_cb(ctx: *mut c_void) {
@@ -590,11 +570,6 @@ fn wall_clock_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn stream_frame_is_fresh(now_ms: u64, last_stream_frame_ms: u64) -> bool {
-    last_stream_frame_ms != 0
-        && now_ms.saturating_sub(last_stream_frame_ms) < LIVE_CAPTURE_WATCHDOG.as_millis() as u64
-}
-
 fn ensure_live_capture(pid: i64, window_id: u64) {
     {
         let streams = LIVE_STREAMS
@@ -610,7 +585,6 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
     stop_live_capture_for(pid);
     let cancelled = Arc::new(AtomicBool::new(false));
     let frame_pending = Arc::new(AtomicBool::new(false));
-    let last_stream_frame_ms = Arc::new(AtomicU64::new(0));
     LIVE_STREAMS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -624,13 +598,7 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
             },
         );
 
-    start_polling_fallback(
-        pid,
-        window_id,
-        Arc::clone(&cancelled),
-        Arc::clone(&frame_pending),
-        Arc::clone(&last_stream_frame_ms),
-    );
+    start_live_visibility_watchdog(pid, Arc::clone(&cancelled));
 
     if let Err(error) = std::thread::Builder::new()
         .name(format!("cua-pip-{pid}"))
@@ -640,7 +608,6 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
                 window_id,
                 Arc::clone(&cancelled),
                 Arc::clone(&frame_pending),
-                Arc::clone(&last_stream_frame_ms),
             ) {
                 Ok(stream) => {
                     let mut streams = LIVE_STREAMS
@@ -681,45 +648,17 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
     }
 }
 
-fn start_polling_fallback(
-    pid: i64,
-    window_id: u64,
-    cancelled: Arc<AtomicBool>,
-    frame_pending: Arc<AtomicBool>,
-    last_stream_frame_ms: Arc<AtomicU64>,
-) {
-    let Ok(native_window_id) = u32::try_from(window_id) else {
-        return;
-    };
+fn start_live_visibility_watchdog(pid: i64, cancelled: Arc<AtomicBool>) {
     if let Err(error) = std::thread::Builder::new()
-        .name(format!("cua-pip-watchdog-{pid}"))
+        .name(format!("cua-pip-visibility-{pid}"))
         .spawn(move || {
             while !cancelled.load(Ordering::Acquire) {
                 schedule_foreground_visibility_refresh();
-                let last_stream_frame = last_stream_frame_ms.load(Ordering::Acquire);
-                let stream_is_fresh = stream_frame_is_fresh(wall_clock_ms(), last_stream_frame);
-                if !stream_is_fresh && !frame_pending.swap(true, Ordering::AcqRel) {
-                    match crate::capture::screenshot_window_bytes(native_window_id) {
-                        Ok(png_bytes) => dispatch_to_main(
-                            LiveFrame {
-                                pid,
-                                window_id,
-                                image: LiveFrameImage::Png(png_bytes),
-                                frame_pending: Arc::clone(&frame_pending),
-                            },
-                            push_live_frame_cb,
-                        ),
-                        Err(error) => {
-                            frame_pending.store(false, Ordering::Release);
-                            tracing::debug!(target: "pip", pid, window_id, %error, "PiP fallback capture failed");
-                        }
-                    }
-                }
-                std::thread::sleep(FALLBACK_CAPTURE_INTERVAL);
+                std::thread::sleep(FOREGROUND_VISIBILITY_CHECK_INTERVAL);
             }
         })
     {
-        tracing::warn!(target: "pip", pid, window_id, %error, "failed to spawn PiP capture watchdog");
+        tracing::warn!(target: "pip", pid, %error, "failed to spawn PiP visibility watchdog");
     }
 }
 
@@ -728,7 +667,6 @@ fn build_live_capture(
     window_id: u64,
     cancelled: Arc<AtomicBool>,
     frame_pending: Arc<AtomicBool>,
-    last_stream_frame_ms: Arc<AtomicU64>,
 ) -> anyhow::Result<SCStream> {
     let native_window_id = u32::try_from(window_id)
         .map_err(|_| anyhow::anyhow!("window id {window_id} does not fit a CGWindowID"))?;
@@ -790,7 +728,6 @@ fn build_live_capture(
                 }
                 match sample.cg_image() {
                     Ok(image) => {
-                        last_stream_frame_ms.store(wall_clock_ms(), Ordering::Release);
                         dispatch_to_main(
                             LiveFrame {
                                 pid,
@@ -890,7 +827,6 @@ unsafe extern "C" fn push_live_frame_cb(ctx: *mut c_void) {
             let allocated: *mut AnyObject = msg_send![objc2::class!(NSImage), alloc];
             msg_send![allocated, initWithCGImage: cg_image size: NSSize::new(0.0, 0.0)]
         }
-        LiveFrameImage::Png(png_bytes) => image_from_png(&png_bytes),
     };
     if !image.is_null() {
         let _: () = msg_send![image_view, setImage: image];
@@ -2428,7 +2364,6 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
     CARD_VIEW_PIDS.lock().unwrap().clear();
     RESIZE_VIEW_DIRECTIONS.lock().unwrap().clear();
     VIEW_MODEL.lock().unwrap().take();
-    PENDING_TARGET_SEEDS.lock().unwrap().clear();
     HIDDEN_APPS.lock().unwrap().clear();
     HOVERED_APP.lock().unwrap().take();
     CARD_GESTURE.lock().unwrap().take();
@@ -2530,10 +2465,25 @@ mod tests {
     }
 
     #[test]
-    fn polling_watchdog_only_takes_over_after_stream_stalls() {
-        assert!(!stream_frame_is_fresh(10_000, 0));
-        assert!(stream_frame_is_fresh(10_000, 9_500));
-        assert!(!stream_frame_is_fresh(10_000, 9_000));
+    fn missing_or_changed_target_waits_for_an_observation_seed() {
+        let target = pip_preview::PipTarget {
+            pid: 100,
+            window_id: 10,
+            app_name: String::new(),
+            window_title: None,
+        };
+        assert_eq!(
+            pip_target_seed_policy(None, &target),
+            PipTargetSeedPolicy::AwaitObservationSeed
+        );
+        assert_eq!(
+            pip_target_seed_policy(Some(&frame(11, 100)), &target),
+            PipTargetSeedPolicy::AwaitObservationSeed
+        );
+        assert_eq!(
+            pip_target_seed_policy(Some(&frame(10, 100)), &target),
+            PipTargetSeedPolicy::ReuseObservationAndLiveStream
+        );
     }
 
     #[test]
