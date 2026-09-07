@@ -12,6 +12,7 @@ pub(crate) mod page;
 
 #[cfg(not(target_os = "linux"))]
 mod stubs;
+mod window_target;
 
 pub fn build_registry(compat: bool) -> ToolRegistry {
     build_registry_with_provider(compat, None)

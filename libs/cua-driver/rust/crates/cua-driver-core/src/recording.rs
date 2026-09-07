@@ -71,9 +71,10 @@ pub fn set_classified_screenshot_fn(
 }
 
 /// Invoke the registered screenshot callback. Returns `None` when no
-/// callback was registered or when the platform capture failed. Used
-/// by the PiP push hook (and by anything else that wants to share the
-/// per-turn screenshot pipeline without duplicating the platform glue).
+/// callback was registered or when the platform capture failed. Kept as the
+/// shared capture entry point for callers that need recording-compatible PNG
+/// bytes without duplicating the platform glue. PiP now reuses the image from
+/// `get_window_state` and its live stream instead of calling this per action.
 pub fn screenshot_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
     SCREENSHOT_FN
         .get()

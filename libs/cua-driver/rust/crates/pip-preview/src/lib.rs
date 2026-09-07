@@ -271,12 +271,11 @@ pub struct PipTarget {
     pub window_title: Option<String>,
 }
 
-/// A single exact-target fallback frame pushed after a tool call lands.
+/// A single exact-target seed/fallback frame reused from an observation.
 ///
 /// `png_bytes` are the raw PNG bytes produced by the platform
-/// screenshot callback — the same path that powers `screenshot.png`
-/// in the recording pipeline. Platforms with native live capture may
-/// ignore these frames while their stream is active.
+/// observation response. Platforms with native live capture use this frame to
+/// create the card and then replace it with stream frames as they arrive.
 #[derive(Debug, Clone)]
 pub struct PipFrame {
     pub target: PipTarget,
@@ -402,6 +401,10 @@ pub trait PipBackend: Send + Sync {
     /// its UI toolkit requires (the macOS impl dispatches to the main
     /// queue via `dispatch_async`).
     fn push_frame(&self, frame: PipFrame);
+
+    /// Ensure an exact target is represented by a live preview. Implementations
+    /// must not synchronously capture on the caller's tool-dispatch path.
+    fn ensure_target(&self, _target: PipTarget) {}
 
     /// Synchronously make the presentation input-transparent while Computer
     /// Use performs a physical desktop action. This prevents an overlapping

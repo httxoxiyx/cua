@@ -20,6 +20,11 @@ use std::sync::{Arc, RwLock};
 use crate::atspi::ElementCache;
 use cursor_overlay::CursorRegistry;
 
+use super::window_target::{
+    exact_window_ownership_result, preflight_owner_pid, publish_after_exact_window_ownership,
+    window_target_resolution_failed,
+};
+
 fn window_target_candidates_for_pid(
     windows: impl IntoIterator<Item = crate::x11::WindowInfo>,
     pid: u32,
@@ -568,6 +573,42 @@ pub struct GetWindowStateTool {
 
 static GWS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+const NO_WINDOW_OBSERVATION_CONTENT: &str =
+    "get_window_state requires at least one of include_elements or include_screenshot";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowObservationPlan {
+    include_elements: bool,
+    include_screenshot: bool,
+}
+
+fn window_observation_plan(
+    include_elements: Option<bool>,
+    include_screenshot: Option<bool>,
+    has_screenshot_out_file: bool,
+) -> Result<WindowObservationPlan, &'static str> {
+    let plan = WindowObservationPlan {
+        include_elements: include_elements != Some(false),
+        include_screenshot: include_screenshot != Some(false) || has_screenshot_out_file,
+    };
+    if !plan.include_elements && !plan.include_screenshot {
+        Err(NO_WINDOW_OBSERVATION_CONTENT)
+    } else {
+        Ok(plan)
+    }
+}
+
+fn current_window_owner_pid(window_id: u64) -> Option<u32> {
+    if crate::wayland::is_wayland() {
+        crate::wayland::list_windows_dispatch(None)
+            .into_iter()
+            .find(|window| window.xid == window_id)
+            .and_then(|window| window.pid)
+    } else {
+        crate::x11::window_owner_pid(window_id)
+    }
+}
+
 #[async_trait]
 impl Tool for GetWindowStateTool {
     fn def(&self) -> &ToolDef {
@@ -589,12 +630,14 @@ impl Tool for GetWindowStateTool {
                 rows plus their ancestor chain while preserving original indices. \
                 `total_element_count` reports the complete snapshot and \
                 `returned_element_count` reports the projection.\n\n\
-                Always returns BOTH the element tree AND a screenshot — ground on \
+                By default returns BOTH the element tree AND a screenshot — ground on \
                 both and cross-check (the tree lies on some surfaces). Choose the \
                 modality at ACTION time: an element ax action \
                 (element_index/element_token → accessibility rung) or an element px \
                 action (x,y → pixel rung off this screenshot). capture_mode is \
-                deprecated and ignored. On Wayland, where output capture cannot prove \
+                deprecated and ignored. Set `include_elements:false` for a screenshot-only \
+                fast path after a surface is known to require visual grounding. On Wayland, \
+                where output capture cannot prove \
                 the requested surface's identity, the truthful tree is returned without \
                 a screenshot and `screenshot_error.code` is \
                 `surface_identity_unproven`.\n\n\
@@ -610,6 +653,8 @@ impl Tool for GetWindowStateTool {
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_screenshot":{"type":"boolean",
                     "description":"Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return tree only (the cheap path for re-indexing before an element ax action)."},
+                "include_elements":{"type":"boolean",
+                    "description":"Default true. Set false for the screenshot-only fast path after the caller has established that the window is canvas/WebGL/custom-drawn. Skips the AT-SPI walk and invalidates the prior element-index cache."},
                 "screenshot_out_file":{"type":"string",
                     "description":"When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output carries screenshot_file_path instead."},
                 "query":{"type":"string","description":"Optional case-insensitive substring. Projects both tree_markdown and structured elements to matches plus ancestors while preserving original indices. Compare total_element_count with returned_element_count."},
@@ -657,6 +702,20 @@ impl Tool for GetWindowStateTool {
                 s
             }
         });
+        let plan = match window_observation_plan(
+            args.get("include_elements")
+                .and_then(|value| value.as_bool()),
+            include_screenshot,
+            screenshot_out_file.is_some(),
+        ) {
+            Ok(plan) => plan,
+            Err(message) => {
+                return ToolResult::error(message).with_structured(json!({
+                    "code": "empty_observation_requested",
+                    "suggestion": "enable include_elements or include_screenshot"
+                }))
+            }
+        };
         // Optional caps — when omitted, the AT-SPI walker uses its built-in
         // defaults (#22865).
         let max_elements = args
@@ -668,27 +727,29 @@ impl Tool for GetWindowStateTool {
             .and_then(|v| v.as_u64())
             .map(|v| v.max(1) as usize);
 
-        let process_is_live = crate::proc_fs::is_process_live(pid);
-        let window_matches = if crate::wayland::is_wayland() {
-            crate::wayland::list_windows_dispatch(Some(pid))
-                .iter()
-                .any(|window| window.xid == xid && window.pid == Some(pid))
-                || crate::wayland::window_was_listed_for_pid(pid, xid)
-        } else {
-            crate::x11::window_belongs_to_pid(xid, pid)
+        let owner_pid = match tokio::task::spawn_blocking(move || {
+            let process_is_live = crate::proc_fs::is_process_live(pid);
+            let current_owner_pid = current_window_owner_pid(xid);
+            let remembered_same_process_window =
+                crate::wayland::is_wayland() && crate::wayland::window_was_listed_for_pid(pid, xid);
+            preflight_owner_pid(
+                pid,
+                process_is_live,
+                current_owner_pid,
+                remembered_same_process_window,
+            )
+        })
+        .await
+        {
+            Ok(owner_pid) => owner_pid,
+            Err(error) => {
+                return window_target_resolution_failed(pid, xid, error.to_string());
+            }
         };
-        if !process_is_live || !window_matches {
-            return ToolResult::error(format!(
-                "Window target pid {pid}, window_id {xid} is stale or no longer running; refresh list_windows."
-            ));
+        if let Err(refusal) = exact_window_ownership_result(pid, xid, owner_pid) {
+            return refusal;
         }
 
-        // Always walk the AT-SPI tree; capture the screenshot by default. The
-        // tree+screenshot pair is the default so the agent grounds on both and
-        // cross-checks the (sometimes-lying) tree against the frame. An explicit
-        // `include_screenshot:false` skips the grab; an unproven Wayland surface
-        // returns the tree with a typed screenshot error instead of unrelated pixels.
-        let should_capture = include_screenshot != Some(false) || screenshot_out_file.is_some();
         let observation_only = args
             .get("_observation_only")
             .and_then(|value| value.as_bool())
@@ -696,30 +757,30 @@ impl Tool for GetWindowStateTool {
         let state = self.state.clone();
         let query_for_walk = query.clone();
 
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let tree_result = Some(crate::atspi::walk_tree_bounded(
-                pid,
-                xid,
-                query_for_walk.as_deref(),
-                max_elements,
-                max_depth,
-            ));
-            // Bounds and element indices come from the same captured AT-SPI
-            // traversal. Joining two live walks by ordinal mis-associated
-            // Chromium controls when its lazy subtree changed between walks.
-            let bounds = tree_result
-                .as_ref()
-                .map(|tree| tree.bounds.clone())
-                .unwrap_or_default();
-            // Capture and DELIVER the screenshot alongside the tree by default — the
-            // grounding frame the agent cross-checks the tree against. With
-            // screenshot_out_file set, write to disk and surface the path instead
-            // of embedding base64; otherwise embed base64. Skipped only when
-            // include_screenshot:false and no disk path was requested.
-            // Tuple: (Option<b64>, Option<file_path>, w, h, Option<original_w>).
-            let mut screenshot_error = None;
-            let screenshot = if should_capture {
-                match crate::wayland::screenshot_dispatch(xid) {
+        let tree_branch = async move {
+            if !plan.include_elements {
+                return Ok(None);
+            }
+            tokio::task::spawn_blocking(move || {
+                Some(crate::atspi::walk_tree_bounded(
+                    pid,
+                    xid,
+                    query_for_walk.as_deref(),
+                    max_elements,
+                    max_depth,
+                ))
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("AT-SPI task panic: {error}"))
+        };
+
+        let screenshot_branch = async move {
+            if !plan.include_screenshot {
+                return Ok((None, None));
+            }
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let mut screenshot_error = None;
+                let screenshot = match crate::wayland::screenshot_dispatch(xid) {
                     Ok(raw) => {
                         let orig_w = crate::capture::png_dimensions_pub(&raw)
                             .map(|(w, _)| w)
@@ -727,13 +788,7 @@ impl Tool for GetWindowStateTool {
                         let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
                         let original_w = if w < orig_w { Some(orig_w) } else { None };
-                        if let Some(ref path) = screenshot_out_file {
-                            std::fs::write(path, &png)?;
-                            Some((None, Some(path.clone()), w, h, original_w))
-                        } else {
-                            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-                            Some((Some(B64.encode(&png)), None, w, h, original_w))
-                        }
+                        Some((png, w, h, original_w))
                     }
                     Err(error) if crate::wayland::is_surface_identity_unproven(&error) => {
                         screenshot_error = Some(error.to_string());
@@ -744,18 +799,78 @@ impl Tool for GetWindowStateTool {
                             "window screenshot failed for window {xid}: {error}"
                         ));
                     }
-                }
-            } else {
-                None
-            };
-            Ok((tree_result, screenshot, bounds, screenshot_error))
-        })
-        .await;
+                };
+                Ok((screenshot, screenshot_error))
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("screenshot task panic: {error}"))?
+        };
+
+        let (tree_result, screenshot_result) = tokio::join!(tree_branch, screenshot_branch);
+        let result = match (tree_result, screenshot_result) {
+            (Ok(tree_result), Ok((screenshot, screenshot_error))) => {
+                let screenshot = if let Some((png, w, h, original_w)) = screenshot {
+                    let owner_pid = match tokio::task::spawn_blocking(move || {
+                        preflight_owner_pid(
+                            pid,
+                            crate::proc_fs::is_process_live(pid),
+                            current_window_owner_pid(xid),
+                            false,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(owner_pid) => owner_pid,
+                        Err(error) => {
+                            return window_target_resolution_failed(pid, xid, error.to_string());
+                        }
+                    };
+                    let publish = || -> anyhow::Result<_> {
+                        if let Some(ref path) = screenshot_out_file {
+                            std::fs::write(path, &png)?;
+                            Ok((None, Some(path.clone()), w, h, original_w))
+                        } else {
+                            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                            Ok((Some(B64.encode(&png)), None, w, h, original_w))
+                        }
+                    };
+                    match publish_after_exact_window_ownership(pid, xid, owner_pid, publish) {
+                        Ok(Ok(screenshot)) => Some(screenshot),
+                        Ok(Err(error)) => {
+                            return ToolResult::error(format!(
+                                "window screenshot publication failed for window {xid}: {error}"
+                            ));
+                        }
+                        Err(refusal) => return refusal,
+                    }
+                } else {
+                    None
+                };
+                // Bounds and element indices come from the same captured
+                // AT-SPI traversal. Never join a second live walk by ordinal.
+                let bounds = tree_result
+                    .as_ref()
+                    .map(|tree| tree.bounds.clone())
+                    .unwrap_or_default();
+                Ok((tree_result, screenshot, bounds, screenshot_error))
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
 
         match result {
-            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error))) => {
+            Ok((tree_opt, shot_opt, bounds, screenshot_error)) => {
                 let mut content = Vec::new();
-                let mut structured = json!({ "window_id": xid, "pid": pid });
+                let mut structured = json!({
+                    "window_id": xid,
+                    "pid": pid,
+                    "elements_included": plan.include_elements,
+                    "element_count": 0,
+                    "total_element_count": 0,
+                    "returned_element_count": 0,
+                    "elements_complete": false,
+                    "tree_markdown": "",
+                    "elements": []
+                });
 
                 if let Some(tr) = tree_opt {
                     let source_trusted = tr.trusted;
@@ -909,6 +1024,11 @@ impl Tool for GetWindowStateTool {
                         // Wayland → foreground) — see non_ax_escalation.
                         structured["escalation"] = non_ax_escalation();
                     }
+                } else if !observation_only {
+                    // Screenshot-only observations intentionally create no
+                    // fresh AT-SPI binding. Invalidate the old integer-index
+                    // cache so it cannot be replayed after the window changed.
+                    state.element_cache.update(pid, xid, &[]);
                 }
 
                 if let Some((b64_opt, file_path, w, h, orig_w)) = shot_opt {
@@ -926,6 +1046,11 @@ impl Tool for GetWindowStateTool {
                     if let Some(b64) = b64_opt {
                         content.push(cua_driver_core::protocol::Content::image_png(b64));
                     }
+                    if !plan.include_elements {
+                        content.push(cua_driver_core::protocol::Content::text(format!(
+                            "window_id={xid} pid={pid} size={w}x{h}"
+                        )));
+                    }
                     structured["screenshot_width"] = json!(w);
                     structured["screenshot_height"] = json!(h);
                     // Surface 7: mirror the MCP image part's `mimeType` onto
@@ -937,6 +1062,9 @@ impl Tool for GetWindowStateTool {
                     }
                 }
                 if let Some(reason) = screenshot_error {
+                    content.push(cua_driver_core::protocol::Content::text(format!(
+                        "screenshot unavailable: {reason}"
+                    )));
                     structured["screenshot_frame_valid"] = json!(false);
                     structured["screenshot_error"] = surface_identity_unproven_error(xid, reason);
                 }
@@ -948,8 +1076,7 @@ impl Tool for GetWindowStateTool {
                     action_record: None,
                 }
             }
-            Ok(Err(e)) => ToolResult::error(format!("Capture error: {e}")),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
+            Err(error) => ToolResult::error(format!("Capture error: {error}")),
         }
     }
 }
@@ -970,6 +1097,25 @@ mod get_window_state_capture_tests {
     use super::*;
 
     #[test]
+    fn screenshot_only_plan_skips_elements() {
+        assert_eq!(
+            window_observation_plan(Some(false), None, false),
+            Ok(WindowObservationPlan {
+                include_elements: false,
+                include_screenshot: true,
+            })
+        );
+    }
+
+    #[test]
+    fn observation_plan_rejects_no_outputs() {
+        assert_eq!(
+            window_observation_plan(Some(false), Some(false), false),
+            Err(NO_WINDOW_OBSERVATION_CONTENT)
+        );
+    }
+
+    #[test]
     fn surface_identity_failure_is_a_typed_screenshot_error() {
         let error = surface_identity_unproven_error(
             0x2962,
@@ -981,6 +1127,27 @@ mod get_window_state_capture_tests {
         assert!(error["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("surface_identity_unproven")));
+    }
+
+    #[test]
+    fn exact_window_ownership_uses_canonical_structured_codes() {
+        assert!(exact_window_ownership_result(42, 7, Some(42)).is_ok());
+
+        let mismatch = exact_window_ownership_result(42, 7, Some(99)).unwrap_err();
+        assert_eq!(
+            mismatch.structured_content.as_ref().unwrap()["code"],
+            "window_target_mismatch"
+        );
+        assert_eq!(
+            mismatch.structured_content.as_ref().unwrap()["owner_pid"],
+            99
+        );
+
+        let stale = exact_window_ownership_result(42, 7, None).unwrap_err();
+        assert_eq!(
+            stale.structured_content.as_ref().unwrap()["code"],
+            "window_target_not_found"
+        );
     }
 }
 

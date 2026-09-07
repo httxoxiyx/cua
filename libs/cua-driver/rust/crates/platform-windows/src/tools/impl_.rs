@@ -333,6 +333,11 @@ use crate::uia::ElementCache;
 use cursor_overlay::CursorRegistry;
 use windows::core::Interface as _;
 
+use super::window_target::{
+    exact_window_ownership_result, publish_after_exact_window_ownership,
+    window_target_resolution_failed,
+};
+
 fn window_target_candidates_for_pid(
     windows: impl IntoIterator<Item = crate::win32::WindowInfo>,
     pid: u32,
@@ -358,35 +363,6 @@ fn pid_window_target_candidates(pid: i64) -> Vec<WindowTargetCandidate> {
 
 struct ExactPidWindowTargetGuard {
     inner: Box<dyn Tool>,
-}
-
-fn exact_window_ownership_result(
-    pid: u32,
-    window_id: u64,
-    owner_pid: Option<u32>,
-) -> Result<(), ToolResult> {
-    match owner_pid {
-        Some(owner_pid) if owner_pid == pid => Ok(()),
-        Some(owner_pid) => Err(ToolResult::error(format!(
-            "window_id {window_id} belongs to pid {owner_pid}, not pid {pid}."
-        ))
-        .with_structured(json!({
-            "code": "window_target_mismatch",
-            "effect": "refused",
-            "pid": pid,
-            "window_id": window_id,
-            "owner_pid": owner_pid,
-        }))),
-        None => Err(ToolResult::error(format!(
-            "window_id {window_id} is closed, stale, or invalid."
-        ))
-        .with_structured(json!({
-            "code": "window_target_not_found",
-            "effect": "refused",
-            "pid": pid,
-            "window_id": window_id,
-        }))),
-    }
 }
 
 #[async_trait]
@@ -1070,6 +1046,31 @@ pub struct GetWindowStateTool {
 
 static GWS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+const NO_WINDOW_OBSERVATION_CONTENT: &str =
+    "get_window_state requires at least one of include_elements or include_screenshot";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowObservationPlan {
+    include_elements: bool,
+    include_screenshot: bool,
+}
+
+fn window_observation_plan(
+    include_elements: Option<bool>,
+    include_screenshot: Option<bool>,
+    has_screenshot_out_file: bool,
+) -> Result<WindowObservationPlan, &'static str> {
+    let plan = WindowObservationPlan {
+        include_elements: include_elements != Some(false),
+        include_screenshot: include_screenshot != Some(false) || has_screenshot_out_file,
+    };
+    if !plan.include_elements && !plan.include_screenshot {
+        Err(NO_WINDOW_OBSERVATION_CONTENT)
+    } else {
+        Ok(plan)
+    }
+}
+
 #[async_trait]
 impl Tool for GetWindowStateTool {
     fn def(&self) -> &ToolDef {
@@ -1103,11 +1104,13 @@ impl Tool for GetWindowStateTool {
                 and `structuredContent.elements` to matching rows plus their ancestor chain. \
                 Original element indices are preserved. `total_element_count` reports the \
                 complete snapshot; `returned_element_count` reports the projection.\n\n\
-                Always returns BOTH the element tree AND a screenshot — ground on both \
+                By default returns BOTH the element tree AND a screenshot — ground on both \
                 and cross-check (the tree lies on some surfaces). Choose the modality at \
                 ACTION time: an element ax action (element_index/element_token → \
                 accessibility rung) or an element px action (x,y → pixel rung off this \
-                screenshot). capture_mode is deprecated and ignored.\n\n\
+                screenshot). capture_mode is deprecated and ignored. Set \
+                `include_elements:false` for a screenshot-only fast path after a surface \
+                is known to require visual grounding.\n\n\
                 Uses `IUIAutomationCacheRequest` to batch-fetch all element properties in a \
                 single COM call (Chrome's ~5000-element tree returns in ~2-3s instead of \
                 timing out at 4s with per-property RPCs).\n\n\
@@ -1131,6 +1134,7 @@ impl Tool for GetWindowStateTool {
                 "window_id":{"type":"integer","description":"HWND of the target window. Must belong to `pid`. Enumerate via `list_windows` or read from `launch_app`'s `windows` array."},
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_screenshot":{"type":"boolean","description":"Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return tree only (the cheap path for re-indexing before an element ax action)."},
+                "include_elements":{"type":"boolean","description":"Default true. Set false for the screenshot-only fast path after the caller has established that the window is canvas/WebGL/custom-drawn. Skips the UIA walk and invalidates the prior element-index cache."},
                 "screenshot_out_file":{"type":"string","description":"When set, write the PNG to this file path instead of embedding base64 in the response. The structured output will contain `screenshot_file_path` instead."},
                 "query":{"type":"string","description":"Optional case-insensitive substring. Projects both tree_markdown and structured elements to matches plus ancestors while preserving original indices. Compare total_element_count with returned_element_count."},
                 "max_elements":{"type":"integer","minimum":1,"description":"Cap on the total number of UIA nodes walked. Truncates depth-first; markdown and structured elements truncate together. Omit for the default (5 000). Lower for Electron / large web apps that produce 10k+ element trees."},
@@ -1155,27 +1159,18 @@ impl Tool for GetWindowStateTool {
                  the target app's windows, or read `launch_app`'s `windows` array.",
                 ),
             };
-        // Validate window belongs to pid — Swift's hard error.
-        let windows_for_pid =
-            tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
-                .await
-                .unwrap_or_default();
-        if !windows_for_pid.iter().any(|w| w.hwnd == hwnd) {
-            // Check if the window exists under a different pid.
-            let all = tokio::task::spawn_blocking(|| crate::win32::list_windows(None))
-                .await
-                .unwrap_or_default();
-            if let Some(w) = all.iter().find(|w| w.hwnd == hwnd) {
-                return ToolResult::error(format!(
-                    "window_id {hwnd} belongs to pid {}, not pid {pid}. Call \
-                     `list_windows({{\"pid\": {pid}}})` to get this pid's own windows.",
-                    w.pid
-                ));
-            }
-            return ToolResult::error(format!(
-                "No window with window_id {hwnd} exists. Call `list_windows({{\"pid\": \
-                 {pid}}})` for candidates."
-            ));
+        // Validate the exact HWND directly. Global UIA/window enumeration can
+        // block on unrelated providers and previously returned unstructured
+        // errors that TBH could not classify.
+        let owner_pid =
+            match tokio::task::spawn_blocking(move || crate::win32::window_owner_pid(hwnd)).await {
+                Ok(owner_pid) => owner_pid,
+                Err(error) => {
+                    return window_target_resolution_failed(pid, hwnd, error.to_string());
+                }
+            };
+        if let Err(refusal) = exact_window_ownership_result(pid, hwnd, owner_pid) {
+            return refusal;
         }
         let max_dim = {
             let cfg = self.state.config.read().unwrap();
@@ -1213,36 +1208,77 @@ impl Tool for GetWindowStateTool {
         // `screenshot_out_file` the bytes go to disk and the path is surfaced
         // instead of embedding base64; otherwise the base64 PNG is embedded.
         let include_screenshot = args.get("include_screenshot").and_then(|v| v.as_bool());
+        let plan = match window_observation_plan(
+            args.get("include_elements")
+                .and_then(|value| value.as_bool()),
+            include_screenshot,
+            screenshot_out_file.is_some(),
+        ) {
+            Ok(plan) => plan,
+            Err(message) => {
+                return ToolResult::error(message).with_structured(json!({
+                    "code": "empty_observation_requested",
+                    "suggestion": "enable include_elements or include_screenshot"
+                }))
+            }
+        };
         let observation_only = args
             .get("_observation_only")
             .and_then(|value| value.as_bool())
             == Some(true);
-        let do_tree = true;
-        let do_shot = include_screenshot != Some(false) || screenshot_out_file.is_some();
+        let do_tree = plan.include_elements;
+        let do_shot = plan.include_screenshot;
 
         let state = self.state.clone();
         let q = query.clone();
-        let out_file = screenshot_out_file.clone();
-        let blocking = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let tree_result = if do_tree {
+        let tree_branch = async move {
+            if !do_tree {
+                return Ok(None);
+            }
+            let blocking = tokio::task::spawn_blocking(move || {
                 Some(crate::uia::walk_tree_bounded(
                     hwnd,
                     q.as_deref(),
                     max_elements,
                     max_depth,
                 ))
-            } else {
-                None
-            };
-            // Capture screenshot AND any error message so the response can
-            // surface *why* there's no image (the iconic-window guard from
-            // #1973 / PR #1974 is the load-bearing case: minimized windows
-            // legitimately can't be captured, and the caller needs to know
-            // to call `bring_to_front` instead of retrying).
-            // The previous `Err(_) => None` silently dropped the error and
-            // upstream agents saw an empty response with no signal.
-            let (screenshot, screenshot_err) = if do_shot {
-                match crate::capture::screenshot_window_bytes(hwnd) {
+            });
+            // Timeout: Chrome's UIA provider can block indefinitely on property reads.
+            match tokio::time::timeout(std::time::Duration::from_secs(4), blocking).await {
+                Ok(join_result) => {
+                    join_result.map_err(|error| anyhow::anyhow!("UIA task panic: {error}"))
+                }
+                Err(_elapsed) => {
+                    // Surface the target's window class + an actionable hint
+                    // instead of just "UIA provider unresponsive".
+                    let class = crate::input::delivery::read_class_name(hwnd);
+                    Err(anyhow::anyhow!(
+                        "get_window_state timed out after 4s (UIA provider unresponsive on \
+                         hwnd 0x{hwnd:x}, class '{class}'). Fallback options: \
+                         (a) re-call this tool with a depth-limited scan \
+                         (`max_elements` / `max_depth`) — if the tree stays unusable, act \
+                         by pixel `click(x, y)` off the screenshot in the response; \
+                         (b) if the target is a transient VCL / message-box dialog, send \
+                         `press_key` with `delivery_mode:\"foreground\"` (SendInput) to fire the \
+                         default accelerator (Esc / Enter / Y / N) without needing the tree."
+                    ))
+                }
+            }
+        };
+
+        let screenshot_branch = async move {
+            if !do_shot {
+                return Ok((None, None));
+            }
+            let blocking = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                // Capture screenshot AND any error message so the response can
+                // surface *why* there's no image (the iconic-window guard from
+                // #1973 / PR #1974 is the load-bearing case: minimized windows
+                // legitimately can't be captured, and the caller needs to know
+                // to call `bring_to_front` instead of retrying).
+                // The previous `Err(_) => None` silently dropped the error and
+                // upstream agents saw an empty response with no signal.
+                let result = match crate::capture::screenshot_window_bytes(hwnd) {
                     Ok(raw) => {
                         let orig_w = crate::capture::png_dimensions_pub(&raw)
                             .map(|(w, _)| w)
@@ -1250,54 +1286,75 @@ impl Tool for GetWindowStateTool {
                         let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
                         let original_w = if w < orig_w { Some(orig_w) } else { None };
-                        // `screenshot_out_file` set (any mode) → write to disk and
-                        // surface the path, never embed bytes. Otherwise (vision,
-                        // no out_file) → embed base64.
-                        if let Some(ref path) = out_file {
+                        (Some((png, w, h, original_w)), None)
+                    }
+                    Err(error) => (None, Some(format!("{error}"))),
+                };
+                Ok(result)
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(4), blocking).await {
+                Ok(join_result) => join_result
+                    .map_err(|error| anyhow::anyhow!("screenshot task panic: {error}"))?,
+                Err(_elapsed) => Err(anyhow::anyhow!(
+                    "window screenshot timed out after 4s for hwnd 0x{hwnd:x}"
+                )),
+            }
+        };
+
+        let (tree_result, screenshot_result) = tokio::join!(tree_branch, screenshot_branch);
+        let result = match (tree_result, screenshot_result) {
+            (Ok(tree_result), Ok((screenshot, screenshot_error))) => {
+                let screenshot = if let Some((png, w, h, original_w)) = screenshot {
+                    let owner_pid = match tokio::task::spawn_blocking(move || {
+                        crate::win32::window_owner_pid(hwnd)
+                    })
+                    .await
+                    {
+                        Ok(owner_pid) => owner_pid,
+                        Err(error) => {
+                            return window_target_resolution_failed(pid, hwnd, error.to_string());
+                        }
+                    };
+                    let publish = || -> anyhow::Result<_> {
+                        if let Some(ref path) = screenshot_out_file {
                             std::fs::write(path, &png)?;
-                            (Some((None, Some(path.clone()), w, h, original_w)), None)
+                            Ok((None, Some(path.clone()), w, h, original_w))
                         } else {
                             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-                            (Some((Some(B64.encode(&png)), None, w, h, original_w)), None)
+                            Ok((Some(B64.encode(&png)), None, w, h, original_w))
                         }
+                    };
+                    match publish_after_exact_window_ownership(pid, hwnd, owner_pid, publish) {
+                        Ok(Ok(screenshot)) => Some(screenshot),
+                        Ok(Err(error)) => {
+                            return ToolResult::error(format!(
+                                "window screenshot publication failed for window {hwnd}: {error}"
+                            ));
+                        }
+                        Err(refusal) => return refusal,
                     }
-                    Err(e) => (None, Some(format!("{e}"))),
-                }
-            } else {
-                (None, None)
-            };
-            Ok((tree_result, screenshot, screenshot_err))
-        });
-        // Timeout: Chrome's UIA provider can block indefinitely on property reads.
-        let result: Result<anyhow::Result<_>, _> =
-            match tokio::time::timeout(std::time::Duration::from_secs(4), blocking).await {
-                Ok(join_result) => join_result.map_err(|e| anyhow::anyhow!("task panic: {e}")),
-                Err(_elapsed) => {
-                    // Surface the target's window class + an actionable hint
-                    // instead of just "UIA provider unresponsive". The class
-                    // points the caller at the right workaround (e.g. SALFRAME
-                    // → screenshot + pixel coords + delivery_mode:"foreground"; UWP
-                    // class → re-call with a depth-limited scan and act by pixel
-                    // off the screenshot if the tree stays unusable).
-                    let class = crate::input::delivery::read_class_name(hwnd);
-                    Err(anyhow::anyhow!(
-                        "get_window_state timed out after 4s (UIA provider unresponsive on \
-                     hwnd 0x{hwnd:x}, class '{class}'). Fallback options: \
-                     (a) re-call this tool with a depth-limited scan \
-                     (`max_elements` / `max_depth`) — if the tree stays unusable, act \
-                     by pixel `click(x, y)` off the screenshot in the response; \
-                     (b) if the target is a transient VCL / message-box dialog, send \
-                     `press_key` with `delivery_mode:\"foreground\"` (SendInput) to fire the \
-                     default accelerator (Esc / Enter / Y / N) without needing the tree."
-                    ))
-                }
-            };
-        let result = result.and_then(|r| r);
+                } else {
+                    None
+                };
+                Ok((tree_result, screenshot, screenshot_error))
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
 
         match result {
             Ok((tree_opt, screenshot_opt, screenshot_err)) => {
                 let mut content = Vec::new();
-                let mut structured = json!({ "window_id": hwnd, "pid": pid });
+                let mut structured = json!({
+                    "window_id": hwnd,
+                    "pid": pid,
+                    "elements_included": plan.include_elements,
+                    "element_count": 0,
+                    "total_element_count": 0,
+                    "returned_element_count": 0,
+                    "elements_complete": false,
+                    "tree_markdown": "",
+                    "elements": []
+                });
 
                 if let Some(tr) = tree_opt {
                     let is_msaa = tr.nodes.iter().any(|n| n.msaa_role.is_some());
@@ -1456,6 +1513,11 @@ impl Tool for GetWindowStateTool {
                                        screenshot in this response (an element px action)."
                         });
                     }
+                } else if !observation_only {
+                    // Screenshot-only observations intentionally create no
+                    // fresh UIA/MSAA binding. Invalidate the old integer-index
+                    // cache so it cannot be replayed after the window changed.
+                    state.element_cache.update(pid, hwnd, &[]);
                 }
 
                 if let Some((b64_opt, file_path, w, h, orig_w)) = screenshot_opt {
@@ -1473,6 +1535,11 @@ impl Tool for GetWindowStateTool {
                     // we surface the path instead — never both.
                     if let Some(b64) = b64_opt {
                         content.push(cua_driver_core::protocol::Content::image_png(b64));
+                    }
+                    if !plan.include_elements {
+                        content.push(cua_driver_core::protocol::Content::text(format!(
+                            "window_id={hwnd} pid={pid} size={w}x{h}"
+                        )));
                     }
                     structured["screenshot_width"] = json!(w);
                     structured["screenshot_height"] = json!(h);
@@ -1513,6 +1580,30 @@ impl Tool for GetWindowStateTool {
             }
             Err(e) => ToolResult::error(format!("Error: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod get_window_state_observation_plan_tests {
+    use super::*;
+
+    #[test]
+    fn screenshot_only_plan_skips_elements() {
+        assert_eq!(
+            window_observation_plan(Some(false), None, false),
+            Ok(WindowObservationPlan {
+                include_elements: false,
+                include_screenshot: true,
+            })
+        );
+    }
+
+    #[test]
+    fn observation_plan_rejects_no_outputs() {
+        assert_eq!(
+            window_observation_plan(Some(false), Some(false), false),
+            Err(NO_WINDOW_OBSERVATION_CONTENT)
+        );
     }
 }
 

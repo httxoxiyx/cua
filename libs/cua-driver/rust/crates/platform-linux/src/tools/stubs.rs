@@ -96,11 +96,12 @@ stub_tool!(
     get_window_state_m,
     GetWindowStateTool,
     "get_window_state",
-    "Walk a running app's AT-SPI tree and return BOTH the element tree AND a \
+    "By default walk a running app's AT-SPI tree and return BOTH the element tree AND a \
      screenshot — ground on both and cross-check (the tree lies on some surfaces). \
      Choose the modality at ACTION time: an element ax action (element_index) or an \
-     element px action (x,y) off the screenshot. capture_mode is deprecated and ignored.",
-    serde_json::json!({"type":"object","required":["pid","window_id"],"properties":{"session": cua_driver_core::tool_schema::session_schema(),"pid":{"type":"integer"},"window_id":{"type":"integer"},"query":{"type":"string"},"include_screenshot":{"type":"boolean","description":"Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return tree only (the cheap path for re-indexing before an element ax action)."},"capture_mode": cua_driver_core::capture_mode::capture_mode_schema()},"additionalProperties":false})
+     element px action (x,y) off the screenshot. capture_mode is deprecated and ignored. \
+     Set include_elements:false for the screenshot-only fast path.",
+    serde_json::json!({"type":"object","required":["pid","window_id"],"properties":{"session": cua_driver_core::tool_schema::session_schema(),"pid":{"type":"integer"},"window_id":{"type":"integer"},"query":{"type":"string"},"include_screenshot":{"type":"boolean","description":"Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return tree only (the cheap path for re-indexing before an element ax action)."},"include_elements":{"type":"boolean","description":"Default true. Set false for the screenshot-only fast path and skip the AT-SPI walk."},"capture_mode": cua_driver_core::capture_mode::capture_mode_schema()},"additionalProperties":false})
 );
 
 stub_tool!(

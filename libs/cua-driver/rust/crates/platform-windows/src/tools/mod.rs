@@ -14,6 +14,7 @@ pub(crate) mod page_bookmark;
 
 #[cfg(not(target_os = "windows"))]
 mod stubs;
+mod window_target;
 
 pub fn build_registry(compat: bool) -> ToolRegistry {
     build_registry_with_provider(compat, None)

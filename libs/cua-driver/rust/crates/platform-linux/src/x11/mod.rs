@@ -37,13 +37,22 @@ pub fn list_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
 /// PID after the original application exits. The XID owner binds the two parts
 /// of a `get_window_state` target and fails closed when either is stale.
 pub fn window_belongs_to_pid(xid: u64, pid: u32) -> bool {
+    window_owner_matches(window_owner_pid(xid), pid)
+}
+
+/// Resolve the current native owner of one exact X11 window.
+///
+/// Unlike `list_windows`, this does not require the window to have a title or
+/// be present in the window manager's client list, making it suitable for the
+/// pre/post-capture identity checks around `get_window_state`.
+pub fn window_owner_pid(xid: u64) -> Option<u32> {
     let Ok(xid) = u32::try_from(xid) else {
-        return false;
+        return None;
     };
     let Ok((conn, _)) = RustConnection::connect(None) else {
-        return false;
+        return None;
     };
-    window_owner_matches(get_window_pid(&conn, xid).ok().flatten(), pid)
+    get_window_pid(&conn, xid).ok().flatten()
 }
 
 fn window_owner_matches(owner: Option<u32>, requested_pid: u32) -> bool {

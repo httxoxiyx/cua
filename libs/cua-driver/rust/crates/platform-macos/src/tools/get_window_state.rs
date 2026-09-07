@@ -37,16 +37,17 @@ fn def() -> &'static ToolDef {
             `tree_markdown` stays available \
             and unchanged in shape for existing text-parsing callers — but new \
             fields will only be added to the structured side.\n\n\
-            Always returns BOTH the element tree AND a screenshot — ground on \
+            By default returns BOTH the element tree AND a screenshot — ground on \
             both and cross-check (the tree lies on some surfaces: Electron \
             echo-confirms, Catalyst null values, virtualized off-viewport rows \
             with `h:1` frames). You choose the modality at ACTION time, not here: \
             an element ax action (pass `element_index`/`element_token` → the \
             accessibility rung) or an element px action (pass `x`,`y` → the pixel \
             rung, read straight off this screenshot). `capture_mode` is deprecated \
-            and ignored. Pass `include_screenshot:false` to skip the grab and get \
-            the tree only — the cheap path when you're just re-indexing before an \
-            element ax action.\n\n\
+            and ignored. Pass `include_elements:false` for a screenshot-only fast \
+            path after a surface is known to require visual grounding; pass \
+            `include_screenshot:false` for a tree-only re-index. At least one output \
+            must remain enabled.\n\n\
             The snapshot is SCOPED to `window_id`: a window_id that no longer exists is \
             refused with `window_id_not_found`, and one owned by another process is \
             refused with `window_owner_pid_mismatch` naming the real `owner_pid` to retry \
@@ -83,6 +84,10 @@ fn def() -> &'static ToolDef {
                     "type": "boolean",
                     "description": "Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return the tree only (the cheap path when you're just re-indexing before an element ax action; saves the image tokens + screen-grab latency). screenshot_out_file still forces a capture to disk."
                 },
+                "include_elements": {
+                    "type": "boolean",
+                    "description": "Default true. Set false for the screenshot-only fast path after the caller has established that the window is a canvas/WebGL/custom-drawn surface. This skips the AX walk and invalidates the prior element-index cache for the window; exact WindowServer ownership and screenshot-frame validation still apply."
+                },
                 "screenshot_out_file": {
                     "type": "string",
                     "description": "When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead."
@@ -105,6 +110,94 @@ fn def() -> &'static ToolDef {
         idempotent: false,
         open_world: false,
     })
+}
+
+const NO_OBSERVATION_CONTENT: &str =
+    "get_window_state requires at least one of include_elements or include_screenshot";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservationPlan {
+    include_elements: bool,
+    include_screenshot: bool,
+}
+
+fn observation_plan(
+    include_elements: Option<bool>,
+    include_screenshot: Option<bool>,
+    has_screenshot_out_file: bool,
+) -> Result<ObservationPlan, &'static str> {
+    let plan = ObservationPlan {
+        include_elements: include_elements != Some(false),
+        include_screenshot: include_screenshot != Some(false) || has_screenshot_out_file,
+    };
+    if !plan.include_elements && !plan.include_screenshot {
+        Err(NO_OBSERVATION_CONTENT)
+    } else {
+        Ok(plan)
+    }
+}
+
+async fn join_observation_branches<Tree, Screenshot, TreeFuture, ScreenshotFuture>(
+    tree: TreeFuture,
+    screenshot: ScreenshotFuture,
+) -> (Tree, Screenshot)
+where
+    TreeFuture: std::future::Future<Output = Tree>,
+    ScreenshotFuture: std::future::Future<Output = Screenshot>,
+{
+    tokio::join!(tree, screenshot)
+}
+
+type CapturedScreenshot = (
+    Vec<u8>,
+    u32,
+    u32,
+    Option<u32>,
+    crate::windows::WindowBounds,
+    f64,
+);
+
+fn capture_screenshot(
+    window_id: u32,
+    max_dim: u32,
+) -> Result<CapturedScreenshot, super::px_frame::PxFrameError> {
+    let bounds = crate::windows::window_bounds_by_id(window_id)
+        .filter(|bounds| bounds.width > 0.0 && bounds.height > 0.0)
+        .ok_or(super::px_frame::PxFrameError::WindowNotFound { window_id })?;
+    let raw = crate::capture::screenshot_window_bytes(window_id).map_err(|error| {
+        super::px_frame::PxFrameError::CaptureUnavailable {
+            window_id,
+            reason: error.to_string(),
+        }
+    })?;
+    let (original_width, original_height) =
+        crate::capture::png_dimensions(&raw).map_err(|error| {
+            super::px_frame::PxFrameError::CaptureUnavailable {
+                window_id,
+                reason: error.to_string(),
+            }
+        })?;
+    let scale = super::px_frame::validate_capture_frame(
+        window_id,
+        &bounds,
+        original_width,
+        original_height,
+    )?;
+    let png = crate::capture::resize_png_if_needed(&raw, max_dim).map_err(|error| {
+        super::px_frame::PxFrameError::CaptureUnavailable {
+            window_id,
+            reason: error.to_string(),
+        }
+    })?;
+    let (width, height) = crate::capture::png_dimensions(&png).map_err(|error| {
+        super::px_frame::PxFrameError::CaptureUnavailable {
+            window_id,
+            reason: error.to_string(),
+        }
+    })?;
+    let resized_from_width = (width < original_width).then_some(original_width);
+
+    Ok((png, width, height, resized_from_width, bounds, scale))
 }
 
 fn chromium_browser_window(pid: i32) -> bool {
@@ -165,11 +258,7 @@ impl Tool for GetWindowStateTool {
             .await
             {
                 Ok(owner) => owner,
-                Err(e) => {
-                    return ToolResult::error(format!(
-                        "window ownership lookup for window_id {window_id} failed: {e}"
-                    ))
-                }
+                Err(e) => return window_owner_resolution_failure(pid, window_id, e.to_string()),
             };
             if let Some(scope) = crate::ax::window_scope::scope_from_owner(&owner) {
                 if let Some(refusal) = window_scope_refusal(pid, window_id, &scope) {
@@ -197,20 +286,25 @@ impl Tool for GetWindowStateTool {
                 .session_config
                 .effective_max_image_dimension(session_id.as_deref(), &cfg)
         };
-        // `capture_mode` is DEPRECATED and ignored — get_window_state always
-        // returns BOTH the tree and a screenshot now, so the agent grounds on
-        // both and cross-checks (the AX tree lies often enough that a grounding
-        // screenshot should always be present). The modality is chosen at action
-        // time: an element ax action (element_index) or element px action (x,y).
-        // We don't even read the arg; it stays in the schema only so old callers
-        // don't trip additionalProperties:false.
-        //
-        // `include_screenshot` (default true) is the perf opt-out: set false to
-        // skip the grab and return the tree only — the cheap path when you're
-        // just re-indexing before an element ax action. `screenshot_out_file`
-        // still forces a capture (an explicit "write the frame to disk").
+        // `capture_mode` is DEPRECATED and ignored. The default remains the
+        // cross-checked tree+screenshot observation. `include_elements:false`
+        // is the explicit screenshot-only fast path for a caller that has
+        // already established the surface is canvas/WebGL/custom-drawn.
+        let include_elements = args.get("include_elements").and_then(|v| v.as_bool());
         let include_screenshot = args.get("include_screenshot").and_then(|v| v.as_bool());
-        let should_capture = include_screenshot != Some(false) || screenshot_out_file.is_some();
+        let plan = match observation_plan(
+            include_elements,
+            include_screenshot,
+            screenshot_out_file.is_some(),
+        ) {
+            Ok(plan) => plan,
+            Err(message) => {
+                return ToolResult::error(message).with_structured(serde_json::json!({
+                    "code": "empty_observation_requested",
+                    "suggestion": "enable include_elements or include_screenshot"
+                }))
+            }
+        };
         // Internal direct-tool mode used by verify_state. Registry ingress
         // strips underscore-prefixed arguments before public dispatch; only
         // a trusted direct in-process invocation can enable this mode.
@@ -233,8 +327,14 @@ impl Tool for GetWindowStateTool {
             .map(|v| v.max(1) as usize)
             .unwrap_or(crate::ax::tree::DEFAULT_MAX_DEPTH);
 
-        // Always walk the AX tree (perception returns both tree + screenshot).
-        let tree_result = {
+        // The expensive AX walk and screenshot encode are independent after
+        // the exact-window ownership preflight, so start both before awaiting
+        // either. Default latency becomes approximately max(tree, screenshot)
+        // instead of their sum.
+        let tree_branch = async {
+            if !plan.include_elements {
+                return Ok::<Option<crate::ax::tree::TreeWalkResult>, ToolResult>(None);
+            }
             let q = query.clone();
             // Keep the product deadline below the public client's 25-second
             // deadline so callers receive a structured driver error. The AX
@@ -250,19 +350,111 @@ impl Tool for GetWindowStateTool {
                 )
             });
             match tokio::time::timeout(std::time::Duration::from_secs(20), walk_future).await {
-                Ok(Ok(r)) => Some(r),
-                Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
-                Err(_elapsed) => {
-                    return ToolResult::error(format!(
-                        "AX tree walk for pid={pid} timed out after 20 s. \
+                Ok(Ok(result)) => Ok(Some(result)),
+                Ok(Err(error)) => Err(ToolResult::error(format!("AX tree walk failed: {error}"))),
+                Err(_elapsed) => Err(ToolResult::error(format!(
+                    "AX tree walk for pid={pid} timed out after 20 s. \
                          The app (likely Arc, Electron, or Safari with many tabs) has a \
                          pathologically large accessibility tree. \
                          Workaround: re-call with a depth-limited scan \
                          (max_elements / max_depth), then act by pixel (x,y) off \
                          the screenshot if the tree stays unusable."
-                    ));
+                ))),
+            }
+        };
+
+        let screenshot_branch = async {
+            if !plan.include_screenshot {
+                return (None, None);
+            }
+            match tokio::task::spawn_blocking(move || {
+                capture_screenshot(window_id, effective_max_dim)
+            })
+            .await
+            {
+                Ok(Ok(screenshot)) => (Some(screenshot), None),
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        "Screenshot frame could not be verified for window {window_id}: {error:?}"
+                    );
+                    (None, Some(error))
+                }
+                Err(error) => {
+                    tracing::warn!("Screenshot task error for window {window_id}: {error}");
+                    (None, None)
                 }
             }
+        };
+
+        let (tree_result, screenshot_result) =
+            join_observation_branches(tree_branch, screenshot_branch).await;
+        let tree_result = match tree_result {
+            Ok(tree) => tree,
+            Err(error) => return error,
+        };
+        let (captured_screenshot, screenshot_frame_error) = screenshot_result;
+
+        // Re-prove the exact native owner after the pixels were captured and
+        // before any image/file-path is returned. A CGWindowID can disappear
+        // or be recycled while the AX walk and screenshot run in parallel;
+        // publishing that frame under the old (pid, window_id) would bind
+        // pixels from a different surface to the caller's target.
+        let screenshot = if let Some((png, width, height, original_width, bounds, scale)) =
+            captured_screenshot
+        {
+            let owner = match tokio::task::spawn_blocking(move || {
+                crate::windows::resolve_window_owner(pid, window_id)
+            })
+            .await
+            {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return window_owner_resolution_failure(pid, window_id, error.to_string())
+                }
+            };
+            let scope = crate::ax::window_scope::scope_from_owner(&owner);
+            let publish = || -> Result<_, ToolResult> {
+                use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+                let (b64, file_path) = if let Some(path) = screenshot_out_file.clone() {
+                    if let Err(error) = std::fs::write(&path, &png) {
+                        let frame_error = super::px_frame::PxFrameError::CaptureUnavailable {
+                            window_id,
+                            reason: error.to_string(),
+                        };
+                        return Err(ToolResult::error(format!(
+                            "Screenshot output could not be written for window {window_id}: {frame_error:?}"
+                        ))
+                        .with_structured(super::px_frame::error_structured(&frame_error)));
+                    }
+                    (None, Some(path))
+                } else {
+                    (Some(BASE64.encode(&png)), None)
+                };
+                // Record resize ratio so ClickTool can scale screenshot-space
+                // coordinates back up. This happens only after the exact
+                // post-capture ownership proof succeeds.
+                if !observation_only {
+                    if let Some(original_width) = original_width {
+                        if width > 0 {
+                            self.state.resize_registry.set_ratio(
+                                pid,
+                                window_id,
+                                original_width as f64 / width as f64,
+                            );
+                        }
+                    } else {
+                        self.state.resize_registry.clear_ratio(pid, window_id);
+                    }
+                }
+                Ok(Some((b64, file_path, width, height, bounds, scale)))
+            };
+            match publish_after_window_scope_check(pid, window_id, scope.as_ref(), publish) {
+                Ok(Ok(screenshot)) => screenshot,
+                Ok(Err(error)) | Err(error) => return error,
+            }
+        } else {
+            None
         };
 
         // The window can close, or its CGWindow can be re-parented onto another
@@ -274,9 +466,10 @@ impl Tool for GetWindowStateTool {
                 return refusal;
             }
         }
-        // `window_scope` is None only when no window_id was requested, which
-        // this tool never does — so treat that as resolved.
-        let scope_matched = window_scope.as_ref().is_none_or(|s| s.is_matched());
+        // No AX scope exists on the explicit screenshot-only path; the
+        // WindowServer ownership preflight above remains authoritative there.
+        let scope_matched =
+            !plan.include_elements || window_scope.as_ref().is_none_or(|scope| scope.is_matched());
 
         // Update element cache — ONLY for a resolved window scope. Caching an
         // unresolved scope's nodes under (pid, window_id) is what turned a
@@ -285,138 +478,25 @@ impl Tool for GetWindowStateTool {
         // For an unresolved scope, replace any prior entry with an empty
         // snapshot so a stale index map cannot be clicked through either.
         if !observation_only {
-            if let Some(ref r) = tree_result {
-                if scope_matched {
-                    self.state.element_cache.update(pid, window_id, &r.nodes);
-                } else {
+            match tree_result.as_ref() {
+                Some(result) if scope_matched => {
+                    self.state
+                        .element_cache
+                        .update(pid, window_id, &result.nodes);
+                }
+                _ => {
+                    // A screenshot-only observation intentionally creates no
+                    // new AX binding. Empty the old cache so integer indices
+                    // from an earlier frame cannot be replayed after the UI
+                    // may have changed.
                     self.state.element_cache.update(pid, window_id, &[]);
                 }
             }
         }
 
-        // Capture the screenshot and deliver it alongside the tree — the
-        // grounding frame the agent cross-checks the (sometimes-lying) tree
-        // against. Skipped only when `include_screenshot:false` (and no
-        // screenshot_out_file). With `screenshot_out_file` set, write to disk and
-        // surface the path instead of embedding base64; otherwise embed base64.
-        let max_dim = effective_max_dim;
-        // Returns the encoded/file capture, delivered dimensions, optional
-        // downscale source width, the WindowServer bounds it was validated
-        // against, and the raw capture's backing scale.
-        let mut screenshot_frame_error = None;
-        let screenshot = if should_capture {
-            let out_file = screenshot_out_file.clone();
-            let res = tokio::task::spawn_blocking(move || -> Result<
-                (
-                    Option<String>,
-                    Option<String>,
-                    u32,
-                    u32,
-                    Option<u32>,
-                    crate::windows::WindowBounds,
-                    f64,
-                ),
-                super::px_frame::PxFrameError,
-            > {
-                use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-                let bounds = crate::windows::window_bounds_by_id(window_id)
-                    .filter(|b| b.width > 0.0 && b.height > 0.0)
-                    .ok_or(super::px_frame::PxFrameError::WindowNotFound { window_id })?;
-                let raw = crate::capture::screenshot_window_bytes(window_id).map_err(|e| {
-                    super::px_frame::PxFrameError::CaptureUnavailable {
-                        window_id,
-                        reason: e.to_string(),
-                    }
-                })?;
-                let (orig_w, orig_h) = crate::capture::png_dimensions(&raw).map_err(|e| {
-                    super::px_frame::PxFrameError::CaptureUnavailable {
-                        window_id,
-                        reason: e.to_string(),
-                    }
-                })?;
-                let scale =
-                    super::px_frame::validate_capture_frame(window_id, &bounds, orig_w, orig_h)?;
-                let png = crate::capture::resize_png_if_needed(&raw, max_dim).map_err(|e| {
-                    super::px_frame::PxFrameError::CaptureUnavailable {
-                        window_id,
-                        reason: e.to_string(),
-                    }
-                })?;
-                let (w, h) = crate::capture::png_dimensions(&png).map_err(|e| {
-                    super::px_frame::PxFrameError::CaptureUnavailable {
-                        window_id,
-                        reason: e.to_string(),
-                    }
-                })?;
-                let original_w = if w < orig_w { Some(orig_w) } else { None };
-                if let Some(ref path) = out_file {
-                    std::fs::write(path, &png).map_err(|e| {
-                        super::px_frame::PxFrameError::CaptureUnavailable {
-                            window_id,
-                            reason: e.to_string(),
-                        }
-                    })?;
-                    Ok((
-                        None,
-                        Some(path.clone()),
-                        w,
-                        h,
-                        original_w,
-                        bounds,
-                        scale,
-                    ))
-                } else {
-                    Ok((
-                        Some(BASE64.encode(&png)),
-                        None,
-                        w,
-                        h,
-                        original_w,
-                        bounds,
-                        scale,
-                    ))
-                }
-            }).await;
-            match res {
-                Ok(Ok((b64, file_path, w, h, orig_w, bounds, scale))) => {
-                    // Record resize ratio so ClickTool can scale coordinates back
-                    // up. Keyed per window: two windows of one pid can carry
-                    // different ratios (only the large one downscales), and a
-                    // pid-only key leaked one window's ratio into the other's
-                    // pixel clicks.
-                    if !observation_only {
-                        if let Some(ow) = orig_w {
-                            if w > 0 {
-                                self.state.resize_registry.set_ratio(
-                                    pid,
-                                    window_id,
-                                    ow as f64 / w as f64,
-                                );
-                            }
-                        } else {
-                            self.state.resize_registry.clear_ratio(pid, window_id);
-                        }
-                    }
-                    Some((b64, file_path, w, h, bounds, scale))
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        "Screenshot frame could not be verified for window {window_id}: {e:?}"
-                    );
-                    if !observation_only {
-                        self.state.resize_registry.clear_ratio(pid, window_id);
-                    }
-                    screenshot_frame_error = Some(e);
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!("Screenshot task error for window {window_id}: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        if screenshot.is_none() && plan.include_screenshot && !observation_only {
+            self.state.resize_registry.clear_ratio(pid, window_id);
+        }
 
         // Capture screenshot dimensions before consuming.
         let screenshot_dims = screenshot.as_ref().map(|(_, _, w, h, _, _)| (*w, *h));
@@ -458,6 +538,12 @@ impl Tool for GetWindowStateTool {
         }
 
         if content.is_empty() {
+            if let Some(ref error) = screenshot_frame_error {
+                return ToolResult::error(format!(
+                    "Screenshot frame could not be verified for window {window_id}: {error:?}"
+                ))
+                .with_structured(super::px_frame::error_structured(error));
+            }
             return ToolResult::error(
                 "No content produced (neither AX tree nor screenshot succeeded)",
             );
@@ -487,7 +573,7 @@ impl Tool for GetWindowStateTool {
             .as_ref()
             .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
             .unwrap_or(0);
-        let snapshot_id = if scope_matched && !observation_only {
+        let snapshot_id = if plan.include_elements && scope_matched && !observation_only {
             Some(cua_driver_core::element_token::global().register_snapshot(
                 pid,
                 window_id,
@@ -523,6 +609,7 @@ impl Tool for GetWindowStateTool {
         let mut structured = serde_json::json!({
             "window_id": window_id,
             "pid": pid,
+            "elements_included": plan.include_elements,
             "element_count": element_count,
             "total_element_count": element_count,
             "returned_element_count": filtered_element_count,
@@ -598,7 +685,7 @@ impl Tool for GetWindowStateTool {
         // background mutation, reported per route so an agent can choose
         // before acting. Every action still revalidates — this is advisory,
         // not a promise. Old consumers ignore the extra field.
-        {
+        if plan.include_elements {
             let capture_available = screenshot_dims.is_some();
             let report = tokio::task::spawn_blocking(move || {
                 let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
@@ -718,6 +805,43 @@ fn window_scope_refusal(
             })),
         ),
     }
+}
+
+/// Gate screenshot publication on a second exact ownership proof.
+///
+/// Tree-only observations have no pixels to publish, so they do not need this
+/// second check. A same-pid owner is represented by `None` because
+/// `scope_from_owner(WindowOwner::SamePid)` deliberately defers to AX only for
+/// tree scoping; for screenshot publication it is the successful outcome.
+fn publish_after_window_scope_check<T>(
+    pid: i32,
+    window_id: u32,
+    owner_scope: Option<&crate::ax::WindowScope>,
+    publish: impl FnOnce() -> T,
+) -> Result<T, ToolResult> {
+    if let Some(refusal) = owner_scope.and_then(|scope| window_scope_refusal(pid, window_id, scope))
+    {
+        return Err(refusal);
+    }
+    Ok(publish())
+}
+
+fn window_owner_resolution_failure(
+    pid: i32,
+    window_id: u32,
+    reason: impl Into<String>,
+) -> ToolResult {
+    let reason = reason.into();
+    ToolResult::error(format!(
+        "could not resolve owner for window_id {window_id}: {reason}"
+    ))
+    .with_structured(serde_json::json!({
+        "code": "window_target_resolution_failed",
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "reason": reason,
+    }))
 }
 
 /// Which degradation rung a snapshot lands on.
@@ -946,6 +1070,40 @@ mod window_scope_contract_tests {
     }
 
     #[test]
+    fn post_capture_revalidation_refuses_stale_or_reowned_windows() {
+        let mut published = false;
+        let stale =
+            publish_after_window_scope_check(800, 67340, Some(&WindowScope::NotFound), || {
+                published = true
+            })
+            .expect_err("a captured frame must not be published after its window disappeared");
+        assert!(!published);
+        assert_eq!(structured(stale)["code"], "window_id_not_found");
+
+        let mut published = false;
+        let mismatch =
+            publish_after_window_scope_check(800, 67340, Some(&panel_mismatch()), || {
+                published = true
+            })
+            .expect_err("a captured frame must not be published after its window was re-owned");
+        assert!(!published);
+        assert_eq!(structured(mismatch)["code"], "window_owner_pid_mismatch");
+
+        publish_after_window_scope_check(800, 67340, None, || published = true).unwrap();
+        assert!(published);
+    }
+
+    #[test]
+    fn owner_lookup_failure_is_not_misreported_as_not_found() {
+        let failure = structured(window_owner_resolution_failure(
+            800,
+            67340,
+            "probe task panicked",
+        ));
+        assert_eq!(failure["code"], "window_target_resolution_failed");
+    }
+
+    #[test]
     fn resolvable_scopes_are_not_refused() {
         assert!(window_scope_refusal(800, 11, &WindowScope::Matched).is_none());
         assert!(
@@ -1005,6 +1163,85 @@ mod window_scope_contract_tests {
                 "tool description must advertise {code}"
             );
         }
+    }
+
+    #[test]
+    fn schema_advertises_screenshot_only_fast_path() {
+        let include_elements = &def().input_schema["properties"]["include_elements"];
+        assert_eq!(include_elements["type"], "boolean");
+        assert!(include_elements["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("screenshot-only")));
+    }
+
+    #[test]
+    fn observation_plan_defaults_to_tree_and_screenshot() {
+        assert_eq!(
+            observation_plan(None, None, false),
+            Ok(ObservationPlan {
+                include_elements: true,
+                include_screenshot: true,
+            })
+        );
+    }
+
+    #[test]
+    fn observation_plan_supports_screenshot_only_and_tree_only() {
+        assert_eq!(
+            observation_plan(Some(false), None, false),
+            Ok(ObservationPlan {
+                include_elements: false,
+                include_screenshot: true,
+            })
+        );
+        assert_eq!(
+            observation_plan(None, Some(false), false),
+            Ok(ObservationPlan {
+                include_elements: true,
+                include_screenshot: false,
+            })
+        );
+    }
+
+    #[test]
+    fn observation_plan_rejects_an_empty_response() {
+        assert_eq!(
+            observation_plan(Some(false), Some(false), false),
+            Err(NO_OBSERVATION_CONTENT)
+        );
+        assert_eq!(
+            observation_plan(Some(false), Some(false), true),
+            Ok(ObservationPlan {
+                include_elements: false,
+                include_screenshot: true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_branches_are_polled_concurrently() {
+        let (tree_started_tx, tree_started_rx) = tokio::sync::oneshot::channel();
+        let (screenshot_started_tx, screenshot_started_rx) = tokio::sync::oneshot::channel();
+
+        let tree = async move {
+            tree_started_tx.send(()).unwrap();
+            screenshot_started_rx.await.unwrap();
+            "tree"
+        };
+        let screenshot = async move {
+            screenshot_started_tx.send(()).unwrap();
+            tree_started_rx.await.unwrap();
+            "screenshot"
+        };
+
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            join_observation_branches(tree, screenshot),
+        )
+        .await
+        .expect("both branches must be polled instead of awaiting one before the other");
+
+        assert_eq!(joined, ("tree", "screenshot"));
     }
 }
 

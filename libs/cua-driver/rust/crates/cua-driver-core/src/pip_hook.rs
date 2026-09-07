@@ -4,17 +4,18 @@
 //! The trait + factory live in the `pip-preview` crate so the platform
 //! backends can implement them without depending on `cua-driver-core`.
 //! What lives here is just the per-process callback that the tool
-//! dispatcher uses to push frames after each successful tool call —
-//! a thin shim so `tool.rs` doesn't need to know about `pip-preview`
-//! directly and we keep the dependency graph one-directional.
+//! dispatcher uses to seed frames from successful observations — a thin shim
+//! so `tool.rs` doesn't need to know about `pip-preview` directly and we keep
+//! the dependency graph one-directional. Platform live capture owns updates
+//! after that seed; mutations do not trigger another synchronous screenshot.
 //!
-//! The PNG bytes pushed through here come from the existing
-//! `SCREENSHOT_FN` callback (the same source `screenshot.png` uses in
-//! the recording pipeline), so PiP shows exactly what the recorder
-//! captures.
+//! The PNG bytes pushed through here are reused from the exact image content
+//! already returned by `get_window_state`, so PiP and the model begin from the
+//! same frame without paying for a duplicate capture.
 
 use std::sync::OnceLock;
 
+#[derive(Clone, Copy)]
 pub struct PipHookTarget {
     pub pid: i64,
     pub window_id: u64,
@@ -32,6 +33,7 @@ pub struct PipHookFrame {
 
 pub enum PipHookEvent {
     Upsert(PipHookFrame),
+    Ensure(PipHookTarget),
     SetInputPassthrough { passthrough: bool },
 }
 
@@ -80,5 +82,13 @@ pub fn begin_pip_input_passthrough() -> Result<Option<PipInputPassthroughGuard>,
 pub fn push_pip_frame(frame: PipHookFrame) {
     if let Some(f) = PIP_EVENT_FN.get() {
         let _ = f(PipHookEvent::Upsert(frame));
+    }
+}
+
+/// Ensure the exact target has a PiP card/live stream without synchronously
+/// capturing on the tool-dispatch path. No-op when no backend is registered.
+pub fn ensure_pip_target(target: PipHookTarget) {
+    if let Some(f) = PIP_EVENT_FN.get() {
+        let _ = f(PipHookEvent::Ensure(target));
     }
 }

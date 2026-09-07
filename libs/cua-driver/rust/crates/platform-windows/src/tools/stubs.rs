@@ -93,8 +93,8 @@ stub_tool!(
 );
 
 stub_tool!(get_window_state_m, GetWindowStateTool, "get_window_state",
-    "Always returns BOTH the element tree AND a screenshot — ground on both and cross-check (the tree lies on some surfaces). Choose the modality at ACTION time: an element ax action (element_index/element_token → accessibility rung) or an element px action (x,y → pixel rung off this screenshot). capture_mode is deprecated and ignored.",
-    serde_json::json!({"type":"object","required":["pid","window_id"],"properties":{"session": cua_driver_core::tool_schema::session_schema(),"pid":{"type":"integer"},"window_id":{"type":"integer"},"query":{"type":"string"},"capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),"include_screenshot":{"type":"boolean","description":"Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return tree only (the cheap path for re-indexing before an element ax action)."}},"additionalProperties":false}));
+    "By default returns BOTH the element tree AND a screenshot — ground on both and cross-check (the tree lies on some surfaces). Choose the modality at ACTION time: an element ax action (element_index/element_token → accessibility rung) or an element px action (x,y → pixel rung off this screenshot). capture_mode is deprecated and ignored. Set include_elements:false for the screenshot-only fast path.",
+    serde_json::json!({"type":"object","required":["pid","window_id"],"properties":{"session": cua_driver_core::tool_schema::session_schema(),"pid":{"type":"integer"},"window_id":{"type":"integer"},"query":{"type":"string"},"capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),"include_screenshot":{"type":"boolean","description":"Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return tree only (the cheap path for re-indexing before an element ax action)."},"include_elements":{"type":"boolean","description":"Default true. Set false for the screenshot-only fast path and skip the UIA walk."}},"additionalProperties":false}));
 
 stub_tool!(
     launch_app_m,

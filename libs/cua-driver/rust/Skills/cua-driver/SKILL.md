@@ -476,7 +476,7 @@ returns.
 
 ## Behavior matrix
 
-### Perception is mode-agnostic — `get_window_state` returns BOTH
+### Perception defaults to tree + screenshot; confirmed visual surfaces can go screenshot-only
 
 `get_window_state(pid, window_id)` **returns both the accessibility
 tree AND a screenshot by default.** There is no capture mode to pick
@@ -496,17 +496,26 @@ wrong you look at the pixels **in the same response** — no second
 capture, no mode flip.
 
 > **Perf opt-out — `include_screenshot`.** `include_screenshot`
-> (boolean, default `true`) is the one knob, and it is a **perf** knob,
+> (boolean, default `true`) is a **perf** knob,
 > not a modality choice. Default returns both (grounding-first). Pass
 > `include_screenshot:false` to skip the screen grab and get the tree
 > only — the cheap path when you're just **re-indexing before an
 > element ax action** and don't need to re-ground on pixels. The
 > `ax`/`px` decision still lives at action time, not here.
 
+> **Confirmed visual-only fast path — `include_elements:false`.** Start with
+> the default tree+screenshot observation. Only after that fresh response
+> establishes that the target is a canvas, WebGL, video, or other custom-drawn
+> surface absent from the accessibility tree may subsequent observations pass
+> `include_elements:false`. This skips the AX/UIA/AT-SPI walk while preserving
+> exact-window ownership checks, screenshot safety, dimensions, and pixel-coordinate
+> state. It also invalidates the prior element-index cache, so do not use it when
+> the next action needs `element_index` or `element_token`.
+
 > **`capture_mode` is DEPRECATED and ignored.** It is still _accepted_
 > on `get_window_state` so old callers don't error, but it has **no
-> effect** — both the tree and the screenshot come back regardless of
-> what you pass (`ax`, `vision`, `som`, anything). There is no
+> effect** — the default remains tree plus screenshot regardless of what you
+> pass (`ax`, `vision`, `som`, anything). There is no
 > `ax`/`vision`/`som` capture choice anymore. Drop the word "vision"
 > for perception entirely. (The tool named `screenshot` is separate —
 > raw PNG, no AX walk — and unrelated.)
@@ -528,7 +537,8 @@ on the action call, and that one choice selects the rung:
 
 `ax`↔`element_index`, `px`↔pixel `x,y`. We retired the word "vision"
 for the _dispatch_ path — it conflated perception with dispatch.
-Perception is always both; dispatch is `ax` or `px`.
+Perception is both by default; confirmed visual-only surfaces may use the
+screenshot-only optimization. Dispatch is still `ax` or `px`.
 
 **The keyboard family has both forms too.** `type_text`, `press_key`,
 and `hotkey` take a snapshot-bound element target (ax) **or** `x,y` (px) — mutually
@@ -593,9 +603,9 @@ can pixel-target in the background, so they target `pixel`. See
 
 ## The verify-then-escalate ladder (algorithm)
 
-Every snapshot already hands you both the tree and the screenshot, so
-verifying never means "go take a screenshot" — it means cross-check
-the tree against the pixels you already have, and only change
+The initial/default snapshot hands you both the tree and the screenshot, so
+verifying the first interaction never means "go take a screenshot" — it means
+cross-check the tree against the pixels you already have, and only change
 _dispatch rung_ on a real signal. Walk the rungs:
 
 ```
@@ -607,7 +617,7 @@ _dispatch rung_ on a real signal. Walk the rungs:
 # Continue below only when the postcondition actually requires native UI interaction.
 
 # Route 2 — element AX/UIA/AT-SPI action, backgrounded
-get_window_state(pid, window_id)            # tree + screenshot, both, always
+get_window_state(pid, window_id)            # tree + screenshot by default
 resp = click(pid, element_token)            # or type_text / set_value / press_key
 check = verify_state(                       # bounded structured read-back
     pid, window_id,
@@ -630,6 +640,8 @@ if resp.effect == "suspected_noop"
    or the tree looks wrong vs the screenshot:   # e.g. an h:1 / off-viewport row
 
     # Route 3 — element px action off the SAME screenshot
+    # Once this response confirms a visual-only surface, later observations
+    # may use include_elements:false to skip repeated AX walks.
     pick the target pixel from the screenshot already in the response
     click(pid, x, y)                        # background pixel — still no foreground
     verify_state(..., include_screenshot=true)
@@ -758,7 +770,11 @@ and the screenshot together** by default, so you can both dispatch by
 `element_token` and ground on pixels from one call — no config change,
 no mode flip. When you're just re-indexing before an element ax action
 and don't need fresh pixels, pass `include_screenshot:false` to skip
-the grab (a perf knob, not a modality choice).
+the grab. After the default observation has confirmed a canvas/WebGL/video/
+custom-drawn surface with no usable accessibility target, pass
+`include_elements:false` on subsequent visual observations to skip the tree
+walk. Do not select screenshot-only pre-emptively, and do not use an element
+target from an older snapshot after doing so.
 
 The response carries:
 
@@ -842,7 +858,7 @@ the response's `snapshot_id` with `element_index`; bare indices fail closed in
 | List an app's windows            | `list_windows({pid})`                                                                                           | returns `window_id`, `title`, `bounds`, `z_index`, `is_on_screen`, `on_current_space`. Already included in `launch_app`'s response — only call this for long-lived pids                                               |
 | Set an exact window frame        | `set_window_frame({pid, window_id, x, y, width, height})`                                                       | uses the platform window manager and returns `confirmed` only after geometry readback; inspect `list_windows` again before continuing when the result is not confirmed                                                |
 | Invoke a native application menu | `invoke_menu({pid, window_id, path:["Window","Arrange","Left"]})`                                              | resolves exact immediate-child labels from live native state at every hop; refuses missing, ambiguous, or disabled segments and never falls back to pixels; verify the command's semantic effect afterward          |
-| Snapshot a window                | `get_window_state({pid, window_id})`                                                                            | returns `tree_markdown` + `screenshot_*`; populates the `(pid, window_id)` element_index cache                                                                                                                        |
+| Snapshot a window                | `get_window_state({pid, window_id})`                                                                            | returns `tree_markdown` + `screenshot_*` by default; after visual-only confirmation, `include_elements:false` skips AX and clears the prior element-index cache                                                       |
 | Verify a postcondition           | `verify_state({pid, window_id, expect, include_screenshot?})`                                                   | polls bounded structured predicates; returns `satisfied`, `unsatisfied`, or `unknown`. Optional final image is interpreted by the agent harness, never by the driver                                                 |
 | Left click                       | `click({pid, element_token})` or `click({pid, window_id, element_index, snapshot_id})`                          | default `action: "press"`. Pixel form: `click({pid, x, y})` (window_id optional) — `modifier: ["cmd"\|"ctrl"]`                                                                                                        |
 | Double-click / open              | `double_click({pid, element_token})`                                                                            | Default action when the element advertises one (Open on Finder items / openable rows), else stamped pixel double-click at the element's center                                                                        |
@@ -882,7 +898,8 @@ coordinates only when the accessibility tree can't.
 The capture, dispatch, and addressing params — `session`,
 `delivery_mode`, `capture_mode` (deprecated/ignored — see the behavior
 matrix; still in the schema only so old callers don't error), `scope`,
-`modifier`, `button`, `element_index`, `snapshot_id`, `element_token` — are a **shared
+`include_elements`, `include_screenshot`, `modifier`, `button`,
+`element_index`, `snapshot_id`, `element_token` — are a **shared
 schema contract**: identical _shape_ (`type`/`enum`/`items`) on macOS,
 Windows, and Linux.
 They compose from canonical fragments in

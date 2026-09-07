@@ -142,6 +142,8 @@ static FOREGROUND_VISIBILITY_STATE: Mutex<ForegroundVisibilityState> =
 static SUPPRESSED_FOREGROUND_WATCHER: Mutex<Option<SuppressedForegroundWatcher>> = Mutex::new(None);
 static LIVE_STREAMS: LazyLock<Mutex<HashMap<i64, LiveStreamEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static PENDING_TARGET_SEEDS: LazyLock<Mutex<HashSet<(i64, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 const LIVE_CAPTURE_FPS: i32 = 12;
 const LIVE_CAPTURE_MAX_SIDE: f64 = 960.0;
@@ -236,6 +238,63 @@ impl PipBackend for MacosPipBackend {
         dispatch_to_main(frame, push_frame_cb);
     }
 
+    fn ensure_target(&self, target: pip_preview::PipTarget) {
+        if target.pid <= 0
+            || target.window_id == 0
+            || HIDDEN_APPS.lock().unwrap().contains(&target.pid)
+        {
+            return;
+        }
+
+        let already_seeded = VIEW_MODEL
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|model| model.frame_for_app(target.pid))
+            .is_some_and(|frame| exact_target_matches(frame, &target));
+        if already_seeded {
+            // The observation seed already started native live capture. The
+            // stream owns subsequent frames, so there is nothing to recapture.
+            return;
+        }
+
+        let target_pid = target.pid;
+        let target_window_id = target.window_id;
+        let key = (target_pid, target_window_id);
+        if !PENDING_TARGET_SEEDS.lock().unwrap().insert(key) {
+            return;
+        }
+        let spawn = std::thread::Builder::new()
+            .name(format!("cua-pip-seed-{target_pid}"))
+            .spawn(move || {
+                let png = if exact_window_is_owned(target.pid, target.window_id) {
+                    u32::try_from(target.window_id)
+                        .ok()
+                        .and_then(|window_id| {
+                            crate::capture::screenshot_window_bytes(window_id).ok()
+                        })
+                        .filter(|_| exact_window_is_owned(target.pid, target.window_id))
+                } else {
+                    None
+                };
+                PENDING_TARGET_SEEDS.lock().unwrap().remove(&key);
+                if let Some(png_bytes) = png {
+                    PipBackend::push_frame(
+                        &MacosPipBackend,
+                        PipFrame {
+                            target,
+                            png_bytes,
+                            timestamp_ms: wall_clock_ms(),
+                        },
+                    );
+                }
+            });
+        if let Err(error) = spawn {
+            PENDING_TARGET_SEEDS.lock().unwrap().remove(&key);
+            tracing::warn!(target: "pip", target_pid, target_window_id, %error, "failed to schedule PiP target seed");
+        }
+    }
+
     fn set_input_passthrough(&self, passthrough: bool) -> anyhow::Result<()> {
         dispatch_to_main_sync(passthrough, set_input_passthrough_cb);
         Ok(())
@@ -246,6 +305,19 @@ impl PipBackend for MacosPipBackend {
         stop_all_live_capture();
         dispatch_to_main((), shutdown_cb);
     }
+}
+
+fn exact_target_matches(frame: &PipFrame, target: &pip_preview::PipTarget) -> bool {
+    frame.target.pid == target.pid && frame.target.window_id == target.window_id
+}
+
+fn exact_window_is_owned(pid: i64, window_id: u64) -> bool {
+    let (Ok(pid), Ok(window_id)) = (i32::try_from(pid), u32::try_from(window_id)) else {
+        return false;
+    };
+    crate::windows::all_windows()
+        .into_iter()
+        .any(|window| window.pid == pid && window.window_id == window_id)
 }
 
 unsafe extern "C" fn set_input_passthrough_cb(ctx: *mut c_void) {
@@ -2356,6 +2428,7 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
     CARD_VIEW_PIDS.lock().unwrap().clear();
     RESIZE_VIEW_DIRECTIONS.lock().unwrap().clear();
     VIEW_MODEL.lock().unwrap().take();
+    PENDING_TARGET_SEEDS.lock().unwrap().clear();
     HIDDEN_APPS.lock().unwrap().clear();
     HOVERED_APP.lock().unwrap().take();
     CARD_GESTURE.lock().unwrap().take();
@@ -2461,6 +2534,30 @@ mod tests {
         assert!(!stream_frame_is_fresh(10_000, 0));
         assert!(stream_frame_is_fresh(10_000, 9_500));
         assert!(!stream_frame_is_fresh(10_000, 9_000));
+    }
+
+    #[test]
+    fn exact_target_match_requires_both_pid_and_window() {
+        let frame = frame(10, 100);
+        assert!(exact_target_matches(&frame, &frame.target));
+        assert!(!exact_target_matches(
+            &frame,
+            &pip_preview::PipTarget {
+                pid: 100,
+                window_id: 11,
+                app_name: String::new(),
+                window_title: None,
+            }
+        ));
+        assert!(!exact_target_matches(
+            &frame,
+            &pip_preview::PipTarget {
+                pid: 101,
+                window_id: 10,
+                app_name: String::new(),
+                window_title: None,
+            }
+        ));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::Value;
 
 thread_local! {
@@ -16,7 +17,7 @@ thread_local! {
 use crate::{
     pip_hook,
     protocol::{Content, ToolResult},
-    recording::{now_ms, screenshot_for, RecordingSession},
+    recording::{now_ms, RecordingSession},
     recording_tools::{
         GetRecordingStateTool, ReplayRegistrySlot, ReplayTrajectoryTool, StartRecordingTool,
         StopRecordingTool,
@@ -1660,24 +1661,36 @@ impl ToolRegistry {
         }
 
         // Experimental PiP push — only when --experimental-pip is on argv.
-        // In addition to post-action frames, a successful exact-window
-        // observation seeds the preview before the first mutation. Other
-        // read-only tools remain excluded to avoid ambient/duplicate capture.
-        let should_publish_pip =
-            pip_frame_should_publish(resolved_name, should_record, result.is_error == Some(true));
-        if pip_hook::pip_enabled() && should_publish_pip && !private_consent_turn {
-            let exact_target = pip_exact_native_target(&args);
-            if let Some(((window_id, pid), png_bytes)) =
-                exact_target.and_then(|(window_id, pid)| {
-                    screenshot_for(Some(window_id), Some(pid))
-                        .map(|png_bytes| ((window_id, pid), png_bytes))
-                })
-            {
-                pip_hook::push_pip_frame(pip_hook::PipHookFrame {
-                    target: pip_hook::PipHookTarget { pid, window_id },
-                    png_bytes,
-                    timestamp_ms: now_ms(),
-                });
+        // A successful exact-window observation already contains the PNG that
+        // the model receives, so reuse those bytes instead of synchronously
+        // capturing the same window again. The macOS PiP backend starts its
+        // live stream from this seed frame; post-action recaptures are therefore
+        // intentionally omitted. This removes a full screenshot from every
+        // mutation without weakening the actuator's independent execution-time
+        // target/frame calibration.
+        if pip_hook::pip_enabled() && !private_consent_turn {
+            let png_bytes = pip_png_from_result(&result);
+            let update = pip_update_kind(
+                resolved_name,
+                should_record,
+                result.is_error == Some(true),
+                png_bytes.is_some(),
+            );
+            if let Some((window_id, pid)) = pip_exact_native_target(&args) {
+                let target = pip_hook::PipHookTarget { pid, window_id };
+                match (update, png_bytes) {
+                    (PipUpdateKind::SeedObservation, Some(png_bytes)) => {
+                        pip_hook::push_pip_frame(pip_hook::PipHookFrame {
+                            target,
+                            png_bytes,
+                            timestamp_ms: now_ms(),
+                        });
+                    }
+                    (PipUpdateKind::EnsureTarget, _) => {
+                        pip_hook::ensure_pip_target(target);
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -2599,8 +2612,45 @@ fn pip_exact_native_target(args: &Value) -> Option<(u64, i64)> {
         .filter(|(window_id, pid)| *window_id > 0 && *pid > 0)
 }
 
-fn pip_frame_should_publish(tool_name: &str, should_record: bool, result_is_error: bool) -> bool {
-    should_record || (tool_name == "get_window_state" && !result_is_error)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipUpdateKind {
+    Skip,
+    SeedObservation,
+    EnsureTarget,
+}
+
+fn pip_update_kind(
+    tool_name: &str,
+    should_record: bool,
+    result_is_error: bool,
+    has_embedded_png: bool,
+) -> PipUpdateKind {
+    if tool_name == "get_window_state" && !result_is_error {
+        if has_embedded_png {
+            PipUpdateKind::SeedObservation
+        } else {
+            PipUpdateKind::EnsureTarget
+        }
+    } else if should_record {
+        PipUpdateKind::EnsureTarget
+    } else {
+        PipUpdateKind::Skip
+    }
+}
+
+/// Decode the exact PNG already carried by a successful observation.
+/// Invalid or non-PNG image blocks are ignored so PiP remains best-effort and
+/// can never turn an otherwise valid Computer Use response into an error.
+fn pip_png_from_result(result: &ToolResult) -> Option<Vec<u8>> {
+    result.content.iter().find_map(|content| match content {
+        Content::Image {
+            data, mime_type, ..
+        } if mime_type.eq_ignore_ascii_case("image/png") => BASE64_STANDARD
+            .decode(data)
+            .ok()
+            .filter(|bytes| !bytes.is_empty()),
+        _ => None,
+    })
 }
 
 /// Bucket that owns the processes a call is allowed to terminate.
@@ -5533,19 +5583,54 @@ mod capability_tests {
     }
 
     #[test]
-    fn pip_frame_policy_includes_exact_window_observations() {
-        assert!(super::pip_frame_should_publish("click", true, true));
-        assert!(super::pip_frame_should_publish(
-            "get_window_state",
-            false,
-            false
-        ));
-        assert!(!super::pip_frame_should_publish(
-            "get_window_state",
-            false,
-            true
-        ));
-        assert!(!super::pip_frame_should_publish("list_apps", false, false));
+    fn pip_update_policy_reuses_observations_and_never_recaptures_mutations() {
+        assert_eq!(
+            super::pip_update_kind("get_window_state", false, false, true),
+            super::PipUpdateKind::SeedObservation
+        );
+        assert_eq!(
+            super::pip_update_kind("get_window_state", false, false, false),
+            super::PipUpdateKind::EnsureTarget
+        );
+        assert_eq!(
+            super::pip_update_kind("click", true, false, false),
+            super::PipUpdateKind::EnsureTarget
+        );
+        assert_eq!(
+            super::pip_update_kind("get_window_state", false, true, true),
+            super::PipUpdateKind::Skip
+        );
+        assert_eq!(
+            super::pip_update_kind("list_apps", false, false, false),
+            super::PipUpdateKind::Skip
+        );
+    }
+
+    #[test]
+    fn pip_reuses_the_png_already_returned_by_get_window_state() {
+        let result = ToolResult {
+            content: vec![
+                Content::text("state"),
+                Content::image_png("AQIDBA==".to_owned()),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(super::pip_png_from_result(&result), Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn pip_rejects_invalid_or_non_png_embedded_images() {
+        let invalid = ToolResult {
+            content: vec![Content::image_png("not-base64".to_owned())],
+            ..Default::default()
+        };
+        assert_eq!(super::pip_png_from_result(&invalid), None);
+
+        let jpeg = ToolResult {
+            content: vec![Content::image_jpeg("AQIDBA==".to_owned())],
+            ..Default::default()
+        };
+        assert_eq!(super::pip_png_from_result(&jpeg), None);
     }
 
     #[test]

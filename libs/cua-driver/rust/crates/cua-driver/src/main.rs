@@ -272,6 +272,14 @@ fn maybe_init_pip() {
                                     timestamp_ms: frame.timestamp_ms,
                                 });
                             }
+                            cua_driver_core::pip_hook::PipHookEvent::Ensure(target) => {
+                                b.ensure_target(pip_preview::PipTarget {
+                                    pid: target.pid,
+                                    window_id: target.window_id,
+                                    app_name: String::new(),
+                                    window_title: None,
+                                });
+                            }
                             cua_driver_core::pip_hook::PipHookEvent::SetInputPassthrough {
                                 passthrough,
                             } => {
