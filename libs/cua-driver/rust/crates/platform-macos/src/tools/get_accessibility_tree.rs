@@ -57,7 +57,7 @@ impl Tool for GetAccessibilityTreeTool {
         let _ = &self.state; // state not needed for this tool
 
         let apps = crate::apps::list_running_apps();
-        let windows = crate::windows::visible_windows();
+        let windows = crate::windows::visible_automation_windows();
 
         let mut lines = vec![format!(
             "{} running app(s), {} visible window(s)",

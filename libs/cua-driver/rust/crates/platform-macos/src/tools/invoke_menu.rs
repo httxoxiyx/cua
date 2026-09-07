@@ -308,7 +308,7 @@ impl Tool for InvokeMenuTool {
             Ok(window_id) => window_id,
             Err(_) => return refusal("invoke_menu: window_id is out of range".into()),
         };
-        if !crate::windows::all_windows()
+        if !crate::windows::all_automation_windows()
             .iter()
             .any(|window| window.pid == pid && window.window_id == window_id)
         {

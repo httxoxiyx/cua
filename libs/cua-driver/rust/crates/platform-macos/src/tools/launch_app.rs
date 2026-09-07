@@ -521,7 +521,7 @@ fn protected_host_launch_refusal() -> ToolResult {
 /// LaunchServices → WindowServer latency (mirrors the Swift reference).
 fn resolve_windows_for_pid(pid: i32) -> Vec<crate::windows::WindowInfo> {
     for attempt in 0..5 {
-        let found: Vec<_> = crate::windows::all_windows()
+        let found: Vec<_> = crate::windows::all_automation_windows()
             .into_iter()
             .filter(|w| w.pid == pid && w.layer == 0)
             .filter(|w| w.bounds.width > 1.0 && w.bounds.height > 1.0)

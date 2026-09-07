@@ -7,7 +7,8 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use crate::ax::bindings::{
-    copy_action_names, element_screen_center, kAXErrorSuccess, perform_action, AXUIElementRef,
+    copy_action_names, element_screen_center, kAXErrorActionUnsupported,
+    kAXErrorAttributeUnsupported, kAXErrorSuccess, perform_action, AXError, AXUIElementRef,
 };
 
 use super::ToolState;
@@ -24,6 +25,11 @@ fn background_action_for_element(
     } else {
         cua_driver_core::background_input::BackgroundAction::WindowPointer
     }
+}
+
+fn should_fallback_from_ax_open(error: AXError, allow_pointer_fallback: bool) -> bool {
+    allow_pointer_fallback
+        && (error == kAXErrorAttributeUnsupported || error == kAXErrorActionUnsupported)
 }
 
 impl DoubleClickTool {
@@ -149,16 +155,33 @@ impl Tool for DoubleClickTool {
             // Thread the resolved session cursor key into the blocking AX path
             // so its ClickPulse lands on THIS session's cursor, not "default".
             let ck = cursor_key.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                ax_double_click(
-                    pid,
-                    wid,
-                    element_ptr,
-                    idx,
-                    &ck,
-                    has_ax_open,
-                    delivery_mode.is_foreground(),
-                )
+            let foreground = delivery_mode.is_foreground();
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                if !foreground {
+                    return ax_double_click(pid, wid, element_ptr, idx, &ck, has_ax_open, false);
+                }
+
+                let mut outcome = None;
+                let fronted = crate::input::skylight::with_foreground_assist(pid, wid, || {
+                    outcome = Some(ax_double_click(
+                        pid,
+                        wid,
+                        element_ptr,
+                        idx,
+                        &ck,
+                        has_ax_open,
+                        true,
+                    )?);
+                    Ok(())
+                })?;
+                let mut message = outcome
+                    .ok_or_else(|| anyhow::anyhow!("foreground double-click did not execute"))?;
+                if !fronted {
+                    message.push_str(
+                        " Foreground assist was unavailable; delivery used the exact window-local route.",
+                    );
+                }
+                Ok(message)
             })
             .await;
 
@@ -322,10 +345,10 @@ fn ax_double_click(
         if err == kAXErrorSuccess {
             return Ok(format!("AXOpen performed on element [{idx}]."));
         }
-        if !allow_pointer_fallback {
+        if !should_fallback_from_ax_open(err, allow_pointer_fallback) {
             anyhow::bail!(
-                "AXOpen returned {err} for element [{idx}]; background delivery will not \
-                 improvise a pointer fallback after choosing the semantic route"
+                "AXOpen returned {err} for element [{idx}]; pointer fallback is allowed only \
+                 in foreground mode after AX reports an unsupported attribute or action"
             );
         }
         tracing::debug!(
@@ -379,5 +402,29 @@ mod tests {
             background_action_for_element(false),
             cua_driver_core::background_input::BackgroundAction::WindowPointer
         );
+    }
+
+    #[test]
+    fn ax_open_fallback_requires_foreground_and_a_definite_unsupported_error() {
+        assert!(should_fallback_from_ax_open(
+            kAXErrorAttributeUnsupported,
+            true
+        ));
+        assert!(should_fallback_from_ax_open(
+            kAXErrorActionUnsupported,
+            true
+        ));
+        assert!(!should_fallback_from_ax_open(
+            kAXErrorAttributeUnsupported,
+            false
+        ));
+        assert!(!should_fallback_from_ax_open(
+            crate::ax::bindings::kAXErrorCannotComplete,
+            true
+        ));
+        assert!(!should_fallback_from_ax_open(
+            crate::ax::bindings::kAXErrorFailure,
+            true
+        ));
     }
 }

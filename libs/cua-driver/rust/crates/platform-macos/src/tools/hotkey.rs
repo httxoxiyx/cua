@@ -177,7 +177,7 @@ impl Tool for HotkeyTool {
             let display = raw_keys.join("+");
             let result = tokio::task::spawn_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                crate::input::keyboard::press_key_global(&key, &modifier_refs)
+                crate::input::keyboard::press_key_bare_global(&key, &modifier_refs)
             })
             .await;
             return match result {
@@ -256,6 +256,11 @@ impl Tool for HotkeyTool {
         // background combo (matches click/type_text).
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
         let fg = delivery_mode.is_foreground();
+        let remembered_cursor = if fg {
+            super::remembered_agent_cursor_position(&self.state, &args)
+        } else {
+            None
+        };
         let px = args.get("x").and_then(|value| value.as_f64());
         let py = args.get("y").and_then(|value| value.as_f64());
         if px.is_some() && py.is_some() && element_index.is_some() {
@@ -392,16 +397,20 @@ impl Tool for HotkeyTool {
         };
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
-        // Hotkeys like Cmd+N, Cmd+W, Cmd+T explicitly open/close
-        // windows. The NSMenu path also briefly activates the target via
-        // SLPSSetFrontProcessWithOptions which can race the wildcard
-        // suppressor — wrapping ensures both side-effects are observed
-        // and the prior frontmost is restored if the activation lingers.
+        // Hotkeys like Cmd+N, Cmd+W, Cmd+T explicitly open/close windows.
+        // Background delivery keeps the wildcard suppressor. Foreground
+        // delivery owns an exact-window activation guard below, so suppressing
+        // the target here would race and undo the activation before the HID
+        // chord reaches custom canvases such as Blender/GHOST.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = if fg {
+            WindowChangeDetector::snapshot_without_suppression(prior_front)
+        } else {
+            WindowChangeDetector::snapshot(prior_front)
+        };
 
         let result = focus_guard::with_focus_suppressed(
-            Some(pid),
+            if fg { None } else { Some(pid) },
             prior_front,
             "hotkey.CGEvent",
             || async move {
@@ -413,16 +422,12 @@ impl Tool for HotkeyTool {
                         // target frontmost until both key events are consumed;
                         // otherwise Cmd+A/Cmd+V can be silently ignored.
                         (true, true, Some(wid), _) => {
-                            crate::input::skylight::with_foreground_hid_activation(
+                            crate::input::skylight::with_foreground_keyboard_target_activation(
                                 pid as libc::pid_t,
                                 wid,
-                                || {
-                                    if screen_sharing_target {
-                                        crate::input::keyboard::press_key_bare_global(&key, &m)
-                                    } else {
-                                        crate::input::keyboard::press_key_global(&key, &m)
-                                    }
-                                },
+                                remembered_cursor,
+                                true,
+                                || crate::input::keyboard::press_key_global(&key, &m),
                             )?;
                             Ok(())
                         }
@@ -431,12 +436,14 @@ impl Tool for HotkeyTool {
                         // establish and confirm the requested child focus after
                         // activation, then use the guarded global HID queue.
                         (true, false, Some(wid), Some(ptr)) => {
-                            crate::input::skylight::with_foreground_hid_activation(
+                            crate::input::skylight::with_foreground_keyboard_target_activation(
                                 pid as libc::pid_t,
                                 wid,
+                                remembered_cursor,
+                                true,
                                 || {
                                     focus_hotkey_element(pid, ptr)?;
-                                    crate::input::keyboard::press_key_bare_global(&key, &m)
+                                    crate::input::keyboard::press_key_global(&key, &m)
                                 },
                             )?;
                             Ok(())
@@ -448,20 +455,28 @@ impl Tool for HotkeyTool {
                         (true, false, Some(wid), None)
                             if crate::input::keyboard::is_screen_sharing_pid(pid) =>
                         {
-                            crate::input::skylight::with_foreground_hid_activation(
+                            crate::input::skylight::with_foreground_keyboard_target_activation(
                                 pid as libc::pid_t,
                                 wid,
-                                || crate::input::keyboard::press_key_bare_global(&key, &m),
+                                remembered_cursor,
+                                false,
+                                || crate::input::keyboard::press_key_global(&key, &m),
                             )?;
                             Ok(())
                         }
-                        // foreground rung: briefly front the window so NSMenu key
-                        // equivalents dispatch, then restore prior frontmost.
+                        // Foreground hotkeys must model a physical chord for every
+                        // target, not only Screen Sharing. PID-routed base-key
+                        // events carrying modifier flags can reach NSMenu but are
+                        // observed as a bare key by custom canvases such as
+                        // Blender/GHOST. Keep the exact window frontmost through
+                        // Cmd-down/base-down/base-up/Cmd-up, then restore it.
                         (true, false, Some(wid), None) => {
-                            crate::input::skylight::with_menu_shortcut_activation(
+                            crate::input::skylight::with_foreground_keyboard_target_activation(
                                 pid as libc::pid_t,
                                 wid,
-                                || crate::input::keyboard::hotkey_no_auth(pid, &key, &m),
+                                remembered_cursor,
+                                false,
+                                || crate::input::keyboard::press_key_global(&key, &m),
                             )?;
                             Ok(())
                         }

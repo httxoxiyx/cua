@@ -73,6 +73,21 @@ pub(crate) fn all_windows_with_space_snapshot() -> WindowEnumeration {
     enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::ZeroOnly)
 }
 
+/// Enumerate layer-0 windows that are meaningful automation targets.
+///
+/// Unlike [`all_windows`], this performs a narrowly-gated AX check for macOS
+/// capture-indicator helpers. Keep hot compositor/PiP polling on the raw
+/// enumeration functions above.
+pub(crate) fn all_automation_windows() -> Vec<WindowInfo> {
+    all_automation_windows_with_space_snapshot().windows
+}
+
+pub(crate) fn all_automation_windows_with_space_snapshot() -> WindowEnumeration {
+    let enumeration = all_windows_with_space_snapshot();
+    let evidence = enumeration.windows.clone();
+    filter_automation_enumeration_with_evidence(enumeration, &evidence)
+}
+
 /// Enumerate only on-screen windows.
 pub fn visible_windows() -> Vec<WindowInfo> {
     visible_windows_with_space_snapshot().windows
@@ -83,6 +98,22 @@ pub(crate) fn visible_windows_with_space_snapshot() -> WindowEnumeration {
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         LayerFilter::ZeroOnly,
     )
+}
+
+pub(crate) fn visible_automation_windows() -> Vec<WindowInfo> {
+    visible_automation_windows_with_space_snapshot().windows
+}
+
+pub(crate) fn visible_automation_windows_with_space_snapshot() -> WindowEnumeration {
+    let enumeration = visible_windows_with_space_snapshot();
+
+    // `kCGWindowListOptionOnScreenOnly` includes the app-owned half of
+    // WindowSharingSessionButton, while its ThemeWidgetControlViewService twin
+    // is only present in the full WindowServer snapshot. Keep that off-screen
+    // twin as classification evidence without returning it in the visible
+    // projection.
+    let evidence = all_windows();
+    filter_automation_enumeration_with_evidence(enumeration, &evidence)
 }
 
 /// Enumerate windows on every CGWindow layer, including the accessory layers
@@ -274,6 +305,118 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
     }
 }
 
+fn filter_automation_enumeration_with_evidence(
+    mut enumeration: WindowEnumeration,
+    evidence: &[WindowInfo],
+) -> WindowEnumeration {
+    enumeration.windows =
+        filter_automation_windows_with_evidence(enumeration.windows, evidence, |window| {
+            use crate::ax::window_classification::{
+                classify_automation_window, AutomationWindowClass,
+            };
+
+            classify_automation_window(window.pid, window.window_id)
+                .map(|class| class == AutomationWindowClass::SystemCaptureIndicator)
+        });
+    enumeration
+}
+
+/// Cheaply narrow AX classification to small, titleless layer-0 surfaces.
+///
+/// Geometry is deliberately only a prefilter. The final exclusion requires
+/// the exact `WindowSharingSessionButton` AX marker, so legitimate compact
+/// utility windows remain visible to automation.
+fn capture_indicator_probe_candidate(window: &WindowInfo) -> bool {
+    window.layer == 0
+        && window.is_on_screen
+        && (window.title.is_empty() || window.title == "Window")
+        && window.bounds.width > 0.0
+        && window.bounds.width <= 256.0
+        && window.bounds.height > 0.0
+        && window.bounds.height <= 96.0
+}
+
+const THEME_WIDGET_CONTROL_VIEW_SERVICE: &str = "ThemeWidgetControlViewService";
+
+fn bounds_match(left: &WindowBounds, right: &WindowBounds) -> bool {
+    const TOLERANCE_POINTS: f64 = 0.5;
+    (left.x - right.x).abs() <= TOLERANCE_POINTS
+        && (left.y - right.y).abs() <= TOLERANCE_POINTS
+        && (left.width - right.width).abs() <= TOLERANCE_POINTS
+        && (left.height - right.height).abs() <= TOLERANCE_POINTS
+}
+
+/// ScreenCaptureKit's WindowSharingSessionButton is represented by two
+/// layer-0 CG windows with identical bounds: an app-owned `"Window"` surface
+/// and an untitled ThemeWidgetControlViewService surface. The app-owned half
+/// is intentionally absent from `AXWindows`, so the exact AX classifier cannot
+/// prove what it is. Treat the paired WindowServer representation as the
+/// bounded fallback proof instead of guessing from compact geometry alone.
+fn has_capture_indicator_twin(window: &WindowInfo, evidence: &[WindowInfo]) -> bool {
+    let app_owned_half =
+        window.title == "Window" && window.app_name != THEME_WIDGET_CONTROL_VIEW_SERVICE;
+    let service_half =
+        window.app_name == THEME_WIDGET_CONTROL_VIEW_SERVICE && window.title.is_empty();
+    if !app_owned_half && !service_half {
+        return false;
+    }
+
+    evidence.iter().any(|other| {
+        if other.window_id == window.window_id
+            || other.pid == window.pid
+            || other.layer != 0
+            || !bounds_match(&window.bounds, &other.bounds)
+        {
+            return false;
+        }
+
+        if app_owned_half {
+            other.app_name == THEME_WIDGET_CONTROL_VIEW_SERVICE && other.title.is_empty()
+        } else {
+            other.title == "Window" && other.app_name != THEME_WIDGET_CONTROL_VIEW_SERVICE
+        }
+    })
+}
+
+#[cfg(test)]
+fn filter_automation_windows_with<F>(
+    windows: Vec<WindowInfo>,
+    is_system_capture_indicator: F,
+) -> Vec<WindowInfo>
+where
+    F: FnMut(&WindowInfo) -> Option<bool>,
+{
+    let evidence = windows.clone();
+    filter_automation_windows_with_evidence(windows, &evidence, is_system_capture_indicator)
+}
+
+fn filter_automation_windows_with_evidence<F>(
+    windows: Vec<WindowInfo>,
+    evidence: &[WindowInfo],
+    mut is_system_capture_indicator: F,
+) -> Vec<WindowInfo>
+where
+    F: FnMut(&WindowInfo) -> Option<bool>,
+{
+    windows
+        .into_iter()
+        .filter(|window| {
+            if has_capture_indicator_twin(window, evidence) {
+                return false;
+            }
+
+            if !capture_indicator_probe_candidate(window) {
+                return true;
+            }
+
+            // Fail open when AX is unavailable. We must never hide an unknown
+            // application window merely because it has compact geometry. The
+            // WindowServer twin check above is the only non-AX exclusion.
+            !matches!(is_system_capture_indicator(window), Some(true))
+        })
+        .collect()
+}
+
 fn apply_window_space_metadata(
     window: &mut WindowInfo,
     space_ids: Option<Vec<u64>>,
@@ -379,7 +522,11 @@ pub fn resolve_window_owner(pid: i32, window_id: u32) -> WindowOwner {
 
 /// Select the best window_id for a pid.
 pub fn resolve_main_window_id(pid: i32) -> anyhow::Result<u32> {
-    let windows = all_windows();
+    let windows = all_automation_windows();
+    resolve_main_window_id_in(&windows, pid)
+}
+
+fn resolve_main_window_id_in(windows: &[WindowInfo], pid: i32) -> anyhow::Result<u32> {
     let pid_windows: Vec<&WindowInfo> = windows.iter().filter(|w| w.pid == pid).collect();
     if pid_windows.is_empty() {
         anyhow::bail!("pid {pid} has no windows");
@@ -461,6 +608,127 @@ mod tests {
             on_current_space: None,
             space_ids: None,
         }
+    }
+
+    #[test]
+    fn window_sharing_session_button_is_not_an_automation_window() {
+        let mut main = window(10, 800, "Calculator");
+        main.title = "Calculator".into();
+        main.bounds.width = 230.0;
+        main.bounds.height = 408.0;
+        main.z_index = 2;
+
+        let mut helper = window(11, 800, "Calculator");
+        helper.title = "Window".into();
+        helper.bounds.width = 66.0;
+        helper.bounds.height = 20.0;
+        helper.z_index = 3;
+
+        let filtered = filter_automation_windows_with(vec![main, helper], |candidate| {
+            Some(candidate.window_id == 11)
+        });
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|window| window.window_id)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert_eq!(resolve_main_window_id_in(&filtered, 800).unwrap(), 10);
+    }
+
+    #[test]
+    fn ax_unresolved_capture_indicator_twin_is_filtered() {
+        let mut main = window(10, 800, "Calculator");
+        main.title = "Calculator".into();
+        main.bounds.width = 230.0;
+        main.bounds.height = 408.0;
+        main.z_index = 2;
+
+        // ScreenCaptureKit exposes this injected surface through CGWindowList,
+        // but it is not necessarily present in the owning app's AXWindows.
+        let mut helper = window(11, 800, "Calculator");
+        helper.title = "Window".into();
+        helper.bounds.width = 66.0;
+        helper.bounds.height = 20.0;
+        helper.z_index = 3;
+
+        let mut twin = helper.clone();
+        twin.window_id = 12;
+        twin.pid = 900;
+        twin.app_name = THEME_WIDGET_CONTROL_VIEW_SERVICE.into();
+        twin.title.clear();
+        twin.is_on_screen = false;
+
+        let filtered = filter_automation_windows_with(vec![helper, twin, main], |_| None);
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|window| window.window_id)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert_eq!(resolve_main_window_id_in(&filtered, 800).unwrap(), 10);
+    }
+
+    #[test]
+    fn visible_projection_keeps_offscreen_twin_as_classification_evidence() {
+        let mut main = window(10, 800, "Calculator");
+        main.title = "Calculator".into();
+        main.bounds.width = 230.0;
+        main.bounds.height = 408.0;
+
+        let mut helper = window(11, 800, "Calculator");
+        helper.title = "Window".into();
+        helper.bounds.width = 66.0;
+        helper.bounds.height = 20.0;
+
+        let mut twin = helper.clone();
+        twin.window_id = 12;
+        twin.pid = 900;
+        twin.app_name = THEME_WIDGET_CONTROL_VIEW_SERVICE.into();
+        twin.title.clear();
+        twin.is_on_screen = false;
+
+        let visible = vec![helper, main];
+        let evidence = [visible[0].clone(), visible[1].clone(), twin];
+        let filtered = filter_automation_windows_with_evidence(visible, &evidence, |_| None);
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|window| window.window_id)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+    }
+
+    #[test]
+    fn unpaired_compact_window_named_window_is_preserved_when_ax_is_unavailable() {
+        let mut compact = window(11, 800, "Utility");
+        compact.title = "Window".into();
+        compact.bounds.width = 66.0;
+        compact.bounds.height = 20.0;
+
+        let filtered = filter_automation_windows_with(vec![compact.clone()], |_| None);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].window_id, compact.window_id);
+    }
+
+    #[test]
+    fn compact_titleless_window_is_preserved_without_exact_ax_marker() {
+        let mut compact = window(11, 800, "Utility");
+        compact.bounds.width = 66.0;
+        compact.bounds.height = 20.0;
+
+        let ordinary = filter_automation_windows_with(vec![compact.clone()], |_| Some(false));
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0].window_id, compact.window_id);
+
+        let ax_unavailable = filter_automation_windows_with(vec![compact], |_| None);
+        assert_eq!(ax_unavailable.len(), 1, "AX failure must fail open");
     }
 
     #[test]

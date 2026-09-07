@@ -57,9 +57,9 @@ impl Tool for ListWindowsTool {
         let on_screen_only = args.bool_or("on_screen_only", false);
 
         let enumeration = if on_screen_only {
-            crate::windows::visible_windows_with_space_snapshot()
+            crate::windows::visible_automation_windows_with_space_snapshot()
         } else {
-            crate::windows::all_windows_with_space_snapshot()
+            crate::windows::all_automation_windows_with_space_snapshot()
         };
         let current_space_id = enumeration.current_space_id;
         let mut windows = enumeration.windows;

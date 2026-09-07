@@ -16,7 +16,7 @@ use super::bindings::{
     ax_get_window_id, copy_ax_windows, copy_bool_attr, copy_element_attr, copy_string_attr,
     focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
 };
-use crate::windows::{all_windows, resolve_window_owner, WindowOwner};
+use crate::windows::{all_automation_windows, resolve_window_owner, WindowOwner};
 
 /// Bounded `AXParent` ascent used when an element does not expose `AXWindow`.
 const MAX_ANCESTRY_DEPTH: usize = 40;
@@ -189,7 +189,7 @@ pub fn gather_background_facts(
     let competing_keyboard_destinations = count_competing_keyboard_destinations(
         pid,
         window_id,
-        all_windows()
+        all_automation_windows()
             .iter()
             .map(|window| (window.pid, window.window_id)),
         &records,

@@ -152,67 +152,82 @@ pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
     let key_code = key_name_to_code(key)?;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    let mut active_flags = CGEventFlags::CGEventFlagNull;
-    let mut pressed_modifiers: Vec<(u16, CGEventFlags)> = Vec::new();
-
-    // A flag-only base-key event can leave the HID modifier state latched on
-    // macOS. Model a physical chord instead: modifier downs in caller order,
-    // base down/up, then modifier ups in reverse order. This also matches the
-    // Windows SendInput and Linux XTest implementations.
+    let mut modifier_keys = Vec::new();
     for modifier in modifiers {
         let Some((modifier_code, modifier_flag)) = modifier_key_code_and_flag(modifier) else {
             continue;
         };
-        if pressed_modifiers
+        if modifier_keys
             .iter()
-            .any(|(pressed_code, _)| *pressed_code == modifier_code)
+            .any(|(existing_code, _)| *existing_code == modifier_code)
         {
             continue;
         }
-        active_flags |= modifier_flag;
-        if let Err(error) = post_global_key(
-            &source,
-            modifier_code,
-            true,
-            active_flags,
-            CGEventTapLocation::HID,
-        ) {
-            release_global_modifiers(
-                &source,
-                &pressed_modifiers,
-                active_flags,
-                CGEventTapLocation::HID,
-            );
-            return Err(error);
-        }
-        pressed_modifiers.push((modifier_code, modifier_flag));
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        modifier_keys.push((modifier_code, modifier_flag));
     }
 
+    dispatch_explicit_chord_with(
+        key_code,
+        &modifier_keys,
+        |code, key_down, flags| {
+            post_global_key(&source, code, key_down, flags, CGEventTapLocation::HID)
+        },
+        || std::thread::sleep(std::time::Duration::from_millis(8)),
+    )
+}
+
+/// Emit a physical chord from an explicit HID modifier state, with best-effort
+/// release of the base key and every posted modifier when a later event fails.
+fn dispatch_explicit_chord_with<Error>(
+    key_code: u16,
+    modifier_keys: &[(u16, CGEventFlags)],
+    mut emit: impl FnMut(u16, bool, CGEventFlags) -> Result<(), Error>,
+    mut after_emit: impl FnMut(),
+) -> Result<(), Error> {
+    let mut active_flags = CGEventFlags::CGEventFlagNull;
+    let mut pressed_modifiers = Vec::with_capacity(modifier_keys.len());
+    let mut base_down = false;
+
     let result = (|| {
-        post_global_key(
-            &source,
-            key_code,
-            true,
-            active_flags,
-            CGEventTapLocation::HID,
-        )?;
-        std::thread::sleep(std::time::Duration::from_millis(8));
-        post_global_key(
-            &source,
-            key_code,
-            false,
-            active_flags,
-            CGEventTapLocation::HID,
-        )
+        for &(modifier_code, modifier_flag) in modifier_keys {
+            let next_flags = active_flags | modifier_flag;
+            emit(modifier_code, true, next_flags)?;
+            active_flags = next_flags;
+            pressed_modifiers.push((modifier_code, modifier_flag));
+            after_emit();
+        }
+
+        emit(key_code, true, active_flags)?;
+        base_down = true;
+        after_emit();
+
+        emit(key_code, false, active_flags)?;
+        base_down = false;
+        after_emit();
+
+        while let Some(&(modifier_code, modifier_flag)) = pressed_modifiers.last() {
+            let mut next_flags = active_flags;
+            next_flags.remove(modifier_flag);
+            emit(modifier_code, false, next_flags)?;
+            active_flags = next_flags;
+            pressed_modifiers.pop();
+            after_emit();
+        }
+        Ok(())
     })();
 
-    release_global_modifiers(
-        &source,
-        &pressed_modifiers,
-        active_flags,
-        CGEventTapLocation::HID,
-    );
+    if result.is_err() {
+        if base_down && emit(key_code, false, active_flags).is_ok() {
+            after_emit();
+        }
+        while let Some((modifier_code, modifier_flag)) = pressed_modifiers.pop() {
+            active_flags.remove(modifier_flag);
+            if emit(modifier_code, false, active_flags).is_ok() {
+                after_emit();
+            }
+        }
+    }
+
     result
 }
 
@@ -735,6 +750,121 @@ pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
 mod tests {
     use super::*;
     use core_graphics::event::CGEventType;
+    use std::{cell::Cell, cell::RefCell, rc::Rc};
+
+    #[test]
+    fn explicit_command_a_does_not_leak_command_into_following_n() {
+        let command_active = Rc::new(Cell::new(false));
+        let n_saw_command = Rc::new(Cell::new(false));
+        let mut emit = {
+            let command_active = Rc::clone(&command_active);
+            let n_saw_command = Rc::clone(&n_saw_command);
+            move |code, key_down, flags: CGEventFlags| {
+                if code == 55 {
+                    command_active.set(key_down);
+                } else if code == 45 && key_down {
+                    n_saw_command.set(
+                        command_active.get() || flags.contains(CGEventFlags::CGEventFlagCommand),
+                    );
+                }
+                Ok::<_, &'static str>(())
+            }
+        };
+
+        dispatch_explicit_chord_with(
+            0,
+            &[(55, CGEventFlags::CGEventFlagCommand)],
+            &mut emit,
+            || {},
+        )
+        .unwrap();
+        dispatch_explicit_chord_with(45, &[], &mut emit, || {}).unwrap();
+
+        assert!(!command_active.get(), "Command must be up after Cmd+A");
+        assert!(!n_saw_command.get(), "following n must not become Cmd+N");
+    }
+
+    #[test]
+    fn explicit_shift_f4_does_not_leak_shift_into_following_p() {
+        let shift_active = Rc::new(Cell::new(false));
+        let p_saw_shift = Rc::new(Cell::new(false));
+        let mut emit = {
+            let shift_active = Rc::clone(&shift_active);
+            let p_saw_shift = Rc::clone(&p_saw_shift);
+            move |code, key_down, flags: CGEventFlags| {
+                if code == SHIFT_KEY_CODE {
+                    shift_active.set(key_down);
+                } else if code == 35 && key_down {
+                    p_saw_shift
+                        .set(shift_active.get() || flags.contains(CGEventFlags::CGEventFlagShift));
+                }
+                Ok::<_, &'static str>(())
+            }
+        };
+
+        dispatch_explicit_chord_with(
+            key_name_to_code("f4").unwrap(),
+            &[(SHIFT_KEY_CODE, CGEventFlags::CGEventFlagShift)],
+            &mut emit,
+            || {},
+        )
+        .unwrap();
+        dispatch_explicit_chord_with(35, &[], &mut emit, || {}).unwrap();
+
+        assert!(!shift_active.get(), "Shift must be up after Shift+F4");
+        assert!(!p_saw_shift.get(), "following p must remain lowercase");
+    }
+
+    #[test]
+    fn explicit_chord_releases_base_and_modifier_after_failure() {
+        let shift_active = Rc::new(Cell::new(false));
+        let base_active = Rc::new(Cell::new(false));
+        let fail_base_up_once = Rc::new(Cell::new(true));
+        let events = Rc::new(RefCell::new(Vec::new()));
+
+        let error = dispatch_explicit_chord_with(
+            0,
+            &[(SHIFT_KEY_CODE, CGEventFlags::CGEventFlagShift)],
+            {
+                let shift_active = Rc::clone(&shift_active);
+                let base_active = Rc::clone(&base_active);
+                let fail_base_up_once = Rc::clone(&fail_base_up_once);
+                let events = Rc::clone(&events);
+                move |code, key_down, flags| {
+                    if code == 0 && !key_down && fail_base_up_once.replace(false) {
+                        return Err("base-up creation failed");
+                    }
+                    if code == SHIFT_KEY_CODE {
+                        shift_active.set(key_down);
+                    } else {
+                        base_active.set(key_down);
+                    }
+                    events.borrow_mut().push((
+                        code,
+                        key_down,
+                        flags.contains(CGEventFlags::CGEventFlagShift),
+                    ));
+                    Ok(())
+                }
+            },
+            || {},
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "base-up creation failed");
+        assert_eq!(
+            *events.borrow(),
+            [
+                (SHIFT_KEY_CODE, true, true),
+                (0, true, true),
+                (0, false, true),
+                (SHIFT_KEY_CODE, false, false),
+            ],
+            "cleanup must retry base-up before releasing Shift"
+        );
+        assert!(!base_active.get(), "base key must be up after failure");
+        assert!(!shift_active.get(), "Shift must be up after failure");
+    }
 
     #[test]
     fn physical_text_uses_flags_changed_for_balanced_shift_transitions() {

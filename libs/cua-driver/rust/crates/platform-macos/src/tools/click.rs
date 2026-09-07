@@ -1048,10 +1048,14 @@ impl Tool for ClickTool {
                 "click.pixel",
                 || async move {
                     tokio::task::spawn_blocking(move || {
-                        let has_modifiers = !mods_owned.is_empty();
                         let do_click = move || -> anyhow::Result<()> {
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                            if fg && !m.is_empty() {
+                            if fg {
+                                // Foreground pixel delivery must behave like a real
+                                // user gesture. Custom canvases such as Blender's
+                                // GHOST regions choose their input context from the
+                                // global HID pointer stream and ignore PID-routed
+                                // mouse events even while their window is frontmost.
                                 return crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
                                     screen_x,
                                     screen_y,
@@ -1104,21 +1108,14 @@ impl Tool for ClickTool {
                         // Foreground rung: brief front → click → restore.
                         // Returns whether the window was ACTUALLY fronted, so the
                         // reported `path` honestly reflects the rung that ran.
-                        match (fg, window_id, has_modifiers) {
-                            (true, Some(wid), true) => {
+                        match (fg, window_id) {
+                            (true, Some(wid)) => {
                                 crate::input::skylight::with_foreground_hid_activation(
                                     pid as libc::pid_t,
                                     wid,
                                     do_click,
                                 )
                                 .map(|_| true)
-                            }
-                            (true, Some(wid), false) => {
-                                crate::input::skylight::with_foreground_assist(
-                                    pid as libc::pid_t,
-                                    wid,
-                                    do_click,
-                                )
                             }
                             _ => do_click().map(|_| false),
                         }

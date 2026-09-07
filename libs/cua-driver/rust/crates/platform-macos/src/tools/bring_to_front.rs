@@ -120,7 +120,7 @@ fn classify_exact_outcome(
 }
 
 fn observe_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
-    let windows = crate::windows::visible_windows();
+    let windows = crate::windows::visible_automation_windows();
     let target_visible_ordinary = windows
         .iter()
         .any(|window| window.pid == pid && window.window_id == window_id && window.layer == 0);

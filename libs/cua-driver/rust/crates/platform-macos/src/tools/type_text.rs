@@ -231,6 +231,11 @@ impl Tool for TypeTextTool {
         };
         let delay_ms = args.u64_or("delay_ms", 30);
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
+        let remembered_cursor = if delivery_mode.is_foreground() {
+            super::remembered_agent_cursor_position(&self.state, &args)
+        } else {
+            None
+        };
         if let Some(error) = screen_sharing_delivery_error(
             crate::input::keyboard::is_screen_sharing_pid(pid),
             delivery_mode.is_foreground(),
@@ -387,6 +392,7 @@ impl Tool for TypeTextTool {
                         delivery_mode,
                         window_id,
                         blocking_policy,
+                        remembered_cursor,
                     )
                 })
                 .await
@@ -591,6 +597,86 @@ enum TextDeliveryRoute {
     PhysicalSynthesis,
 }
 
+/// Concrete keyboard-event actuator for synthesized text.
+///
+/// Foreground delivery uses the global HID queue only while an exact-window
+/// guard is active. Screen Sharing requires physical virtual-key transitions;
+/// Blender and ordinary foreground applications use layout-independent Unicode
+/// events, and unguarded/background delivery remains PID-routed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextEventRoute {
+    PidUnicode,
+    GlobalUnicode,
+    GlobalPhysical,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextEventPolicy {
+    route: TextEventRoute,
+    focus_click: bool,
+}
+
+fn text_event_route(
+    delivery_mode: super::DeliveryMode,
+    has_exact_window: bool,
+    screen_sharing_target: bool,
+) -> TextEventRoute {
+    if !delivery_mode.is_foreground() || !has_exact_window {
+        TextEventRoute::PidUnicode
+    } else if screen_sharing_target {
+        TextEventRoute::GlobalPhysical
+    } else {
+        TextEventRoute::GlobalUnicode
+    }
+}
+
+fn text_event_policy(
+    delivery_mode: super::DeliveryMode,
+    has_exact_window: bool,
+    screen_sharing_target: bool,
+    bundle_id: Option<&str>,
+) -> TextEventPolicy {
+    let route = text_event_route(delivery_mode, has_exact_window, screen_sharing_target);
+    TextEventPolicy {
+        route,
+        focus_click: route == TextEventRoute::GlobalUnicode
+            && crate::input::skylight::foreground_keyboard_focus_click_for_bundle_id(bundle_id),
+    }
+}
+
+fn dispatch_text_events(
+    route: TextEventRoute,
+    pid: i32,
+    text: &str,
+    delay_ms: u64,
+) -> anyhow::Result<()> {
+    dispatch_text_events_with(
+        route,
+        pid,
+        text,
+        delay_ms,
+        crate::input::keyboard::type_text_with_delay,
+        crate::input::keyboard::type_text_global,
+        crate::input::keyboard::type_text_physical_global,
+    )
+}
+
+fn dispatch_text_events_with(
+    route: TextEventRoute,
+    pid: i32,
+    text: &str,
+    delay_ms: u64,
+    pid_dispatch: impl FnOnce(i32, &str, u64) -> anyhow::Result<()>,
+    global_unicode_dispatch: impl FnOnce(&str, u64) -> anyhow::Result<()>,
+    global_physical_dispatch: impl FnOnce(&str, u64) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match route {
+        TextEventRoute::PidUnicode => pid_dispatch(pid, text, delay_ms),
+        TextEventRoute::GlobalUnicode => global_unicode_dispatch(text, delay_ms),
+        TextEventRoute::GlobalPhysical => global_physical_dispatch(text, delay_ms),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SynthesisRefusal {
     requested_chars: usize,
@@ -628,7 +714,7 @@ fn synthesis_preflight(
     }
     let per_character_ms = match route {
         TextDeliveryRoute::AtomicAx => unreachable!(),
-        // PID-routed and desktop Unicode paths post one key-down and one
+        // PID-routed and global-HID Unicode paths post one key-down and one
         // key-up, sleeping 8ms after the down and max(delay, 8) after the up.
         TextDeliveryRoute::UnicodeSynthesis => {
             KEY_DOWN_GAP_MS.saturating_add(delay_ms.max(KEY_DOWN_GAP_MS))
@@ -1023,17 +1109,19 @@ fn cgevent_type_verified(
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     settle_ms: u64,
     window_id: Option<u32>,
+    event_route: TextEventRoute,
 ) -> anyhow::Result<(bool, Option<usize>)> {
     // Focus the target element so the keystrokes land in IT. Critical in
     // foreground mode: a freshly-fronted window's keyboard focus may be on the
     // search box or nowhere, so without this the text goes into the void (or the
     // wrong field). AXFocused is best-effort — harmless when unsupported.
     //
-    // Ordering matters as much as the write itself. `with_foreground_assist` has
-    // already waited for the activation to land, so AppKit has installed the
-    // window's remembered first responder by now and this write lands *after*
-    // it rather than being clobbered by it. Re-applying once on a failed
-    // read-back covers apps that install their responder slightly late.
+    // Ordering matters as much as the write itself. The foreground guard has
+    // already waited for exact activation and primed the pointer-owned context,
+    // so AppKit has installed the window's remembered first responder by now
+    // and this write lands *after* it rather than being clobbered by it.
+    // Re-applying once on a failed read-back covers apps that install their
+    // responder slightly late.
     if let Some((ptr, _)) = element_ptr_and_idx {
         let _ = crate::input::ax_actions::focus_element(ptr);
         if settle_ms > 0 && !crate::input::ax_actions::is_element_focused(pid, ptr) {
@@ -1050,7 +1138,7 @@ fn cgevent_type_verified(
     if settle_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
     }
-    crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
+    dispatch_text_events(event_route, pid, text, delay_ms)?;
 
     // CGEvent posting is asynchronous with respect to the renderer. In
     // particular, Chromium can acknowledge the posting process while a long
@@ -1097,7 +1185,8 @@ fn await_typed_delivery(
 /// - `delivery_mode == Background` (default): AX insert → read-back; on a
 ///   silent/unreadable accept, CGEvent keystrokes → read-back. Never fronts.
 /// - `delivery_mode == Foreground`: the agent's explicit last resort — briefly
-///   front `window_id`, insert at the current cursor, restore, then read-back.
+///   front the exact `window_id`, prime its pointer-owned keyboard context,
+///   insert at the current text cursor, restore, then read-back.
 ///
 /// Returns `(detail, path, verified)`. `verified` is `true` only when a
 /// read-back positively confirmed the text; `false` means the agent must
@@ -1111,6 +1200,7 @@ fn type_text_blocking(
     delivery_mode: super::DeliveryMode,
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
+    remembered_cursor: Option<(f64, f64)>,
 ) -> anyhow::Result<TypeTextDelivery> {
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
@@ -1121,8 +1211,22 @@ fn type_text_blocking(
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
         let screen_sharing_target = crate::input::keyboard::is_screen_sharing_pid(pid);
+        let bundle_id = apps::bundle_id_for_pid(pid);
+        let event_policy = text_event_policy(
+            delivery_mode,
+            window_id.is_some(),
+            screen_sharing_target,
+            bundle_id.as_deref(),
+        );
+        let event_route = event_policy.route;
+        let path = if event_route == TextEventRoute::PidUnicode {
+            PATH_KEY_EVENTS
+        } else {
+            PATH_KEY_EVENTS_FG
+        };
+        let focus_click = event_policy.focus_click;
         if let Some(refusal) = synthesis_preflight(
-            if screen_sharing_target {
+            if event_route == TextEventRoute::GlobalPhysical {
                 TextDeliveryRoute::PhysicalSynthesis
             } else {
                 TextDeliveryRoute::UnicodeSynthesis
@@ -1131,11 +1235,7 @@ fn type_text_blocking(
             delay_ms,
         ) {
             return Ok(TypeTextDelivery::SynthesisRefused {
-                path: if window_id.is_some() {
-                    PATH_KEY_EVENTS_FG
-                } else {
-                    PATH_KEY_EVENTS
-                },
+                path,
                 refusal,
                 ax_attempt: AxAttempt::NotAttempted,
             });
@@ -1158,6 +1258,7 @@ fn type_text_blocking(
                 element_ptr_and_idx,
                 foreground_settle_ms,
                 window_id,
+                event_route,
             )
         };
         let ((verified, delivered_chars), fronted) = match window_id {
@@ -1168,9 +1269,10 @@ fn type_text_blocking(
                 // turn Cmd+V into plain "v". The explicit foreground rung may
                 // safely use the global HID queue while the exact target is
                 // guarded and restored.
-                crate::input::skylight::with_foreground_hid_activation(
+                crate::input::skylight::with_foreground_keyboard_context_activation(
                     pid as libc::pid_t,
                     wid,
+                    remembered_cursor,
                     || {
                         if foreground_settle_ms > 0 {
                             std::thread::sleep(std::time::Duration::from_millis(
@@ -1183,34 +1285,40 @@ fn type_text_blocking(
                 ((false, None), true)
             }
             Some(wid) => {
-                // Front → type → restore. The closure returns the read-back
-                // result; with_foreground_assist returns whether it actually
-                // fronted (Ok(false) when the fronting SPIs are unavailable —
-                // the keystrokes still ran, just as background input).
+                // Exact-window activate → pointer-context move → type → restore.
+                // Keep the read-back tuple outside the closure because the
+                // shared foreground helper deliberately exposes only whether
+                // the guarded action itself succeeded.
                 let mut typed_delivery = (false, None);
-                let fronted = crate::input::skylight::with_foreground_assist(
-                    pid as libc::pid_t,
-                    wid,
-                    || {
-                        typed_delivery = do_type()?;
-                        Ok(())
-                    },
-                )?;
-                (typed_delivery, fronted)
+                let type_action = || {
+                    typed_delivery = do_type()?;
+                    Ok(())
+                };
+                if focus_click {
+                    crate::input::skylight::with_foreground_keyboard_focus_activation(
+                        pid as libc::pid_t,
+                        wid,
+                        remembered_cursor,
+                        type_action,
+                    )?;
+                } else {
+                    crate::input::skylight::with_foreground_keyboard_context_activation(
+                        pid as libc::pid_t,
+                        wid,
+                        remembered_cursor,
+                        type_action,
+                    )?;
+                }
+                (typed_delivery, true)
             }
             // No window to front — best-effort background keystrokes instead.
             None => (do_type()?, false),
         };
-        // Only claim the `_fg` path when a front actually happened; when no
-        // foregrounding occurred (no window, or SPIs unavailable) these were
-        // background keystrokes and `path` must say so honestly.
+        // Only claim the `_fg` path when an exact window was guarded; the
+        // window-less fallback remains background keystrokes and must say so.
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via foreground keystrokes ({delay_ms}ms delay)"),
-            path: if fronted {
-                PATH_KEY_EVENTS_FG
-            } else {
-                PATH_KEY_EVENTS
-            },
+            path: if fronted { PATH_KEY_EVENTS_FG } else { path },
             delivered_chars,
             verified,
         }));
@@ -1247,6 +1355,7 @@ fn type_text_blocking(
             element_ptr_and_idx,
             /*settle_ms=*/ 0,
             window_id,
+            TextEventRoute::PidUnicode,
         )?;
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
@@ -1359,6 +1468,7 @@ fn type_text_blocking(
         element_ptr_and_idx,
         /*settle_ms=*/ 0,
         window_id,
+        TextEventRoute::PidUnicode,
     )?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
@@ -1371,6 +1481,175 @@ fn type_text_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_unicode_synthesis_uses_global_hid_not_pid_routing() {
+        let policy = text_event_policy(
+            super::super::DeliveryMode::Foreground,
+            true,
+            false,
+            Some("com.apple.TextEdit"),
+        );
+        assert_eq!(
+            policy,
+            TextEventPolicy {
+                route: TextEventRoute::GlobalUnicode,
+                focus_click: false,
+            }
+        );
+
+        let dispatched = std::cell::Cell::new(None);
+        dispatch_text_events_with(
+            policy.route,
+            78_199,
+            "print(1)",
+            30,
+            |_, _, _| {
+                dispatched.set(Some("pid"));
+                Ok(())
+            },
+            |_, _| {
+                dispatched.set(Some("global_unicode"));
+                Ok(())
+            },
+            |_, _| {
+                dispatched.set(Some("global_physical"));
+                Ok(())
+            },
+        )
+        .expect("foreground Unicode dispatch");
+
+        assert_eq!(dispatched.get(), Some("global_unicode"));
+        let record = cua_driver_core::action_record::ActionExecutionRecord::from_legacy(
+            "type_text",
+            &serde_json::json!({"delivery_mode": "foreground"}),
+            &serde_json::json!({
+                "path": PATH_KEY_EVENTS_FG,
+                "effect": "unverifiable",
+            }),
+        )
+        .expect("foreground type_text action record");
+        assert_eq!(
+            record.transport,
+            cua_driver_core::action_record::ActionTransport::MacosCgEventHid,
+            "the reported foreground route must match the global HID actuator"
+        );
+    }
+
+    #[test]
+    fn blender_exact_bundle_uses_global_unicode_with_focus_click() {
+        let policy = text_event_policy(
+            super::super::DeliveryMode::Foreground,
+            true,
+            false,
+            Some("org.blenderfoundation.blender"),
+        );
+        assert_eq!(
+            policy,
+            TextEventPolicy {
+                route: TextEventRoute::GlobalUnicode,
+                focus_click: true,
+            }
+        );
+
+        let dispatched = std::cell::Cell::new(None);
+        dispatch_text_events_with(
+            policy.route,
+            78_199,
+            "print(\"TBH_ZERO_ANCHOR_UNICODE🙂\")",
+            30,
+            |_, _, _| {
+                dispatched.set(Some("pid"));
+                Ok(())
+            },
+            |_, _| {
+                dispatched.set(Some("global_unicode"));
+                Ok(())
+            },
+            |_, _| {
+                dispatched.set(Some("global_physical"));
+                Ok(())
+            },
+        )
+        .expect("Blender Unicode foreground dispatch");
+        assert_eq!(dispatched.get(), Some("global_unicode"));
+    }
+
+    #[test]
+    fn screen_sharing_exact_foreground_uses_physical_text_without_focus_click() {
+        let policy = text_event_policy(
+            super::super::DeliveryMode::Foreground,
+            true,
+            true,
+            Some("com.apple.ScreenSharing"),
+        );
+        assert_eq!(
+            policy,
+            TextEventPolicy {
+                route: TextEventRoute::GlobalPhysical,
+                focus_click: false,
+            }
+        );
+
+        let dispatched = std::cell::Cell::new(None);
+        dispatch_text_events_with(
+            policy.route,
+            42,
+            "screen sharing text",
+            30,
+            |_, _, _| {
+                dispatched.set(Some("pid"));
+                Ok(())
+            },
+            |_, _| {
+                dispatched.set(Some("global_unicode"));
+                Ok(())
+            },
+            |_, _| {
+                dispatched.set(Some("global_physical"));
+                Ok(())
+            },
+        )
+        .expect("Screen Sharing physical foreground dispatch");
+        assert_eq!(dispatched.get(), Some("global_physical"));
+    }
+
+    #[test]
+    fn foreground_without_exact_window_never_uses_global_events() {
+        assert_eq!(
+            text_event_route(super::super::DeliveryMode::Foreground, false, true),
+            TextEventRoute::PidUnicode
+        );
+    }
+
+    #[test]
+    fn background_unicode_synthesis_remains_pid_routed() {
+        let route = text_event_route(super::super::DeliveryMode::Background, true, true);
+        assert_eq!(route, TextEventRoute::PidUnicode);
+
+        let dispatched = std::cell::Cell::new(None);
+        dispatch_text_events_with(
+            route,
+            42,
+            "text",
+            30,
+            |_, _, _| {
+                dispatched.set(Some("pid"));
+                Ok(())
+            },
+            |_, _| {
+                dispatched.set(Some("global_hid"));
+                Ok(())
+            },
+            |_, _| {
+                dispatched.set(Some("global_physical"));
+                Ok(())
+            },
+        )
+        .expect("background Unicode dispatch");
+
+        assert_eq!(dispatched.get(), Some("pid"));
+    }
 
     /// Sanity-check that the terminal short-circuit can be expressed as a
     /// pure function of `is_terminal_target`: when true, the code goes
@@ -1399,6 +1678,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
+            None,
         );
         // We don't care whether r is Ok or Err — what matters is that
         // calling it with is_terminal_target=true is safe and never
@@ -1425,6 +1705,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             Some(7),
             BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
+            None,
         );
         match r {
             Ok(TypeTextDelivery::Refused(returned)) => assert_eq!(returned, refusal),
@@ -1444,6 +1725,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
+            None,
         )
         .expect("preflight refusal must not attempt the invalid pid");
         let TypeTextDelivery::SynthesisRefused {

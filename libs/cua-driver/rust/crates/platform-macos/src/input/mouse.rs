@@ -17,6 +17,57 @@ use core_graphics::{
 };
 use foreign_types::ForeignType;
 
+/// Screen-space point used to establish a custom canvas's keyboard context.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ForegroundKeyboardAnchor {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Pick the point whose real HID mouse-move should precede a foreground
+/// keyboard action. A remembered agent cursor is useful only while it still
+/// belongs to the exact live window; stale, non-finite, and out-of-window
+/// positions fall back to the window's center.
+pub(crate) fn foreground_keyboard_anchor(
+    bounds: &crate::windows::WindowBounds,
+    remembered: Option<(f64, f64)>,
+) -> Option<ForegroundKeyboardAnchor> {
+    let right = bounds.x + bounds.width;
+    let bottom = bounds.y + bounds.height;
+    if ![
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+        right,
+        bottom,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+        || bounds.width <= 0.0
+        || bounds.height <= 0.0
+    {
+        return None;
+    }
+
+    if let Some((x, y)) = remembered {
+        if x.is_finite()
+            && y.is_finite()
+            && x >= bounds.x
+            && x < right
+            && y >= bounds.y
+            && y < bottom
+        {
+            return Some(ForegroundKeyboardAnchor { x, y });
+        }
+    }
+
+    Some(ForegroundKeyboardAnchor {
+        x: bounds.x + bounds.width / 2.0,
+        y: bounds.y + bounds.height / 2.0,
+    })
+}
+
 /// Left-click at `(x, y)` screen coordinates, posted to `pid`.
 ///
 /// Window-local coordinates for backgrounded targets: if `window_local` is
@@ -118,6 +169,12 @@ fn click_at_xy_desktop_inner(
     // Re-couple cursor + mouse-delta so the synthesized click hit-tests at the
     // warped point, not the pre-warp one.
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+    // Some custom-canvas applications (notably Blender/GHOST) choose the
+    // keyboard context from their last delivered mouse-move event rather than
+    // polling the current hardware cursor position. A cursor warp alone does
+    // not reliably update that application-owned context, so prime it with a
+    // genuine HID mouse move before the down/up pair.
+    post_desktop_mouse_moved(&source, point)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
     let result = super::keyboard::with_global_modifier_keys(modifiers, |flags| {
         for pair_index in 0..count.max(1) {
@@ -158,11 +215,177 @@ fn click_at_xy_desktop_inner(
 /// Move the real hardware cursor to a logical desktop point.
 pub fn move_cursor_desktop(x: f64, y: f64) -> anyhow::Result<()> {
     use core_graphics::display::CGDisplay;
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let point = CGPoint::new(x, y);
     CGDisplay::warp_mouse_cursor_position(point)
         .map_err(|error| anyhow::anyhow!("CGWarpMouseCursorPosition failed: {error:?}"))?;
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+    post_desktop_mouse_moved(&source, point)
+}
+
+fn post_desktop_mouse_moved(source: &CGEventSource, point: CGPoint) -> anyhow::Result<()> {
+    use core_graphics::event::CGEventTapLocation;
+    let moved = CGEvent::new_mouse_event(
+        source.clone(),
+        CGEventType::MouseMoved,
+        point,
+        CGMouseButton::Left,
+    )
+    .map_err(|_| anyhow::anyhow!("desktop mouse-move creation failed"))?;
+    moved.post(CGEventTapLocation::HID);
     Ok(())
+}
+
+trait ForegroundKeyboardPointerBackend {
+    fn current_position(&mut self) -> anyhow::Result<ForegroundKeyboardAnchor>;
+    fn warp(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()>;
+    fn post_mouse_moved(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()>;
+    fn focus_click(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()>;
+    fn wait(&mut self, duration: std::time::Duration);
+}
+
+struct QuartzForegroundKeyboardPointer {
+    source: CGEventSource,
+}
+
+impl QuartzForegroundKeyboardPointer {
+    fn new() -> anyhow::Result<Self> {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+        Ok(Self { source })
+    }
+}
+
+impl ForegroundKeyboardPointerBackend for QuartzForegroundKeyboardPointer {
+    fn current_position(&mut self) -> anyhow::Result<ForegroundKeyboardAnchor> {
+        let point = CGEvent::new(self.source.clone())
+            .map_err(|_| anyhow::anyhow!("CGEvent::new failed"))?
+            .location();
+        Ok(ForegroundKeyboardAnchor {
+            x: point.x,
+            y: point.y,
+        })
+    }
+
+    fn warp(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
+        use core_graphics::display::CGDisplay;
+        CGDisplay::warp_mouse_cursor_position(CGPoint::new(point.x, point.y))
+            .map_err(|error| anyhow::anyhow!("CGWarpMouseCursorPosition failed: {error:?}"))?;
+        unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+        Ok(())
+    }
+
+    fn post_mouse_moved(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
+        post_desktop_mouse_moved(&self.source, CGPoint::new(point.x, point.y))
+    }
+
+    fn focus_click(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
+        use core_graphics::event::CGEventTapLocation;
+        let point = CGPoint::new(point.x, point.y);
+        // Construct both sides before posting either one so a construction
+        // failure can never leave the target with an unmatched mouse-down.
+        let down = CGEvent::new_mouse_event(
+            self.source.clone(),
+            CGEventType::LeftMouseDown,
+            point,
+            CGMouseButton::Left,
+        )
+        .map_err(|_| anyhow::anyhow!("foreground focus-click down creation failed"))?;
+        let up = CGEvent::new_mouse_event(
+            self.source.clone(),
+            CGEventType::LeftMouseUp,
+            point,
+            CGMouseButton::Left,
+        )
+        .map_err(|_| anyhow::anyhow!("foreground focus-click up creation failed"))?;
+        for event in [&down, &up] {
+            event.set_integer_value_field(
+                core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
+                1,
+            );
+        }
+        down.post(CGEventTapLocation::HID);
+        std::thread::sleep(std::time::Duration::from_millis(28));
+        up.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    fn wait(&mut self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+/// Prime the target application's pointer-owned keyboard context while its
+/// exact window is foreground, run one keyboard action, then put the user's
+/// hardware cursor back. Restoration deliberately performs only a cursor warp:
+/// no second `MouseMoved` is posted, so custom canvases retain `anchor` as their
+/// last delivered pointer context.
+pub(crate) fn with_foreground_keyboard_pointer_context(
+    anchor: ForegroundKeyboardAnchor,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut backend = QuartzForegroundKeyboardPointer::new()?;
+    with_foreground_keyboard_pointer_context_using(
+        &mut backend,
+        anchor,
+        false,
+        std::time::Duration::from_millis(40),
+        action,
+    )
+}
+
+/// Blender/GHOST needs a real focus click at the already-validated anchor
+/// before it accepts foreground keyboard input. This variant remains internal
+/// and is selected only by exact Blender foreground keyboard routes.
+pub(crate) fn with_foreground_keyboard_pointer_context_and_focus_click(
+    anchor: ForegroundKeyboardAnchor,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut backend = QuartzForegroundKeyboardPointer::new()?;
+    with_foreground_keyboard_pointer_context_using(
+        &mut backend,
+        anchor,
+        true,
+        // Blender can retain a substantial tail of globally posted synthesized
+        // text events. Keep its derived focus context in place until that queue
+        // drains; restoring earlier lets the tail become 3D-editor shortcuts.
+        std::time::Duration::from_millis(500),
+        action,
+    )
+}
+
+fn with_foreground_keyboard_pointer_context_using<B: ForegroundKeyboardPointerBackend>(
+    backend: &mut B,
+    anchor: ForegroundKeyboardAnchor,
+    focus_click: bool,
+    post_action_drain: std::time::Duration,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let prior = backend.current_position()?;
+    backend.warp(anchor)?;
+
+    if let Err(error) = backend.post_mouse_moved(anchor) {
+        let _ = backend.warp(prior);
+        return Err(error);
+    }
+
+    backend.wait(std::time::Duration::from_millis(40));
+    if focus_click {
+        if let Err(error) = backend.focus_click(anchor) {
+            let _ = backend.warp(prior);
+            return Err(error);
+        }
+        backend.wait(std::time::Duration::from_millis(40));
+    }
+    let action_result = action();
+    backend.wait(post_action_drain);
+    let restore_result = backend.warp(prior);
+
+    match action_result {
+        Err(error) => Err(error),
+        Ok(()) => restore_result,
+    }
 }
 
 /// Scroll the foreground desktop surface at a logical screen point through the
@@ -1240,4 +1463,194 @@ fn parse_modifier_flags(modifiers: &[&str]) -> CGEventFlags {
         }
     }
     flags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn bounds() -> crate::windows::WindowBounds {
+        crate::windows::WindowBounds {
+            x: 100.0,
+            y: 50.0,
+            width: 800.0,
+            height: 600.0,
+        }
+    }
+
+    #[test]
+    fn foreground_keyboard_anchor_prefers_remembered_point_inside_exact_frame() {
+        assert_eq!(
+            foreground_keyboard_anchor(&bounds(), Some((740.0, 610.0))),
+            Some(ForegroundKeyboardAnchor { x: 740.0, y: 610.0 })
+        );
+    }
+
+    #[test]
+    fn foreground_keyboard_anchor_falls_back_to_safe_center() {
+        let expected = Some(ForegroundKeyboardAnchor { x: 500.0, y: 350.0 });
+        assert_eq!(
+            foreground_keyboard_anchor(&bounds(), Some((99.0, 350.0))),
+            expected
+        );
+        assert_eq!(
+            foreground_keyboard_anchor(&bounds(), Some((900.0, 350.0))),
+            expected,
+            "the right edge is outside the half-open live frame"
+        );
+        assert_eq!(
+            foreground_keyboard_anchor(&bounds(), Some((f64::NAN, 350.0))),
+            expected
+        );
+
+        let mut invalid = bounds();
+        invalid.width = 0.0;
+        assert_eq!(foreground_keyboard_anchor(&invalid, None), None);
+    }
+
+    struct RecordingPointerBackend {
+        prior: ForegroundKeyboardAnchor,
+        events: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl ForegroundKeyboardPointerBackend for RecordingPointerBackend {
+        fn current_position(&mut self) -> anyhow::Result<ForegroundKeyboardAnchor> {
+            self.events.borrow_mut().push("capture".into());
+            Ok(self.prior)
+        }
+
+        fn warp(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("warp:{:.0},{:.0}", point.x, point.y));
+            Ok(())
+        }
+
+        fn post_mouse_moved(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("move:{:.0},{:.0}", point.x, point.y));
+            Ok(())
+        }
+
+        fn focus_click(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("click:{:.0},{:.0}", point.x, point.y));
+            Ok(())
+        }
+
+        fn wait(&mut self, duration: std::time::Duration) {
+            self.events
+                .borrow_mut()
+                .push(format!("wait:{}", duration.as_millis()));
+        }
+    }
+
+    #[test]
+    fn foreground_keyboard_context_moves_before_action_and_restores_without_move() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = RecordingPointerBackend {
+            prior: ForegroundKeyboardAnchor { x: 12.0, y: 34.0 },
+            events: events.clone(),
+        };
+        let anchor = ForegroundKeyboardAnchor { x: 500.0, y: 350.0 };
+
+        with_foreground_keyboard_pointer_context_using(
+            &mut backend,
+            anchor,
+            false,
+            std::time::Duration::from_millis(40),
+            || {
+                events.borrow_mut().push("keyboard".into());
+                Ok(())
+            },
+        )
+        .expect("context priming sequence");
+
+        assert_eq!(
+            *events.borrow(),
+            [
+                "capture",
+                "warp:500,350",
+                "move:500,350",
+                "wait:40",
+                "keyboard",
+                "wait:40",
+                "warp:12,34",
+            ]
+        );
+    }
+
+    #[test]
+    fn foreground_focus_click_lands_before_keyboard_action_and_drain_precedes_restore() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = RecordingPointerBackend {
+            prior: ForegroundKeyboardAnchor { x: 12.0, y: 34.0 },
+            events: events.clone(),
+        };
+        let anchor = ForegroundKeyboardAnchor { x: 500.0, y: 350.0 };
+
+        with_foreground_keyboard_pointer_context_using(
+            &mut backend,
+            anchor,
+            true,
+            std::time::Duration::from_millis(500),
+            || {
+                events.borrow_mut().push("keyboard".into());
+                Ok(())
+            },
+        )
+        .expect("focus-click context sequence");
+
+        assert_eq!(
+            *events.borrow(),
+            [
+                "capture",
+                "warp:500,350",
+                "move:500,350",
+                "wait:40",
+                "click:500,350",
+                "wait:40",
+                "keyboard",
+                "wait:500",
+                "warp:12,34",
+            ]
+        );
+    }
+
+    #[test]
+    fn foreground_keyboard_context_restores_cursor_when_action_fails() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = RecordingPointerBackend {
+            prior: ForegroundKeyboardAnchor { x: 12.0, y: 34.0 },
+            events: events.clone(),
+        };
+
+        let error = with_foreground_keyboard_pointer_context_using(
+            &mut backend,
+            ForegroundKeyboardAnchor { x: 500.0, y: 350.0 },
+            false,
+            std::time::Duration::from_millis(40),
+            || Err(anyhow::anyhow!("keyboard failed")),
+        )
+        .expect_err("action failure must propagate");
+
+        assert_eq!(error.to_string(), "keyboard failed");
+        assert_eq!(
+            events.borrow().last().map(String::as_str),
+            Some("warp:12,34")
+        );
+        assert_eq!(
+            events
+                .borrow()
+                .iter()
+                .filter(|event| event.starts_with("move:"))
+                .count(),
+            1,
+            "restoration must not post a second MouseMoved"
+        );
+    }
 }

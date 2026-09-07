@@ -51,14 +51,14 @@ fn pid_window_target_candidates(pid: i64) -> Vec<WindowTargetCandidate> {
     let Ok(pid) = i32::try_from(pid) else {
         return Vec::new();
     };
-    window_target_candidates_for_pid(crate::windows::all_windows(), pid)
+    window_target_candidates_for_pid(crate::windows::all_automation_windows(), pid)
 }
 
 fn window_target_candidates_for_pid(
     windows: impl IntoIterator<Item = crate::windows::WindowInfo>,
     pid: i32,
 ) -> Vec<WindowTargetCandidate> {
-    windows
+    let candidates: Vec<_> = windows
         .into_iter()
         .filter(|window| window.pid == pid)
         .map(|window| WindowTargetCandidate {
@@ -67,7 +67,24 @@ fn window_target_candidates_for_pid(
             app_name: Some(window.app_name),
             is_on_screen: window.is_on_screen,
         })
-        .collect()
+        .collect();
+
+    // CGWindowList includes off-screen AppKit bookkeeping surfaces alongside
+    // the application's real window (menu-bar and restoration helpers are
+    // common examples). They are not actionable PID-only targets and must not
+    // make an otherwise unique visible window look ambiguous. Keep the
+    // off-screen set only as a fallback for apps whose windows are all hidden
+    // or minimized, where an explicit ambiguity remains safer than guessing.
+    let visible: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.is_on_screen)
+        .cloned()
+        .collect();
+    if visible.is_empty() {
+        candidates
+    } else {
+        visible
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +117,41 @@ mod pid_window_target_tests {
     fn same_pid_sibling_windows_are_ambiguous() {
         let candidates =
             window_target_candidates_for_pid([window(7, 42), window(8, 42), window(9, 99)], 42);
+        assert!(matches!(
+            resolve_pid_window_target(candidates),
+            PidWindowTargetResolution::Ambiguous(windows)
+                if windows.iter().map(|window| window.window_id).collect::<Vec<_>>() == [7, 8]
+        ));
+    }
+
+    #[test]
+    fn visible_window_wins_over_offscreen_appkit_helpers() {
+        let mut offscreen = window(7, 42);
+        offscreen.title.clear();
+        offscreen.is_on_screen = false;
+        offscreen.bounds = crate::windows::WindowBounds {
+            x: -192.0,
+            y: -1080.0,
+            width: 1920.0,
+            height: 30.0,
+        };
+        let visible = window(8, 42);
+
+        let candidates = window_target_candidates_for_pid([offscreen, visible], 42);
+        assert!(matches!(
+            resolve_pid_window_target(candidates),
+            PidWindowTargetResolution::Resolved(window) if window.window_id == 8
+        ));
+    }
+
+    #[test]
+    fn all_offscreen_windows_remain_ambiguous_instead_of_guessing() {
+        let mut first = window(7, 42);
+        first.is_on_screen = false;
+        let mut second = window(8, 42);
+        second.is_on_screen = false;
+
+        let candidates = window_target_candidates_for_pid([first, second], 42);
         assert!(matches!(
             resolve_pid_window_target(candidates),
             PidWindowTargetResolution::Ambiguous(windows)
@@ -774,6 +826,21 @@ impl ToolState {
             host_bundle_id,
         }
     }
+}
+
+/// Read the logical pointer remembered for the caller's own session without
+/// creating cursor state. Foreground keyboard tools validate this point again
+/// against the exact window's live frame immediately after activation.
+pub(crate) fn remembered_agent_cursor_position(
+    state: &ToolState,
+    args: &serde_json::Value,
+) -> Option<(f64, f64)> {
+    let cursor_key = cursor_tools::resolve_cursor_key(args);
+    state
+        .cursor_registry
+        .get(&cursor_key)
+        .and_then(|cursor| cursor.position)
+        .map(|position| (position.x, position.y))
 }
 
 pub(crate) fn cursor_overlay_unavailable() -> cua_driver_core::protocol::ToolResult {

@@ -858,6 +858,120 @@ pub fn with_foreground_hid_activation(
     result
 }
 
+const BLENDER_BUNDLE_ID: &str = "org.blenderfoundation.blender";
+
+pub(crate) fn foreground_keyboard_focus_click_for_bundle_id(bundle_id: Option<&str>) -> bool {
+    bundle_id == Some(BLENDER_BUNDLE_ID)
+}
+
+pub(crate) fn foreground_keyboard_focus_click_policy(
+    bundle_id: Option<&str>,
+    explicit_focus_already_established: bool,
+) -> bool {
+    !explicit_focus_already_established && foreground_keyboard_focus_click_for_bundle_id(bundle_id)
+}
+
+fn foreground_keyboard_focus_click_for_pid(
+    pid: i32,
+    explicit_focus_already_established: bool,
+) -> bool {
+    foreground_keyboard_focus_click_policy(
+        crate::apps::bundle_id_for_pid(pid).as_deref(),
+        explicit_focus_already_established,
+    )
+}
+
+/// Select the exact-window foreground keyboard activation policy from the
+/// target application's identity. Blender/GHOST needs one real click at the
+/// validated internal anchor before shortcuts or text are accepted; ordinary
+/// applications (including Screen Sharing) retain move-only context priming.
+/// An explicit pixel or AX focus action also suppresses the derived click so it
+/// cannot overwrite a more specific caller-selected keyboard destination.
+pub fn with_foreground_keyboard_target_activation(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    remembered_cursor: Option<(f64, f64)>,
+    explicit_focus_already_established: bool,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_foreground_keyboard_context_activation_inner(
+        target_pid,
+        target_wid,
+        remembered_cursor,
+        foreground_keyboard_focus_click_for_pid(target_pid, explicit_focus_already_established),
+        action,
+    )
+}
+
+/// Activate one exact window, establish the pointer-owned keyboard context
+/// used by custom canvases, and then run a foreground keyboard action.
+///
+/// The remembered agent-cursor position is accepted only while it remains
+/// inside the exact window's current WindowServer frame. Otherwise the live
+/// frame's center is used. Pointer restoration happens inside the activation
+/// guard and deliberately emits no restoring `MouseMoved`, so applications
+/// such as Blender/GHOST retain the target context while the user's hardware
+/// cursor returns to its original position.
+pub fn with_foreground_keyboard_context_activation(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    remembered_cursor: Option<(f64, f64)>,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_foreground_keyboard_context_activation_inner(
+        target_pid,
+        target_wid,
+        remembered_cursor,
+        false,
+        action,
+    )
+}
+
+/// Exact-window keyboard activation with one internal focus click at the
+/// derived anchor. Used only by Blender foreground keyboard actions, whose
+/// editor context is not established by activation and pointer motion alone.
+pub fn with_foreground_keyboard_focus_activation(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    remembered_cursor: Option<(f64, f64)>,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_foreground_keyboard_context_activation_inner(
+        target_pid,
+        target_wid,
+        remembered_cursor,
+        true,
+        action,
+    )
+}
+
+fn with_foreground_keyboard_context_activation_inner(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    remembered_cursor: Option<(f64, f64)>,
+    focus_click: bool,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_foreground_hid_activation(target_pid, target_wid, || {
+        let bounds = crate::windows::window_bounds_by_id(target_wid).ok_or_else(|| {
+            anyhow::anyhow!("target window {target_wid} closed before foreground keyboard delivery")
+        })?;
+        let anchor = crate::input::mouse::foreground_keyboard_anchor(&bounds, remembered_cursor)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "target window {target_wid} has no valid frame for foreground keyboard delivery"
+                )
+            })?;
+        if focus_click {
+            crate::input::mouse::with_foreground_keyboard_pointer_context_and_focus_click(
+                anchor, action,
+            )
+        } else {
+            crate::input::mouse::with_foreground_keyboard_pointer_context(anchor, action)
+        }
+    })
+}
+
 fn preserves_exact_existing_focus(
     previous_process_known: bool,
     previous_psn: [u8; 8],
@@ -923,7 +1037,44 @@ pub fn with_menu_shortcut_activation(
 
 #[cfg(test)]
 mod tests {
-    use super::{make_key_window_record, preserves_exact_existing_focus};
+    use super::{
+        foreground_keyboard_focus_click_for_bundle_id, foreground_keyboard_focus_click_policy,
+        make_key_window_record, preserves_exact_existing_focus,
+    };
+
+    #[test]
+    fn foreground_keyboard_focus_click_is_blender_unaddressed_only() {
+        assert!(foreground_keyboard_focus_click_for_bundle_id(Some(
+            "org.blenderfoundation.blender"
+        )));
+        assert!(!foreground_keyboard_focus_click_for_bundle_id(Some(
+            "org.blenderfoundation.Blender"
+        )));
+        assert!(!foreground_keyboard_focus_click_for_bundle_id(Some(
+            "com.apple.ScreenSharing"
+        )));
+        assert!(!foreground_keyboard_focus_click_for_bundle_id(Some(
+            "com.apple.TextEdit"
+        )));
+        assert!(!foreground_keyboard_focus_click_for_bundle_id(None));
+
+        assert!(foreground_keyboard_focus_click_policy(
+            Some("org.blenderfoundation.blender"),
+            false,
+        ));
+        assert!(!foreground_keyboard_focus_click_policy(
+            Some("org.blenderfoundation.blender"),
+            true,
+        ));
+        assert!(!foreground_keyboard_focus_click_policy(
+            Some("com.apple.ScreenSharing"),
+            false,
+        ));
+        assert!(!foreground_keyboard_focus_click_policy(
+            Some("com.apple.TextEdit"),
+            false,
+        ));
+    }
 
     #[test]
     fn make_key_records_address_only_the_exact_window() {

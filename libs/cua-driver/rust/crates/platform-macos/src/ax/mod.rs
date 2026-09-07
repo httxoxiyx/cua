@@ -21,6 +21,7 @@ pub mod cache;
 pub mod enablement;
 pub mod exact_target;
 pub mod tree;
+pub(crate) mod window_classification;
 pub mod window_scope;
 
 pub use cache::ElementCache;

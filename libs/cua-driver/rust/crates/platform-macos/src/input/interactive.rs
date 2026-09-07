@@ -248,7 +248,7 @@ fn validate_config(config: &InteractiveInputConfig) -> Result<()> {
 }
 
 fn target_window_bounds(config: &InteractiveInputConfig) -> Result<crate::windows::WindowBounds> {
-    crate::windows::all_windows()
+    crate::windows::all_automation_windows()
         .into_iter()
         .find(|window| window.window_id == config.window_id && window.pid == config.pid)
         .map(|window| window.bounds)

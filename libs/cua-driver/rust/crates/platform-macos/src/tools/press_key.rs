@@ -48,6 +48,26 @@ enum PressKeyDeliveryOutcome {
     Failed(anyhow::Error),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PressKeyFocusSuppressionPolicy {
+    suppress_window_changes: bool,
+    target_pid: Option<i32>,
+}
+
+fn focus_suppression_policy(foreground: bool, pid: i32) -> PressKeyFocusSuppressionPolicy {
+    if foreground {
+        PressKeyFocusSuppressionPolicy {
+            suppress_window_changes: false,
+            target_pid: None,
+        }
+    } else {
+        PressKeyFocusSuppressionPolicy {
+            suppress_window_changes: true,
+            target_pid: Some(pid),
+        }
+    }
+}
+
 fn map_delivery_outcome(result: anyhow::Result<bool>) -> PressKeyDeliveryOutcome {
     match result {
         Ok(true) => PressKeyDeliveryOutcome::Confirmed,
@@ -247,7 +267,7 @@ impl Tool for PressKeyTool {
             let key_for_input = key.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                crate::input::keyboard::press_key_global(&key_for_input, &modifier_refs)
+                crate::input::keyboard::press_key_bare_global(&key_for_input, &modifier_refs)
             })
             .await;
             return match result {
@@ -313,7 +333,11 @@ impl Tool for PressKeyTool {
         // explicit NSMenu-activation rung. Matches click/type_text/hotkey.
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
         let fg = delivery_mode.is_foreground();
-
+        let remembered_cursor = if fg {
+            super::remembered_agent_cursor_position(&self.state, &args)
+        } else {
+            None
+        };
         // Argument-shape errors are reported before any gating or retained
         // lookups: a malformed call must fail the same way regardless of
         // background-target state.
@@ -375,47 +399,53 @@ impl Tool for PressKeyTool {
         // px form: pixel-click to focus, then the key goes to the focused element.
         // Reuses click's translation + delivery_mode; after it, deliver via the
         // plain background path (the focus-click already handled fronting if fg).
-        let px_focus = {
-            if let (Some(cx), Some(cy)) = (px, py) {
-                let from_zoom = args
-                    .get("from_zoom")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if let Err(e) = super::focus_by_pixel(
-                    &self.state,
-                    pid,
-                    window_id,
-                    cx,
-                    cy,
-                    fg,
-                    args.opt_str("session"),
-                    args.opt_str("_session_id"),
-                    from_zoom,
-                    _mutation_lease.as_ref(),
-                )
-                .await
-                {
-                    return e;
-                }
-                true
-            } else {
-                false
+        let coordinate_focus = if let (Some(cx), Some(cy)) = (px, py) {
+            let from_zoom = args
+                .get("from_zoom")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if let Err(e) = super::focus_by_pixel(
+                &self.state,
+                pid,
+                window_id,
+                cx,
+                cy,
+                fg,
+                args.opt_str("session"),
+                args.opt_str("_session_id"),
+                from_zoom,
+                _mutation_lease.as_ref(),
+            )
+            .await
+            {
+                return e;
             }
+            true
+        } else {
+            false
         };
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
-        // Single-key presses can fire autocomplete (Return on a search
-        // box opens a results popover) or trigger menu shortcuts that
-        // open windows. Wrapping mirrors the hotkey path.
+        // Single-key presses can fire autocomplete (Return on a search box
+        // opens a results popover) or trigger menu shortcuts that open windows.
+        // Background delivery keeps the wildcard suppressor. Foreground
+        // delivery owns an exact-window activation guard below, so suppressing
+        // the target here would race and undo that activation before the HID
+        // transition reaches custom canvases such as Blender/GHOST.
         //
         // The AX focus_element() pre-write also runs inside the closure
-        // so any reflex activations it triggers are caught by both the
-        // wildcard snapshot suppressor and the targeted FocusGuard lease.
+        // so any reflex activations it triggers are caught by both background
+        // suppression layers.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let suppression_policy = focus_suppression_policy(fg, pid);
+        let snapshot = if suppression_policy.suppress_window_changes {
+            WindowChangeDetector::snapshot(prior_front)
+        } else {
+            WindowChangeDetector::snapshot_without_suppression(prior_front)
+        };
 
         let result = focus_guard::with_focus_suppressed(
-            Some(pid),
+            suppression_policy.target_pid,
             prior_front,
             "press_key.CGEvent",
             || async move {
@@ -435,29 +465,33 @@ impl Tool for PressKeyTool {
                     // physical HID key down/up pair, then restore. PID-routed events without the
                     // authentication envelope reach NSMenu, but Chromium/Electron may
                     // silently discard them even while frontmost; the guarded HID route
-                    // is accepted by both. Skipped when px-focus already handled the
-                    // target-specific foreground transition.
-                    if fg && !px_focus {
+                    // is accepted by both. Pixel focus may itself have briefly
+                    // activated the window, but that helper restores before
+                    // returning; always establish a fresh exact foreground HID
+                    // guard for the key transition itself.
+                    if fg {
                         let wid = window_id.ok_or_else(|| {
                             anyhow::anyhow!(
                                 "delivery_mode=foreground requires window_id for press_key"
                             )
                         })?;
                         return dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                            crate::input::skylight::with_foreground_hid_activation(
+                            let key_action = || {
+                                // Activation can change the first responder, so
+                                // repeat the best-effort AX focus write inside
+                                // the guarded foreground interval immediately
+                                // before the physical key transition.
+                                if let Some(element_ptr) = pre_focus_ptr {
+                                    let _ = crate::input::ax_actions::focus_element(element_ptr);
+                                }
+                                crate::input::keyboard::press_key_global(&key, &m)
+                            };
+                            crate::input::skylight::with_foreground_keyboard_target_activation(
                                 pid as libc::pid_t,
                                 wid,
-                                || {
-                                    // Activation can change the first responder, so
-                                    // repeat the best-effort AX focus write inside
-                                    // the guarded foreground interval immediately
-                                    // before the physical key transition.
-                                    if let Some(element_ptr) = pre_focus_ptr {
-                                        let _ =
-                                            crate::input::ax_actions::focus_element(element_ptr);
-                                    }
-                                    crate::input::keyboard::press_key_bare_global(&key, &m)
-                                },
+                                remembered_cursor,
+                                coordinate_focus || pre_focus_ptr.is_some(),
+                                key_action,
                             )
                         });
                     }
@@ -522,6 +556,24 @@ mod tests {
         ));
         let failed = map_delivery_outcome(Err(anyhow::anyhow!("post rejected")));
         assert!(matches!(failed, PressKeyDeliveryOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn foreground_exact_window_guard_is_not_raced_by_focus_suppression() {
+        assert_eq!(
+            focus_suppression_policy(true, 52_211),
+            PressKeyFocusSuppressionPolicy {
+                suppress_window_changes: false,
+                target_pid: None,
+            }
+        );
+        assert_eq!(
+            focus_suppression_policy(false, 52_211),
+            PressKeyFocusSuppressionPolicy {
+                suppress_window_changes: true,
+                target_pid: Some(52_211),
+            }
+        );
     }
 
     #[test]
