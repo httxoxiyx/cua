@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_action_names, copy_children, copy_string_attr, element_at_screen_position,
+    copy_action_names, copy_bool_attr, copy_children, copy_string_attr, element_at_screen_position,
     element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction, AXUIElementRef,
 };
 use crate::focus_guard;
@@ -103,8 +103,20 @@ fn pixel_activation_policy(
 /// macOS can return kAXErrorSuccess for AXPress on containers such as
 /// AXWebArea even though no page pointer event is produced; treating that as
 /// delivery would turn a coordinate click into a silent no-op.
-fn background_pixel_ax_press_eligible(advertised_actions: &[String]) -> bool {
-    advertised_actions.iter().any(|action| action == "AXPress")
+fn background_pixel_ax_press_eligible(
+    press_action: bool,
+    role: &str,
+    advertised_actions: &[String],
+    enabled: Option<bool>,
+) -> bool {
+    let is_concrete_press_control = matches!(
+        role,
+        "AXButton" | "AXCheckBox" | "AXRadioButton" | "AXLink" | "AXDisclosureTriangle"
+    );
+    press_action
+        && enabled == Some(true)
+        && is_concrete_press_control
+        && advertised_actions.iter().any(|action| action == "AXPress")
 }
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
@@ -883,6 +895,7 @@ impl Tool for ClickTool {
                 && modifiers.is_empty()
             {
                 let focus_only = action == "focus";
+                let press_only = action == "press";
                 let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
                 let ax_result = tokio::task::spawn_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
@@ -897,10 +910,17 @@ impl Tool for ClickTool {
                         CFRelease(element as _);
                         return Ok(false);
                     }
+                    let role = copy_string_attr(element, "AXRole").unwrap_or_default();
+                    let enabled = copy_bool_attr(element, "AXEnabled");
                     let advertised_actions = copy_action_names(element);
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
-                    } else if !background_pixel_ax_press_eligible(&advertised_actions) {
+                    } else if !background_pixel_ax_press_eligible(
+                        press_only,
+                        &role,
+                        &advertised_actions,
+                        enabled,
+                    ) {
                         false
                     } else {
                         let press = core_foundation::string::CFString::new("AXPress");
@@ -1565,14 +1585,65 @@ mod tests {
     }
     #[test]
     fn background_pixel_ax_bridge_requires_advertised_press() {
-        assert!(background_pixel_ax_press_eligible(&[
-            "AXPress".to_owned(),
-            "AXShowMenu".to_owned(),
-        ]));
-        assert!(!background_pixel_ax_press_eligible(&[]));
-        assert!(!background_pixel_ax_press_eligible(&[
-            "AXShowMenu".to_owned(),
-            "AXScrollToVisible".to_owned(),
-        ]));
+        assert!(background_pixel_ax_press_eligible(
+            true,
+            "AXButton",
+            &["AXPress".to_owned(), "AXShowMenu".to_owned()],
+            Some(true),
+        ));
+        assert!(background_pixel_ax_press_eligible(
+            true,
+            "AXLink",
+            &["AXPress".to_owned()],
+            Some(true),
+        ));
+        assert!(!background_pixel_ax_press_eligible(
+            true,
+            "AXLink",
+            &["AXPress".to_owned()],
+            None,
+        ));
+        assert!(!background_pixel_ax_press_eligible(
+            false,
+            "AXButton",
+            &["AXPress".to_owned()],
+            Some(true),
+        ));
+        assert!(!background_pixel_ax_press_eligible(
+            true,
+            "AXButton",
+            &[],
+            Some(true),
+        ));
+        assert!(!background_pixel_ax_press_eligible(
+            true,
+            "AXButton",
+            &["AXShowMenu".to_owned(), "AXScrollToVisible".to_owned()],
+            Some(true),
+        ));
+        assert!(!background_pixel_ax_press_eligible(
+            true,
+            "AXButton",
+            &["AXPress".to_owned()],
+            Some(false),
+        ));
+        assert!(!background_pixel_ax_press_eligible(
+            true,
+            "AXWebArea",
+            &["AXPress".to_owned()],
+            Some(true),
+        ));
+        assert!(!background_pixel_ax_press_eligible(
+            true,
+            "AXGroup",
+            &["AXPress".to_owned()],
+            Some(true),
+        ));
+        assert!(!background_pixel_ax_press_eligible(
+            true,
+            "AXPopUpButton",
+            &["AXPress".to_owned()],
+            Some(true),
+        ));
     }
 }
