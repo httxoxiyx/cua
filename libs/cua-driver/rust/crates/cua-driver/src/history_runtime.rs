@@ -29,6 +29,8 @@ pub struct DaemonLaunchState {
     pub approve_capability_manifest: bool,
     pub no_permissions_gate: bool,
     pub claude_code_compat: bool,
+    #[serde(default)]
+    pub async_click_feedback: bool,
     pub grants: Vec<String>,
 }
 
@@ -48,6 +50,7 @@ pub fn configure_daemon_launch_state(
     approve_capability_manifest: bool,
     no_permissions_gate: bool,
     claude_code_compat: bool,
+    async_click_feedback: bool,
     grants: &[String],
 ) {
     let state = DAEMON_LAUNCH_STATE.get_or_init(|| Mutex::new(DaemonLaunchState::default()));
@@ -58,6 +61,7 @@ pub fn configure_daemon_launch_state(
         approve_capability_manifest,
         no_permissions_gate,
         claude_code_compat,
+        async_click_feedback,
         grants: grants.to_vec(),
     };
 }
@@ -508,6 +512,21 @@ mod tests {
             "{}/computer-history",
             crate::bundle::state_namespace()
         )));
+    }
+
+    #[test]
+    fn older_daemon_launch_state_defaults_async_feedback_off() {
+        let state: DaemonLaunchState = serde_json::from_value(serde_json::json!({
+            "permission_mode": null,
+            "dangerously_bypass_approvals": false,
+            "capability_manifest": null,
+            "approve_capability_manifest": false,
+            "no_permissions_gate": false,
+            "claude_code_compat": false,
+            "grants": []
+        }))
+        .expect("pre-async launch state remains readable");
+        assert!(!state.async_click_feedback);
     }
 
     #[test]

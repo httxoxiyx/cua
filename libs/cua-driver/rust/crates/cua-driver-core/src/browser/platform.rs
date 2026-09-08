@@ -208,7 +208,8 @@ pub enum BrowserConsentOutcome {
 ///
 /// This is deliberately separate from input delivery: platform adapters may
 /// animate an agent cursor, but must never synthesize input, activate a
-/// browser, or change whether the browser action succeeds.
+/// browser, or change whether the browser action succeeds. A click pulse marks
+/// the attempted target; it is not evidence that the later mutation succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserVisualActionKind {
     Click,

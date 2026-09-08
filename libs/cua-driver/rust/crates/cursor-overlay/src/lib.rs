@@ -67,6 +67,10 @@ pub struct CursorConfig {
     /// Whether the overlay is visible at startup.
     /// Pass `--no-overlay` to disable.
     pub enabled: bool,
+
+    /// Whether click-family tools enqueue cursor animation as best-effort
+    /// feedback instead of waiting for the glide before delivering input.
+    pub async_click_feedback: bool,
 }
 
 impl Default for CursorConfig {
@@ -77,6 +81,7 @@ impl Default for CursorConfig {
             reduced_motion: ReducedMotion::Auto,
             motion: MotionConfig::default(),
             enabled: true,
+            async_click_feedback: false,
         }
     }
 }
@@ -89,6 +94,7 @@ impl CursorConfig {
     /// --cursor-theme <installed-theme-id>
     /// --cursor-reduced-motion <auto|on|off>
     /// --no-overlay                (start with overlay disabled)
+    /// --async-click-feedback      (do not block input on cursor animation)
     /// --glide-ms     <f64>        (glideDurationMs override)
     /// --dwell-ms     <f64>        (dwellAfterClickMs override)
     /// --idle-hide-ms <f64>        (idleHideMs override)
@@ -126,6 +132,7 @@ impl CursorConfig {
                     }
                 }
                 "--no-overlay" => cfg.enabled = false,
+                "--async-click-feedback" => cfg.async_click_feedback = true,
                 "--glide-ms" => {
                     if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
                         cfg.motion.glide_duration_ms = v;
@@ -337,6 +344,14 @@ pub enum OverlayCommand {
         y: f64,
         end_heading_radians: f64,
     },
+    /// Animate to a click target and start the decorative click pulse only
+    /// after the glide arrives. Pointer delivery does not wait for this
+    /// animation; a newer move supersedes the pending pulse.
+    MoveToThenClickPulse {
+        x: f64,
+        y: f64,
+        end_heading_radians: f64,
+    },
     /// Snap the cursor immediately to a screen position, optionally updating heading.
     SnapTo {
         x: f64,
@@ -424,5 +439,12 @@ mod pointer_tracking_tests {
                 .and_then(|cursor| cursor.x.zip(cursor.y)),
             Some((56.0, 78.0))
         );
+    }
+
+    #[test]
+    fn async_click_feedback_is_opt_in() {
+        assert!(!CursorConfig::default().async_click_feedback);
+        let args = vec!["--async-click-feedback".to_owned()];
+        assert!(CursorConfig::parse(&args).async_click_feedback);
     }
 }

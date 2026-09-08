@@ -384,6 +384,7 @@ fn apply_keyed_command(
     // spring animation begins on-screen. This mirrors the X11 renderer.
     let seed_target = match &cmd {
         OverlayCommand::MoveTo { x, y, .. }
+        | OverlayCommand::MoveToThenClickPulse { x, y, .. }
         | OverlayCommand::SnapTo { x, y, .. }
         | OverlayCommand::ClickPulse { x, y } => Some((*x, *y)),
         _ => None,

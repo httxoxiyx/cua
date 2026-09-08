@@ -612,8 +612,12 @@ pub fn parse_command() -> Command {
             "  action snaps the cursor with a brief pulse on its first action instead of a long"
         );
         println!("  glide, so it can be easy to miss — do a pixel click or move_cursor first");
-        println!("  for a visibly gliding demo. These flags tune the overlay on `serve`/`mcp`:");
+        println!("  for a visibly gliding demo. Set these on `serve`; an MCP proxy forwards");
+        println!("  --async-click-feedback when it auto-launches a fresh daemon:");
         println!("  --no-overlay            Disable the cursor overlay entirely for this daemon.");
+        println!(
+            "  --async-click-feedback  On macOS, deliver clicks without waiting for cursor glides."
+        );
         println!("  --cursor-theme <id>     Select an installed theme (default: cua.default).");
         println!("  --cursor-reduced-motion <auto|on|off>");
         println!("                          Follow the OS setting, force stills, or allow motion.");
@@ -1217,9 +1221,11 @@ pub fn launch_daemon_and_wait(
     grants: &[String],
     experimental_history: bool,
     experimental_pip: bool,
+    async_click_feedback: bool,
 ) -> Result<(), LaunchDaemonError> {
     let state = crate::history_runtime::DaemonLaunchState {
         claude_code_compat,
+        async_click_feedback,
         grants: grants.to_vec(),
         ..Default::default()
     };
@@ -1334,9 +1340,11 @@ pub fn launch_daemon_and_wait(
     grants: &[String],
     experimental_history: bool,
     experimental_pip: bool,
+    async_click_feedback: bool,
 ) -> Result<(), LaunchDaemonError> {
     let state = crate::history_runtime::DaemonLaunchState {
         claude_code_compat,
+        async_click_feedback,
         grants: grants.to_vec(),
         ..Default::default()
     };
@@ -1607,6 +1615,9 @@ fn append_daemon_launch_state(
     if state.claude_code_compat {
         args.push("--claude-code-computer-use-compat".to_owned());
     }
+    if state.async_click_feedback {
+        args.push("--async-click-feedback".to_owned());
+    }
     if experimental_history {
         args.push("--experimental-history".to_owned());
     }
@@ -1651,6 +1662,7 @@ pub fn run_mcp_via_daemon_proxy<F>(
     claude_code_compat: bool,
     grants: &[String],
     experimental_pip: bool,
+    async_click_feedback: bool,
     on_startup: F,
 ) -> anyhow::Result<()>
 where
@@ -1669,6 +1681,14 @@ where
         }
         anyhow::bail!(
             "--grant configures a newly launched runtime and cannot modify the daemon already listening on {socket_path}; restart it with the same --grant option"
+        );
+    }
+    if already_running && async_click_feedback {
+        if let Some(on_startup) = on_startup.take() {
+            on_startup(McpDaemonStartup::AlreadyRunning, false);
+        }
+        anyhow::bail!(
+            "--async-click-feedback configures a newly launched runtime and cannot modify the daemon already listening on {socket_path}; restart it with `cua-driver serve --async-click-feedback`"
         );
     }
     let mut daemon = McpDaemonStartup::AlreadyRunning;
@@ -1698,9 +1718,14 @@ where
             } else {
                 ""
             };
+            let async_cursor_suffix = if async_click_feedback {
+                " --async-click-feedback"
+            } else {
+                ""
+            };
             eprintln!(
                 "{}: mcp launched without {app_name}.app's TCC grants; \
-                 auto-launching the daemon via `open -n -g -a {app_name} --args serve{socket_suffix}{pip_suffix}` \
+                 auto-launching the daemon via `open -n -g -a {app_name} --args serve{socket_suffix}{pip_suffix}{async_cursor_suffix}` \
                  and proxying MCP requests through it.",
                 crate::bundle::cli_name()
             );
@@ -1711,6 +1736,7 @@ where
                 grants,
                 crate::history_runtime::preview_admitted_preference(),
                 experimental_pip,
+                async_click_feedback,
             ) {
                 if let Some(on_startup) = on_startup.take() {
                     on_startup(
@@ -1747,6 +1773,7 @@ where
                 grants,
                 true,
                 experimental_pip,
+                async_click_feedback,
             ) {
                 if let Some(on_startup) = on_startup.take() {
                     on_startup(
@@ -1858,6 +1885,7 @@ pub fn build_manifest() -> serde_json::Value {
                   { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Select the Claude Code computer-use compat tool surface." },
                   { "name": "--embedded", "type": "flag", "description": "Declare embedding-host mode. Without --direct, requires the host's private service through --socket instead of auto-launching the standalone app." },
                   { "name": "--host-bundle-id", "type": "string", "description": "Advisory host bundle id label echoed in check_permissions output." },
+                  { "name": "--async-click-feedback", "type": "flag", "description": "Forward non-blocking macOS click decoration to a freshly auto-launched daemon." },
                   { "name": "--grant", "type": "repeatable-string", "description": "Pre-authorize a residual standard-mode boundary for a newly launched runtime. Supported value: existing-profile." }
               ] },
             { "name": "serve",
@@ -1873,6 +1901,7 @@ pub fn build_manifest() -> serde_json::Value {
                   { "name": "--approve-session-policy", "type": "flag", "description": "Deprecated alias for --approve-capability-manifest." },
                   { "name": "--no-permissions-gate", "type": "flag", "description": "Skip the macOS TCC first-launch gate." },
                   { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Forwarded by the MCP proxy when the client asked for the compat surface." },
+                  { "name": "--async-click-feedback", "type": "flag", "description": "On macOS, deliver click-family actions without waiting for decorative cursor glides." },
                   { "name": "--embedded", "type": "flag", "description": "Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1." },
                   { "name": "--host-bundle-id", "type": "string", "description": "Advisory host bundle id label echoed in check_permissions output." }
                   ,{ "name": "--experimental-history", "type": "flag", "description": "Admit the encrypted local Computer History early preview for this daemon launch." }
@@ -3614,6 +3643,7 @@ fn run_permissions_grant() {
                 &[],
                 crate::history_runtime::preview_admitted_preference(),
                 false,
+                false,
             ) {
                 eprintln!("\nDidn't detect the {app_name} daemon: {e}");
                 eprintln!(
@@ -3891,7 +3921,8 @@ fn cli_docs_json() -> serde_json::Value {
                 "flags": [
                     {"name":"direct","short_name":null,"help":"Own the runtime in this MCP process; mutually exclusive with --socket.","default_value":false},
                     {"name":"claude-code-computer-use-compat","short_name":null,"help":"Accepted for older Claude Code setup snippets; no standalone screenshot tool — use get_window_state for window screenshots.","default_value":false},
-                    {"name":"embedded","short_name":null,"help":"Declare embedding-host mode. Without --direct, require the host's private service through --socket instead of auto-launching the standalone app.","default_value":false}
+                    {"name":"embedded","short_name":null,"help":"Declare embedding-host mode. Without --direct, require the host's private service through --socket instead of auto-launching the standalone app.","default_value":false},
+                    {"name":"async-click-feedback","short_name":null,"help":"Forward asynchronous click feedback to a freshly auto-launched macOS daemon.","default_value":false}
                 ],
                 "subcommands": no_subcommands
             },
@@ -3948,7 +3979,8 @@ fn cli_docs_json() -> serde_json::Value {
                     {"name":"approve-session-policy","short_name":null,"help":"Deprecated alias for approve-capability-manifest.","default_value":false},
                     {"name":"no-permissions-gate","short_name":null,"help":"Skip the macOS first-launch permissions gate.","default_value":false},
                     {"name":"embedded","short_name":null,"help":"Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1.","default_value":false},
-                    {"name":"no-overlay","short_name":null,"help":"Disable the agent cursor overlay for this daemon.","default_value":false}
+                    {"name":"no-overlay","short_name":null,"help":"Disable the agent cursor overlay for this daemon.","default_value":false},
+                    {"name":"async-click-feedback","short_name":null,"help":"On macOS, deliver clicks immediately while cursor feedback continues asynchronously.","default_value":false}
                 ],
                 "subcommands": no_subcommands
             },
@@ -4785,6 +4817,7 @@ mod tests {
             approve_capability_manifest: true,
             no_permissions_gate: true,
             claude_code_compat: true,
+            async_click_feedback: true,
             grants,
         };
         #[cfg(target_os = "macos")]
@@ -4801,6 +4834,7 @@ mod tests {
         assert!(launch.contains(&"--approve-capability-manifest".to_owned()));
         assert!(launch.contains(&"--no-permissions-gate".to_owned()));
         assert!(launch.contains(&"--claude-code-computer-use-compat".to_owned()));
+        assert!(launch.contains(&"--async-click-feedback".to_owned()));
         assert!(launch.contains(&"--experimental-history".to_owned()));
         assert!(launch
             .windows(2)
@@ -5254,6 +5288,23 @@ mod tests {
                 obj.get("args").and_then(|v| v.as_array()).is_some(),
                 "subcommand missing args[]: {entry}"
             );
+        }
+    }
+
+    #[test]
+    fn manifest_advertises_async_click_feedback_on_mcp_and_serve() {
+        let manifest = build_manifest();
+        let subcommands = manifest["subcommands"].as_array().expect("subcommands");
+        for command_name in ["mcp", "serve"] {
+            let command = subcommands
+                .iter()
+                .find(|command| command["name"] == command_name)
+                .unwrap_or_else(|| panic!("missing {command_name} command"));
+            assert!(command["args"]
+                .as_array()
+                .expect("args")
+                .iter()
+                .any(|argument| argument["name"] == "--async-click-feedback"));
         }
     }
 

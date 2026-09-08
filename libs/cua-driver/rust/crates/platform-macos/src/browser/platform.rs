@@ -807,7 +807,27 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             action.session.clone(),
             cursor_overlay::OverlayCommand::PinAbove(action.window_id),
         );
-        crate::cursor::overlay::animate_cursor_to(action.session.clone(), screen_x, screen_y).await;
+        let click_family = matches!(
+            action.kind,
+            BrowserVisualActionKind::Click
+                | BrowserVisualActionKind::RightClick
+                | BrowserVisualActionKind::DoubleClick
+        );
+        let async_click_feedback = if click_family {
+            crate::cursor::overlay::animate_click_feedback(
+                action.session.clone(),
+                screen_x,
+                screen_y,
+            )
+            .await
+        } else {
+            // Explicit hover/type/scroll/drag visualization keeps its existing
+            // completion semantics. The opt-in only removes click-family
+            // decoration from the input critical path.
+            crate::cursor::overlay::animate_cursor_to(action.session.clone(), screen_x, screen_y)
+                .await;
+            false
+        };
         self.cursor_registry
             .update_position(&action.session, screen_x, screen_y);
 
@@ -818,7 +838,8 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 | BrowserVisualActionKind::RightClick
                 | BrowserVisualActionKind::DoubleClick
                 | BrowserVisualActionKind::Drag
-        ) {
+        ) && !async_click_feedback
+        {
             crate::cursor::overlay::send_command(
                 action.session,
                 cursor_overlay::OverlayCommand::ClickPulse {

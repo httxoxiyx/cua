@@ -273,6 +273,8 @@ impl ToolOutput for SetAgentCursorThemeOutput {}
 pub struct GetAgentCursorStateOutput {
     pub session: String,
     pub enabled: bool,
+    /// Last logical action target. With asynchronous click feedback, the
+    /// decorative cursor may still be gliding toward this point.
     #[schemars(required)]
     pub position: Option<CursorPointOutput>,
     pub theme: CursorThemeOutput,

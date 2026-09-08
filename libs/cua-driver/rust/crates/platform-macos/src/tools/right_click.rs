@@ -237,15 +237,18 @@ impl Tool for RightClickTool {
                 cursor_overlay::OverlayCommand::PinAbove(wid as u64),
             );
         }
-        // Animate cursor to the click point; wait for arrival before firing.
-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
-        crate::cursor::overlay::send_command(
-            cursor_key.clone(),
-            cursor_overlay::OverlayCommand::ClickPulse {
-                x: screen_x,
-                y: screen_y,
-            },
-        );
+        let async_click_feedback =
+            crate::cursor::overlay::animate_click_feedback(cursor_key.clone(), screen_x, screen_y)
+                .await;
+        if !async_click_feedback {
+            crate::cursor::overlay::send_command(
+                cursor_key.clone(),
+                cursor_overlay::OverlayCommand::ClickPulse {
+                    x: screen_x,
+                    y: screen_y,
+                },
+            );
+        }
 
         let mod_suffix = if modifiers.is_empty() {
             String::new()

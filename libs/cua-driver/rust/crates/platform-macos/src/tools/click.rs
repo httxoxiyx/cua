@@ -290,9 +290,10 @@ impl Tool for ClickTool {
                 return ToolResult::error("click.count must be at least 1.")
                     .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
             }
-            // Glide the session's agent cursor to the screen point for visibility.
+            // Keep decorative cursor feedback off the input critical path when
+            // the daemon opts into asynchronous click feedback.
             let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), sx, sy).await;
+            crate::cursor::overlay::animate_click_feedback(cursor_key.clone(), sx, sy).await;
             self.state
                 .cursor_registry
                 .update_position(&cursor_key, sx, sy);
@@ -495,7 +496,7 @@ impl Tool for ClickTool {
                     cursor_key.clone(),
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await;
+                crate::cursor::overlay::animate_click_feedback(cursor_key.clone(), cx, cy).await;
                 self.state
                     .cursor_registry
                     .update_position(&cursor_key, cx, cy);
@@ -530,20 +531,25 @@ impl Tool for ClickTool {
                 };
             }
 
-            if let Some((cx, cy)) = center {
+            let async_click_feedback = if let Some((cx, cy)) = center {
                 // Pin overlay above target window first.
                 crate::cursor::overlay::send_command(
                     cursor_key.clone(),
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await;
+                let asynchronous =
+                    crate::cursor::overlay::animate_click_feedback(cursor_key.clone(), cx, cy)
+                        .await;
                 // Keep the registry in sync with the overlay so
                 // get_agent_cursor_state reports a truthful position even when
                 // the click was dispatched via the AX path (no pixel coords).
                 self.state
                     .cursor_registry
                     .update_position(&cursor_key, cx, cy);
-            }
+                asynchronous
+            } else {
+                false
+            };
 
             // Finder icon/list items can expose a readable AXSelected state
             // while refusing both AXSelected writes and AXPress. Resolve a
@@ -641,6 +647,7 @@ impl Tool for ClickTool {
                                     selection_pixel,
                                     &selection_modifiers,
                                     foreground,
+                                    !async_click_feedback,
                                 )?);
                                 std::thread::sleep(std::time::Duration::from_millis(150));
                                 Ok(())
@@ -674,6 +681,7 @@ impl Tool for ClickTool {
                                 selection_pixel,
                                 &selection_modifiers,
                                 false,
+                                !async_click_feedback,
                             )
                             .map(|outcome| (outcome, false))
                         }
@@ -969,7 +977,7 @@ impl Tool for ClickTool {
             let fg = delivery_mode.is_foreground() && window_id.is_some();
             let activation_policy = pixel_activation_policy(&button_str, fg, window_id.is_some());
 
-            // Pin the overlay above the target window BEFORE animating so
+            // Pin the overlay above the target window before any animation so
             // the cursor is already sandwiched correctly while it glides in.
             if let Some(wid) = window_id {
                 crate::cursor::overlay::send_command(
@@ -977,9 +985,12 @@ impl Tool for ClickTool {
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
             }
-            // Animate the visual cursor to the click point and wait for it to
-            // arrive — mirrors Swift's `AgentCursor.shared.animateAndWait(to:)`.
-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
+            let async_click_feedback_requested =
+                crate::cursor::overlay::async_click_feedback_enabled(&cursor_key);
+            if !async_click_feedback_requested {
+                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y)
+                    .await;
+            }
             // Keep the registry in sync with the overlay (see AX path above).
             self.state
                 .cursor_registry
@@ -1041,15 +1052,28 @@ impl Tool for ClickTool {
                 };
             let used_synthetic_target_focus = synthetic_focus_context.is_some();
 
-            // Pulse only after the activation settle so it visually coincides
-            // with the real target click rather than the private focus prelude.
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::ClickPulse {
-                    x: screen_x,
-                    y: screen_y,
-                },
-            );
+            // In asynchronous mode, do not start cosmetic feedback until all
+            // target-validation and Chromium focus preparation has completed.
+            // This keeps a fast glide from pulsing before the actual click is
+            // ready to dispatch. If the renderer queue is unavailable, retain
+            // the existing immediate pulse as a best-effort fallback.
+            let async_click_feedback = async_click_feedback_requested
+                && crate::cursor::overlay::queue_async_click_feedback(
+                    cursor_key.clone(),
+                    screen_x,
+                    screen_y,
+                );
+            if !async_click_feedback {
+                // Synchronized mode preserves the existing timing: pulse only
+                // after the private activation prelude has settled.
+                crate::cursor::overlay::send_command(
+                    cursor_key.clone(),
+                    cursor_overlay::OverlayCommand::ClickPulse {
+                        x: screen_x,
+                        y: screen_y,
+                    },
+                );
+            }
 
             let mods_owned = modifiers.clone();
             // Surface 5: route to the right/middle CGEvent primitives when
@@ -1203,6 +1227,7 @@ fn perform_ax_click(
     selection_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
+    emit_click_pulse: bool,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
     let ax_action = map_action(action_str);
     let element = element_ptr as AXUIElementRef;
@@ -1423,22 +1448,19 @@ fn perform_ax_click(
         ax_action == "AXPress" && (role == "AXTextField" || role == "AXTextArea");
 
     // Show focus-rect highlight around the element (matches Swift showFocusRect).
-    // Also move the cursor to the element center so the glide animation plays.
     if let Some(rect) = unsafe { element_screen_rect(element) } {
-        // Drive THIS session's cursor (threaded in via `cursor_key`), matching
-        // the keyed glide already played in the invoke body above. The keyed
-        // glide already played on the session's cursor in the invoke body.
         crate::cursor::overlay::send_command(
             cursor_key.to_owned(),
             cursor_overlay::OverlayCommand::ShowFocusRect(Some(rect)),
         );
-        // Animate cursor to element center.
-        let cx = rect[0] + rect[2] / 2.0;
-        let cy = rect[1] + rect[3] / 2.0;
-        crate::cursor::overlay::send_command(
-            cursor_key.to_owned(),
-            cursor_overlay::OverlayCommand::ClickPulse { x: cx, y: cy },
-        );
+        if emit_click_pulse {
+            let cx = rect[0] + rect[2] / 2.0;
+            let cy = rect[1] + rect[3] / 2.0;
+            crate::cursor::overlay::send_command(
+                cursor_key.to_owned(),
+                cursor_overlay::OverlayCommand::ClickPulse { x: cx, y: cy },
+            );
+        }
     }
     let _ = pid;
     let _ = window_id; // used by caller context

@@ -69,6 +69,16 @@ fn arrival_fire(key: &CursorKey) {
     }
 }
 
+fn take_superseded_arrival(
+    arrivals: &mut Option<HashMap<CursorKey, tokio::sync::oneshot::Sender<()>>>,
+    key: &CursorKey,
+    command_enqueued: bool,
+) -> Option<tokio::sync::oneshot::Sender<()>> {
+    command_enqueued
+        .then(|| arrivals.as_mut().and_then(|map| map.remove(key)))
+        .flatten()
+}
+
 // ── Global overlay state ──────────────────────────────────────────────────
 
 static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<OverlayMsg>> = OnceLock::new();
@@ -220,17 +230,22 @@ pub fn init(cfg: CursorConfig) {
     ));
 }
 
-/// Send a keyed command from any thread (MCP tool, etc.).  Non-blocking; drops
-/// if the channel is full (old commands are less important than new ones).
-pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
+/// Send a keyed command from any thread (MCP tool, etc.). Non-blocking; returns
+/// `false` if the cursor is disabled for this callsite, the renderer is absent,
+/// or the bounded queue is full. Callers that suppress fallback feedback must
+/// check the return value.
+pub fn send_command(key: CursorKey, cmd: OverlayCommand) -> bool {
     // Empty key is the explicit no-cursor sentinel for direct platform calls
     // that bypass lifecycle dispatch.
     if key.is_empty() {
-        return;
+        return false;
     }
     if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }));
+        return tx
+            .try_send(OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }))
+            .is_ok();
     }
+    false
 }
 
 /// Convenience for callsites not yet threaded with a session key: drives the
@@ -427,7 +442,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     arrival_register(key.clone(), tx);
 
     // Send the MoveTo command (click offset applied inside apply_command).
-    send_command(
+    if !send_command(
         key.clone(),
         OverlayCommand::MoveTo {
             x,
@@ -436,7 +451,12 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
             // convention and Swift reference (`endAngleDegrees: 45`).
             end_heading_radians: std::f64::consts::FRAC_PI_4,
         },
-    );
+    ) {
+        // Do not make an unavailable/full renderer look like a ten-second
+        // cursor animation. Resolve the waiter immediately and let the real
+        // desktop action continue.
+        arrival_fire(&key);
+    }
 
     // Visual feedback must never hold the real desktop action indefinitely.
     // The renderer normally fires this promptly; the timeout is a final guard
@@ -451,6 +471,81 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
             "cursor animation timed out; continuing with the desktop action"
         );
     }
+}
+
+/// Present decorative click feedback without changing input-delivery timing.
+///
+/// The default synchronized mode preserves the historical contract by waiting
+/// for the cursor glide; the caller then emits its ordinary `ClickPulse` at the
+/// existing point in the action flow. With `--async-click-feedback`, enqueue
+/// one render-thread-owned glide+arrival-pulse command and return immediately
+/// so the real pointer action is not coupled to overlay frame cadence.
+///
+/// Returns `true` when the arrival pulse was queued. The caller must then skip
+/// its ordinary immediate `ClickPulse` command.
+pub fn async_click_feedback_enabled(key: &str) -> bool {
+    {
+        let guard = RENDER.lock().unwrap();
+        guard
+            .as_ref()
+            .and_then(|map| map.cursors.get(key).map(|state| &state.core.cfg))
+            .or_else(|| guard.as_ref().map(|map| &map.template))
+            .is_some_and(|cfg| cfg.async_click_feedback)
+    }
+}
+
+/// Queue a renderer-owned glide followed by a click pulse. Returns `true`
+/// only when the command was accepted, so callers can retain an immediate
+/// pulse fallback if the bounded queue is unavailable.
+pub fn queue_async_click_feedback(key: CursorKey, x: f64, y: f64) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    seed_start_if_sentinel(&key, x, y);
+    let should_animate = {
+        let guard = RENDER.lock().unwrap();
+        matches!(
+            guard.as_ref().and_then(|map| map.cursors.get(&key)),
+            Some(state) if state.core.cfg.enabled && state.core.pos.0 > -50.0
+        )
+    };
+    if !should_animate || !RENDER_LOOP_RUNNING.load(Ordering::Acquire) {
+        return false;
+    }
+    // Hold the arrival map lock across enqueue + waiter removal. The render
+    // thread also takes this lock when a path arrives, so it cannot mistake
+    // this new asynchronous path's arrival for the superseded synchronous
+    // move. If enqueue fails, leave the original waiter untouched.
+    let superseded = {
+        let mut arrivals = ARRIVAL_TX.lock().unwrap();
+        let enqueued = send_command(
+            key.clone(),
+            OverlayCommand::MoveToThenClickPulse {
+                x,
+                y,
+                end_heading_radians: std::f64::consts::FRAC_PI_4,
+            },
+        );
+        if !enqueued {
+            return false;
+        }
+        take_superseded_arrival(&mut arrivals, &key, true)
+    };
+    if let Some(sender) = superseded {
+        let _ = sender.send(());
+    }
+    true
+}
+
+pub async fn animate_click_feedback(key: CursorKey, x: f64, y: f64) -> bool {
+    let asynchronous = async_click_feedback_enabled(&key);
+
+    if asynchronous {
+        return queue_async_click_feedback(key, x, y);
+    }
+
+    animate_cursor_to(key, x, y).await;
+    false
 }
 
 /// Block the calling thread (must be the OS main thread) running the AppKit
@@ -1584,5 +1679,24 @@ mod tests {
             rxb.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn async_enqueue_supersedes_only_after_command_acceptance() {
+        let mut waiters: Option<HashMap<CursorKey, tokio::sync::oneshot::Sender<()>>> =
+            Some(HashMap::new());
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        waiters.as_mut().unwrap().insert("session".to_owned(), tx);
+
+        assert!(take_superseded_arrival(&mut waiters, &"session".to_owned(), false).is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let sender = take_superseded_arrival(&mut waiters, &"session".to_owned(), true)
+            .expect("accepted async move must supersede the old waiter");
+        let _ = sender.send(());
+        assert!(matches!(rx.try_recv(), Ok(())));
     }
 }

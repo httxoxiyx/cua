@@ -32,7 +32,7 @@ pub fn contracts() -> Vec<ToolContract> {
         ),
         contract::<GetAgentCursorStateInput, GetAgentCursorStateOutput>(
             "get_agent_cursor_state",
-            "Return the session cursor's theme, semantic playback, position, visibility, and motion.",
+            "Return the session cursor's theme, semantic playback, last logical target position, visibility, and motion.",
             &["agent_cursor.state"],
             true,
         ),

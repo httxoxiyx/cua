@@ -39,6 +39,8 @@ The remaining Linux gap is raw keyboard injection into native Wayland apps. Typi
 
 Cua Driver does not move the user's real pointer to show agent activity. It renders a synthetic cursor overlay for supervision. The user can see where the agent is acting while their own cursor and active app stay untouched.
 
+On macOS, `cua-driver serve --async-click-feedback` keeps that supervision UI off the input critical path: click-family tools deliver the real action immediately while the synthetic cursor completes its glide and click pulse on the renderer thread. The pulse visualizes the attempted target; tool verification remains the source of truth for whether an action succeeded. The default remains synchronized for workflows that intentionally coordinate input timing with cursor arrival; explicit `move_cursor` and drag operations also retain their completion semantics.
+
 The Linux recordings below make that separation visible. Synthetic pointers act on background windows while the foreground window remains untouched.
 
 <div className="not-prose my-8 grid gap-5 md:grid-cols-2">

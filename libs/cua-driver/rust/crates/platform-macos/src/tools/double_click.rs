@@ -267,15 +267,18 @@ impl Tool for DoubleClickTool {
                 cursor_overlay::OverlayCommand::PinAbove(wid as u64),
             );
         }
-        // Animate cursor to the click point; wait for arrival before firing.
-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
-        crate::cursor::overlay::send_command(
-            cursor_key.clone(),
-            cursor_overlay::OverlayCommand::ClickPulse {
-                x: screen_x,
-                y: screen_y,
-            },
-        );
+        let async_click_feedback =
+            crate::cursor::overlay::animate_click_feedback(cursor_key.clone(), screen_x, screen_y)
+                .await;
+        if !async_click_feedback {
+            crate::cursor::overlay::send_command(
+                cursor_key.clone(),
+                cursor_overlay::OverlayCommand::ClickPulse {
+                    x: screen_x,
+                    y: screen_y,
+                },
+            );
+        }
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {

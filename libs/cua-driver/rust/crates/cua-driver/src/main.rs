@@ -9,6 +9,7 @@
 //!   --cursor-theme <installed-theme-id>   installed cursor theme
 //!   --cursor-reduced-motion <auto|on|off> accessibility motion preference
 //!   --no-overlay                          start with overlay disabled
+//!   --async-click-feedback                do not wait for decorative click glides
 //!   --glide-ms     <f64>                  glide duration override
 //!   --dwell-ms     <f64>                  post-click dwell override
 //!   --idle-hide-ms <f64>                  idle-hide timeout override
@@ -610,6 +611,7 @@ fn main() {
             grants,
             experimental_history,
         } => {
+            let cursor_cfg = cursor_overlay::CursorConfig::from_args();
             if let Err(error) = configure_startup_permission_mode(
                 permission_mode.as_deref(),
                 dangerously_bypass_approvals,
@@ -635,6 +637,7 @@ fn main() {
                 approve_capability_manifest,
                 no_permissions_gate,
                 claude_code_compat,
+                cursor_cfg.async_click_feedback,
                 &grants,
             );
             let gate_opts =
@@ -672,8 +675,6 @@ fn main() {
             // loop must run HERE. The MCP proxy never renders, so the daemon
             // owns every cursor command and window. Init the channel before spawning
             // the serve thread so `run_on_main_thread()` always finds it ready.
-            let cursor_cfg = cursor_overlay::CursorConfig::from_args();
-
             // Honour the compat flag forwarded by the MCP proxy
             // (launch_daemon_and_wait passes `serve
             // --claude-code-computer-use-compat`). The Serve arm is the daemon
@@ -896,6 +897,8 @@ fn main() {
             experimental_pip,
         } => {
             let startup_started = std::time::Instant::now();
+            let async_click_feedback =
+                cursor_overlay::CursorConfig::from_args().async_click_feedback;
             // Long-running MCP proxy — kick off the background update check
             // before connecting to or launching the daemon.
             version_check::maybe_announce_update();
@@ -921,6 +924,7 @@ fn main() {
                     claude_code_compat,
                     &grants,
                     experimental_pip,
+                    async_click_feedback,
                     |daemon, success| {
                         telemetry::capture_mcp_startup_completed(
                             "daemon_proxy",
@@ -1016,6 +1020,7 @@ fn main() -> anyhow::Result<()> {
             grants,
             experimental_history,
         } => {
+            let cursor_cfg = cursor_overlay::CursorConfig::from_args();
             configure_startup_permission_mode(
                 permission_mode.as_deref(),
                 dangerously_bypass_approvals,
@@ -1035,6 +1040,7 @@ fn main() -> anyhow::Result<()> {
                 approve_capability_manifest,
                 no_permissions_gate,
                 claude_code_compat,
+                cursor_cfg.async_click_feedback,
                 &grants,
             );
             telemetry::capture_start(
@@ -1050,7 +1056,6 @@ fn main() -> anyhow::Result<()> {
             // surface is accepted on every platform for CLI uniformity.
             let _ = no_permissions_gate;
             // Serve mode needs the cursor overlay just like MCP mode.
-            let cursor_cfg = cursor_overlay::CursorConfig::from_args();
             let driver = build_driver(
                 cursor_cfg,
                 claude_code_compat,
@@ -1188,6 +1193,8 @@ fn main() -> anyhow::Result<()> {
             experimental_pip,
         } => {
             let startup_started = std::time::Instant::now();
+            let async_click_feedback =
+                cursor_overlay::CursorConfig::from_args().async_click_feedback;
             // Long-running MCP proxy — kick off the background update check
             // before connecting to the daemon.
             version_check::maybe_announce_update();
@@ -1208,6 +1215,7 @@ fn main() -> anyhow::Result<()> {
                     claude_code_compat,
                     &grants,
                     experimental_pip,
+                    async_click_feedback,
                     |daemon, success| {
                         telemetry::capture_mcp_startup_completed(
                             "daemon_proxy",

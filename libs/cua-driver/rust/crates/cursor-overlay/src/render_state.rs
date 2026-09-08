@@ -66,6 +66,9 @@ pub struct RenderStateCore {
     pub spring_tgt: Option<(f64, f64, f64)>,
     /// Click-pulse phase 0..1; `None` = no pulse in flight.
     pub click_t: Option<f64>,
+    /// Decorative pulse queued by a non-blocking click animation. A newer
+    /// movement command supersedes it before arrival.
+    pub click_pulse_on_arrival: bool,
     /// Whether a button is currently being held for this cursor.
     pub pressed: bool,
     /// Semantic action and animation playback state.
@@ -133,6 +136,7 @@ impl RenderStateCore {
             spring: None,
             spring_tgt: None,
             click_t: None,
+            click_pulse_on_arrival: false,
             pressed: false,
             visible: true,
             idle_secs: 0.0,
@@ -359,6 +363,7 @@ impl RenderStateCore {
             let next = t + dt * 4.0;
             self.click_t = if next >= 1.0 { None } else { Some(next) };
         }
+        self.start_pending_click_pulse(fire_arrival);
 
         self.tick_idle(dt);
 
@@ -471,10 +476,74 @@ impl RenderStateCore {
             let next = t + dt * 4.0; // full pulse over 0.25s
             self.click_t = if next >= 1.0 { None } else { Some(next) };
         }
+        self.start_pending_click_pulse(fire_arrival);
 
         self.tick_idle(dt);
 
         fire_arrival
+    }
+
+    fn start_pending_click_pulse(&mut self, arrived: bool) {
+        if arrived && std::mem::take(&mut self.click_pulse_on_arrival) {
+            // This pulse is deliberately cosmetic. The tool's BeginAction /
+            // EndAction events may already have completed by the time an
+            // asynchronous glide arrives, so do not reopen semantic action
+            // state here.
+            self.click_t = Some(0.0);
+            self.idle_secs = 0.0;
+            self.idle_alpha = 1.0;
+        }
+    }
+
+    fn start_move(
+        &mut self,
+        x: f64,
+        y: f64,
+        end_heading_radians: f64,
+        move_to_snap_sentinel: bool,
+        click_pulse_on_arrival: bool,
+    ) {
+        let reveal_badge = !self.cursor_is_revealed();
+        // Apply click offset (16 pt along end_heading) before planning,
+        // matching Swift `moveTo(point:endAngleRadians:)`.
+        const CLICK_OFFSET: f64 = 16.0;
+        let turn_radius = self.motion.turn_radius;
+        let tx = x + end_heading_radians.cos() * CLICK_OFFSET;
+        let ty = y + end_heading_radians.sin() * CLICK_OFFSET;
+
+        if move_to_snap_sentinel && self.pos.0 < -50.0 {
+            self.pos = (tx, ty);
+        }
+        let (x0, y0) = self.pos;
+        let th0 = self.heading + std::f64::consts::PI;
+        let th1 = end_heading_radians + std::f64::consts::PI;
+        self.path = Some(PathPlanner::plan(
+            x0,
+            y0,
+            th0,
+            tx,
+            ty,
+            th1,
+            end_heading_radians,
+            turn_radius,
+        ));
+        self.dist = 0.0;
+        self.spring = None;
+        self.spring_tgt = None;
+        self.click_pulse_on_arrival = click_pulse_on_arrival;
+        if matches!(
+            self.visual.resolved_action,
+            CursorAction::Idle | CursorAction::Navigate
+        ) {
+            let delivery = self.visual.delivery;
+            let target = self.visual.target;
+            self.visual.begin(CursorAction::Navigate, delivery, target);
+        }
+        self.idle_secs = 0.0;
+        self.idle_alpha = 1.0;
+        if reveal_badge {
+            self.reveal_session_badge();
+        }
     }
 
     /// Shared idle-hide / fade logic — accumulate idle time when nothing is
@@ -555,43 +624,15 @@ impl RenderStateCore {
                 y,
                 end_heading_radians,
             } => {
-                let reveal_badge = !self.cursor_is_revealed();
-                // Apply click offset (16 pt along end_heading) before planning,
-                // matching Swift `moveTo(point:endAngleRadians:)`:
-                //   tx = clickPoint.x + cos(endAngle) * clickOffset
-                //   ty = clickPoint.y + sin(endAngle) * clickOffset
-                const CLICK_OFFSET: f64 = 16.0;
-                let turn_radius = self.motion.turn_radius;
-                let tx = x + end_heading_radians.cos() * CLICK_OFFSET;
-                let ty = y + end_heading_radians.sin() * CLICK_OFFSET;
-
-                // macOS-only: if the cursor is still at the initial off-screen
-                // sentinel, snap it to the offset target so the path starts on-screen.
-                if move_to_snap_sentinel && self.pos.0 < -50.0 {
-                    self.pos = (tx, ty);
-                }
-                let (x0, y0) = self.pos;
-                let th0 = self.heading + std::f64::consts::PI;
-                let th1 = end_heading_radians + std::f64::consts::PI;
-                let plan =
-                    PathPlanner::plan(x0, y0, th0, tx, ty, th1, end_heading_radians, turn_radius);
-                self.path = Some(plan);
-                self.dist = 0.0;
-                self.spring = None;
-                self.spring_tgt = None;
-                if matches!(
-                    self.visual.resolved_action,
-                    CursorAction::Idle | CursorAction::Navigate
-                ) {
-                    let delivery = self.visual.delivery;
-                    let target = self.visual.target;
-                    self.visual.begin(CursorAction::Navigate, delivery, target);
-                }
-                self.idle_secs = 0.0;
-                self.idle_alpha = 1.0;
-                if reveal_badge {
-                    self.reveal_session_badge();
-                }
+                self.start_move(x, y, end_heading_radians, move_to_snap_sentinel, false);
+                true
+            }
+            OverlayCommand::MoveToThenClickPulse {
+                x,
+                y,
+                end_heading_radians,
+            } => {
+                self.start_move(x, y, end_heading_radians, move_to_snap_sentinel, true);
                 true
             }
             OverlayCommand::SnapTo {
@@ -608,6 +649,7 @@ impl RenderStateCore {
                 self.dist = 0.0;
                 self.spring = None;
                 self.spring_tgt = None;
+                self.click_pulse_on_arrival = false;
                 if matches!(
                     self.visual.resolved_action,
                     CursorAction::Idle | CursorAction::Navigate
@@ -625,6 +667,7 @@ impl RenderStateCore {
             }
             OverlayCommand::ClickPulse { x, y } => {
                 let reveal_badge = !self.cursor_is_revealed();
+                self.click_pulse_on_arrival = false;
                 if click_pulse_sentinel_only {
                     // macOS: only snap position on first placement (sentinel state).
                     // After that the cursor stays where the animation landed.
@@ -982,6 +1025,119 @@ mod glide_duration_tests {
                 "swift={swift} short={short} long={long}"
             );
         }
+    }
+
+    #[test]
+    fn deferred_click_pulse_starts_only_after_arrival_on_both_motion_paths() {
+        for swift in [false, true] {
+            let mut core = RenderStateCore::new(CursorConfig::default());
+            core.motion.glide_duration_ms = 50.0;
+            core.pos = (0.0, 0.0);
+            assert!(core.apply_command_base(
+                OverlayCommand::MoveToThenClickPulse {
+                    x: 120.0,
+                    y: 80.0,
+                    end_heading_radians: 0.0,
+                },
+                swift,
+                swift,
+            ));
+            assert!(core.click_pulse_on_arrival);
+            assert!(core.click_t.is_none());
+
+            let mut arrived = false;
+            for _ in 0..100 {
+                arrived = if swift {
+                    core.tick_swift_constants(1.0 / 240.0)
+                } else {
+                    core.tick_motion(1.0 / 240.0)
+                };
+                if arrived {
+                    break;
+                }
+            }
+
+            assert!(arrived, "swift={swift}");
+            assert!(!core.click_pulse_on_arrival);
+            assert_eq!(core.click_t, Some(0.0));
+        }
+    }
+
+    #[test]
+    fn newer_plain_move_cancels_a_deferred_click_pulse() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.motion.glide_duration_ms = 50.0;
+        core.pos = (0.0, 0.0);
+        core.apply_command_base(
+            OverlayCommand::MoveToThenClickPulse {
+                x: 120.0,
+                y: 80.0,
+                end_heading_radians: 0.0,
+            },
+            false,
+            false,
+        );
+        core.apply_command_base(
+            OverlayCommand::MoveTo {
+                x: 40.0,
+                y: 20.0,
+                end_heading_radians: 0.0,
+            },
+            false,
+            false,
+        );
+        assert!(!core.click_pulse_on_arrival);
+
+        for _ in 0..100 {
+            if core.tick_motion(1.0 / 240.0) {
+                break;
+            }
+        }
+        assert!(core.click_t.is_none());
+    }
+
+    #[test]
+    fn deferred_pulse_does_not_replace_newer_semantic_action() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.motion.glide_duration_ms = 50.0;
+        core.pos = (0.0, 0.0);
+        core.apply_command_base(
+            OverlayCommand::BeginAction {
+                action: CursorAction::Click,
+                delivery: None,
+                target: None,
+            },
+            false,
+            false,
+        );
+        core.apply_command_base(
+            OverlayCommand::MoveToThenClickPulse {
+                x: 120.0,
+                y: 80.0,
+                end_heading_radians: 0.0,
+            },
+            false,
+            false,
+        );
+        core.apply_command_base(OverlayCommand::EndAction(CursorAction::Click), false, false);
+        core.apply_command_base(
+            OverlayCommand::BeginAction {
+                action: CursorAction::Text,
+                delivery: None,
+                target: None,
+            },
+            false,
+            false,
+        );
+
+        for _ in 0..100 {
+            if core.tick_motion(1.0 / 240.0) {
+                break;
+            }
+        }
+
+        assert_eq!(core.visual.resolved_action, CursorAction::Text);
+        assert_eq!(core.click_t, Some(0.0));
     }
 }
 
