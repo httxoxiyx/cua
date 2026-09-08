@@ -451,7 +451,8 @@ impl Tool for HotkeyTool {
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Hotkeys like Cmd+N, Cmd+W, Cmd+T explicitly open/close windows.
-        // Background delivery keeps the wildcard suppressor. Foreground
+        // Background delivery suppresses only reflex activation of the target;
+        // a user switch to an unrelated app must remain untouched. Foreground
         // delivery owns an exact-window activation guard below, so suppressing
         // the target here would race and undo the activation before the HID
         // chord reaches custom canvases such as Blender/GHOST.
@@ -459,11 +460,12 @@ impl Tool for HotkeyTool {
         let snapshot = if fg {
             WindowChangeDetector::snapshot_without_suppression(prior_front)
         } else {
-            WindowChangeDetector::snapshot(prior_front)
+            WindowChangeDetector::snapshot_targeted(prior_front, pid)
         };
 
         let result = focus_guard::with_focus_suppressed(
-            if fg { None } else { Some(pid) },
+            // The observation snapshot owns the canonical target-only lease.
+            None,
             prior_front,
             "hotkey.CGEvent",
             || async move {

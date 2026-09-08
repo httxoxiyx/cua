@@ -27,6 +27,15 @@ pub struct DragTool {
     pub state: Arc<ToolState>,
 }
 
+fn prior_pid_to_restore_after_foreground_action(
+    prior_front: Option<i32>,
+    current_front: Option<i32>,
+    target_pid: i32,
+) -> Option<i32> {
+    prior_front
+        .filter(|previous_pid| *previous_pid != target_pid && current_front == Some(target_pid))
+}
+
 impl DragTool {
     pub fn new(state: Arc<ToolState>) -> Self {
         Self { state }
@@ -297,26 +306,29 @@ impl Tool for DragTool {
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Drags can trigger drag-and-drop side-effects that spawn helper
-        // windows (drop on Dock, drop on background app icon) and the
-        // mouseDown half-event alone can activate the target app on some
-        // Chromium builds. Wrap to catch + report both.
+        // windows. Foreground delivery owns its intentional activation and
+        // restoration, so observe changes without a competing suppressor. If
+        // background drag support is added later, keep it target-only.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let fg = delivery_mode.is_foreground() && window_id.is_some();
+        let snapshot = if fg {
+            WindowChangeDetector::snapshot_without_suppression(prior_front)
+        } else {
+            WindowChangeDetector::snapshot_targeted(prior_front, pid)
+        };
 
         // Dispatch blocking drag synthesis.
         let mods_owned = modifiers.clone();
-        let fg = delivery_mode.is_foreground() && window_id.is_some();
         let cursor_for_drag = cursor_key.clone();
         crate::cursor::overlay::send_command(
             cursor_key.clone(),
             cursor_overlay::OverlayCommand::SetPressed(true),
         );
         let drag_input = focus_guard::with_focus_suppressed(
-            // Foreground drag deliberately activates the target so the global
-            // HID stream carries the pressed-button state. A suppression lease
-            // here would race that activation and restore the prior app before
-            // Chromium receives the gesture.
-            if fg { None } else { Some(pid) },
+            // The snapshot above owns the canonical target-only lease for
+            // background delivery. Foreground drag deliberately owns its
+            // activation. Do not add a second restore anchor here.
+            None,
             prior_front,
             "drag.CGEvent",
             || async move {
@@ -377,10 +389,14 @@ impl Tool for DragTool {
                         (true, Some(_wid)) => {
                             let result = do_it();
                             std::thread::sleep(std::time::Duration::from_millis(100));
-                            if let Some(previous_pid) = prior_front {
-                                if previous_pid != pid {
-                                    apps::activate_pid(previous_pid);
-                                }
+                            if let Some(previous_pid) =
+                                prior_pid_to_restore_after_foreground_action(
+                                    prior_front,
+                                    apps::frontmost_pid(),
+                                    pid,
+                                )
+                            {
+                                apps::activate_pid(previous_pid);
                             }
                             result?;
                             Ok(())
@@ -447,5 +463,30 @@ impl Tool for DragTool {
             Ok(Err(e)) => ToolResult::error(format!("drag failed: {e}")),
             Err(e)     => ToolResult::error(format!("Task error: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prior_pid_to_restore_after_foreground_action;
+
+    #[test]
+    fn foreground_drag_restore_preserves_user_takeover() {
+        assert_eq!(
+            prior_pid_to_restore_after_foreground_action(Some(7), Some(42), 42),
+            Some(7)
+        );
+        assert_eq!(
+            prior_pid_to_restore_after_foreground_action(Some(7), Some(99), 42),
+            None
+        );
+        assert_eq!(
+            prior_pid_to_restore_after_foreground_action(Some(42), Some(42), 42),
+            None
+        );
+        assert_eq!(
+            prior_pid_to_restore_after_foreground_action(Some(7), None, 42),
+            None
+        );
     }
 }

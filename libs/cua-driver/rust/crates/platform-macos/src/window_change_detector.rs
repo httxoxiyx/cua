@@ -11,22 +11,21 @@
 //!
 //! 1. Surface the side-effect to the agent (one-line suffix on the
 //!    tool result, matching Swift verbatim).
-//! 2. Arm a **wildcard** focus-steal suppression entry that covers the
-//!    full snapshot→detect window. Wildcards (`target_pid = None`)
-//!    catch any activation other than the prior frontmost — so even an
-//!    app we didn't know about (Safari activating because a UTM Gallery
-//!    link routed to it) is suppressed before the first compositor
-//!    frame.
+//! 2. Optionally arm a focus-steal suppression entry that covers the full
+//!    snapshot→detect window. Ordinary background actions use a **targeted**
+//!    entry so only reflex activation of the app being automated is restored;
+//!    an unrelated app the user intentionally activates remains frontmost.
+//!    Wildcard suppression is reserved for flows such as launch where the
+//!    eventual target pid is not known yet.
 //!
 //! ## Usage
 //!
 //! ```ignore
-//! // Callers capture frontmost BEFORE the snapshot so the wildcard
-//! // suppressor and the snapshot's recorded frontmost agree on the
-//! // pid to restore to — avoids a race where another app activates
-//! // between the caller's `frontmost_pid()` and the detector's own.
+//! // Callers capture frontmost before the snapshot for reporting continuity.
+//! // The targeted constructor refreshes that value immediately before it
+//! // arms the lease, reducing the stale-anchor window.
 //! let prior_front = apps::frontmost_pid();
-//! let snapshot = WindowChangeDetector::snapshot(prior_front);
+//! let snapshot = WindowChangeDetector::snapshot_targeted(prior_front, target_pid);
 //! // … perform action …
 //! let changes = snapshot.detect();
 //! // changes.result_suffix() — append to ToolResult text.
@@ -68,17 +67,29 @@ pub enum WindowChange {
 /// - `window_ids` — the set of visible layer-0 window IDs at snapshot
 ///   time. `detect()` diffs against this.
 /// - `front_pid` — the OS frontmost pid at snapshot time. `detect()`
-///   reports whether a *different* pid became frontmost. The wildcard
-///   suppressor in `focus_steal` will normally restore the original
-///   front before `detect()`'s poll loop observes the change, so this
-///   field is best-effort.
-/// - `_lease` — the wildcard suppression lease. Dropping the snapshot
-///   ends suppression. Held inside `Option` so `detect()` can take it
-///   and drop early.
+///   reports whether a *different* pid became frontmost. A configured
+///   suppressor may restore the latest unrelated front before `detect()`'s
+///   poll loop observes a target self-activation, so this field is best-effort.
+/// - `_lease` — the configured suppression lease. Dropping the snapshot
+///   ends suppression.
+/// - `hold_targeted_lease_until_deadline` — keeps a target-only lease alive for
+///   its original bounded settle window even after the reporting detector sees
+///   a user/external foreground change.
 pub struct Snapshot {
     window_ids: HashSet<u32>,
     front_pid: Option<i32>,
     _lease: Option<SuppressionLease>,
+    hold_targeted_lease_until_deadline: bool,
+    #[cfg(test)]
+    suppression_scope: SuppressionScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SuppressionScope {
+    None,
+    Target(i32),
+    Wildcard,
+    WildcardAllowing(i32),
 }
 
 /// Result of `detect()` — what changed during the action window.
@@ -147,7 +158,7 @@ impl Changes {
 }
 
 /// Default poll deadline — new windows triggered by a click typically
-/// appear within ~200ms on macOS; 1.0s gives the wildcard suppressor
+/// appear within ~200ms on macOS; 1.0s gives any configured suppressor
 /// time to fire and settle.
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
 
@@ -163,14 +174,11 @@ impl WindowChangeDetector {
     /// wildcard focus-steal suppressor. Call immediately before
     /// dispatching the action.
     ///
-    /// `prior_front` is the frontmost pid the **caller** already
-    /// observed — typically captured one line earlier via
-    /// `apps::frontmost_pid()` for the surrounding `focus_guard`
-    /// lease. We use the caller's value (not a fresh re-read) so the
-    /// wildcard suppressor's `restore_to` matches what the focus-guard
-    /// lease saw; a race where another app became frontmost between
-    /// the caller's read and this method would otherwise leave the
-    /// two leases targeting different pids.
+    /// `prior_front` is the frontmost pid the caller already observed.
+    /// Wildcard callers retain that explicit anchor because they own every
+    /// activation in their setup interval. Target-only callers refresh it
+    /// immediately before arming because they must preserve unrelated user
+    /// focus changes and there is no second independent focus-guard lease.
     ///
     /// Returns `Snapshot`. Drop ends suppression (via the held
     /// `SuppressionLease`); call `Snapshot::detect()` to consume the
@@ -179,62 +187,93 @@ impl WindowChangeDetector {
     /// Safe to call from any thread — `CGWindowListCopyWindowInfo` is
     /// documented as thread-safe.
     pub fn snapshot(prior_front: Option<i32>) -> Snapshot {
-        Self::capture(prior_front, true, None)
+        Self::capture(prior_front, SuppressionScope::Wildcard)
+    }
+
+    /// Capture the before-state and suppress only reflex activation of
+    /// `target_pid`.
+    ///
+    /// This is the standard scope for actions delivered to a known background
+    /// app. Activations of unrelated apps are not suppressed; they update the
+    /// target lease's restore anchor because they may be the user switching
+    /// applications while the action is in flight.
+    pub fn snapshot_targeted(prior_front: Option<i32>, target_pid: i32) -> Snapshot {
+        Self::capture(prior_front, SuppressionScope::Target(target_pid))
     }
 
     /// Capture the same before-state without arming reactive focus suppression.
     /// Foreground delivery owns its temporary activation and restoration, so a
-    /// wildcard lease would race the target while the action is settling.
+    /// suppression lease would race the target while the action is settling.
     pub fn snapshot_without_suppression(prior_front: Option<i32>) -> Snapshot {
-        Self::capture(prior_front, false, None)
+        Self::capture(prior_front, SuppressionScope::None)
     }
 
     /// Capture the before-state and suppress cross-app activations while
     /// allowing one intentional target activation.
     ///
-    /// The raw background pixel-click path needs this middle ground:
-    /// focus-without-raise makes `allowed_pid` AppKit-active so its event queue
-    /// accepts the click, but a link or hand-off that activates a different app
-    /// must still restore the user's original foreground.
+    /// This specialized wildcard scope is for flows that intentionally activate
+    /// one known pid but still own all other activation during their bounded
+    /// setup window. Ordinary background actions should use
+    /// `snapshot_targeted`; only intentional real foreground actions should use
+    /// `snapshot_without_suppression`.
     pub fn snapshot_allowing_activation(prior_front: Option<i32>, allowed_pid: i32) -> Snapshot {
-        Self::capture(prior_front, true, Some(allowed_pid))
+        Self::capture(prior_front, SuppressionScope::WildcardAllowing(allowed_pid))
     }
 
-    fn capture(
-        prior_front: Option<i32>,
-        suppress_focus: bool,
-        allowed_pid: Option<i32>,
-    ) -> Snapshot {
+    fn capture(prior_front: Option<i32>, suppression_scope: SuppressionScope) -> Snapshot {
+        // A caller-captured prior can become stale while a full WindowServer
+        // enumeration runs. Targeted background actions can safely refresh the
+        // anchor immediately before arming because only that known target will
+        // be suppressed; wildcard launch flows retain their deliberately
+        // pre-operation anchor.
+        let effective_front = match suppression_scope {
+            SuppressionScope::Target(_) => apps::frontmost_pid().or(prior_front),
+            _ => prior_front,
+        };
+
+        // Arm the requested suppression scope for the snapshot → detect
+        // window. If there's no frontmost (rare — screensaver/login window),
+        // skip the lease; foreground-change tracking still runs.
+        let lease = effective_front.and_then(|restore_to| match suppression_scope {
+            SuppressionScope::None => None,
+            SuppressionScope::Target(target_pid) => Some(focus_steal::begin_suppression(
+                Some(target_pid),
+                restore_to,
+                "WindowChangeDetector.snapshot_targeted",
+            )),
+            SuppressionScope::Wildcard => Some(focus_steal::begin_suppression(
+                None,
+                restore_to,
+                "WindowChangeDetector.snapshot",
+            )),
+            SuppressionScope::WildcardAllowing(pid) => {
+                Some(focus_steal::begin_suppression_allowing(
+                    pid,
+                    restore_to,
+                    "WindowChangeDetector.snapshot_allowing_activation",
+                ))
+            }
+        });
+
+        // Enumerate only after the targeted lease is armed. Window enumeration
+        // can be comparatively slow; arming first avoids a large gap in which
+        // the user changes foreground and the later target activation restores
+        // a stale app.
         let window_ids: HashSet<u32> = windows::visible_windows()
             .into_iter()
             .filter(|w| w.layer == 0)
             .map(|w| w.window_id)
             .collect();
 
-        // Arm wildcard suppression — covers snapshot → detect window.
-        // restore_to = caller-captured frontmost; target = wildcard
-        // (any other pid). If there's no frontmost (rare — screensaver,
-        // login window), we skip the lease; foreground-change tracking
-        // still runs.
-        let lease = prior_front
-            .filter(|_| suppress_focus)
-            .map(|restore_to| match allowed_pid {
-                Some(pid) => focus_steal::begin_suppression_allowing(
-                    pid,
-                    restore_to,
-                    "WindowChangeDetector.snapshot_allowing_activation",
-                ),
-                None => focus_steal::begin_suppression(
-                    None, // wildcard
-                    restore_to,
-                    "WindowChangeDetector.snapshot",
-                ),
-            });
-
+        let hold_targeted_lease_until_deadline =
+            lease.is_some() && matches!(suppression_scope, SuppressionScope::Target(_));
         Snapshot {
             window_ids,
-            front_pid: prior_front,
+            front_pid: effective_front,
             _lease: lease,
+            hold_targeted_lease_until_deadline,
+            #[cfg(test)]
+            suppression_scope,
         }
     }
 }
@@ -249,7 +288,7 @@ impl Snapshot {
     /// foreground-app change. Returns as soon as a change is detected
     /// or the timeout elapses.
     ///
-    /// Consumes the snapshot — the wildcard suppression lease is
+    /// Consumes the snapshot — the configured suppression lease is
     /// dropped when this returns (covers the full action + detection
     /// window).
     pub fn detect(self) -> Changes {
@@ -307,10 +346,23 @@ impl Snapshot {
             };
 
             if !new_windows.is_empty() || foreground_changed {
-                return Changes {
+                let changes = Changes {
                     new_windows,
                     foreground_changed,
                 };
+                if self.hold_targeted_lease_until_deadline {
+                    // A user may switch apps before the automated target's
+                    // delayed self-activation arrives. Reporting the first
+                    // foreground change must not also drop the target-only
+                    // lease early; retain it for the original bounded settle
+                    // window so the focus observer can restore the latest
+                    // unrelated foreground instead of the stale snapshot app.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        std::thread::sleep(remaining);
+                    }
+                }
+                return changes;
             }
             if Instant::now() >= deadline {
                 return Changes::no_change();
@@ -526,5 +578,25 @@ mod tests {
         // panicking (no frontmost to restore to).
         let snap_none = WindowChangeDetector::snapshot(None);
         assert_eq!(snap_none.front_pid(), None);
+    }
+
+    /// Regression: the standard background-action API must request an exact
+    /// target lease, not the wildcard lease that would also match a user's
+    /// intentional switch to an unrelated third-party app.
+    #[test]
+    fn targeted_snapshot_records_exact_target_scope() {
+        let snap = WindowChangeDetector::snapshot_targeted(Some(7), 52_211);
+        assert_eq!(snap.suppression_scope, SuppressionScope::Target(52_211));
+        assert_ne!(snap.suppression_scope, SuppressionScope::Wildcard);
+        assert!(snap.hold_targeted_lease_until_deadline);
+    }
+
+    #[test]
+    fn non_targeted_snapshots_do_not_extend_after_first_change() {
+        let unsuppressed = WindowChangeDetector::snapshot_without_suppression(None);
+        assert!(!unsuppressed.hold_targeted_lease_until_deadline);
+
+        let wildcard = WindowChangeDetector::snapshot(None);
+        assert!(!wildcard.hold_targeted_lease_until_deadline);
     }
 }

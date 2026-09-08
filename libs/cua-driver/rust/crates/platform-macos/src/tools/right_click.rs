@@ -6,11 +6,10 @@ use cua_driver_core::{
 use serde_json::Value;
 use std::sync::Arc;
 
+use super::ToolState;
 use crate::ax::bindings::{
     copy_action_names, copy_string_attr, kAXErrorSuccess, perform_action, AXUIElementRef,
 };
-
-use super::ToolState;
 
 pub struct RightClickTool {
     state: Arc<ToolState>,
@@ -172,8 +171,17 @@ impl Tool for RightClickTool {
                 Err(refusal_result) => return refusal_result,
             };
 
-            let result =
-                tokio::task::spawn_blocking(move || ax_show_menu(element_ptr, idx, pid, wid)).await;
+            let prior_front = crate::apps::frontmost_pid();
+            let result = crate::focus_guard::with_focus_suppressed(
+                Some(pid),
+                prior_front,
+                "right_click.AX",
+                || async move {
+                    tokio::task::spawn_blocking(move || ax_show_menu(element_ptr, idx, pid, wid))
+                        .await
+                },
+            )
+            .await;
 
             return match result {
                 Ok(Ok(msg)) => ToolResult::text(msg),
@@ -264,32 +272,45 @@ impl Tool for RightClickTool {
         };
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let do_it = move || -> anyhow::Result<()> {
-                let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                if let Some(wid) = window_id {
-                    crate::input::mouse::right_click_at_xy_with_window_local(
-                        pid,
-                        screen_x,
-                        screen_y,
-                        win_local_x,
-                        win_local_y,
-                        wid,
-                        &m,
-                    )
-                } else {
-                    crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
-                }
-            };
-            // Foreground rung: brief front → right-click → restore prior frontmost.
-            match (fg, window_id) {
-                (true, Some(wid)) => {
-                    crate::input::skylight::with_foreground_assist(pid as libc::pid_t, wid, do_it)?;
-                    Ok(())
-                }
-                _ => do_it(),
-            }
-        })
+        let prior_front = crate::apps::frontmost_pid();
+        let result = crate::focus_guard::with_focus_suppressed(
+            if fg { None } else { Some(pid) },
+            prior_front,
+            "right_click.pixel",
+            || async move {
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let do_it = move || -> anyhow::Result<()> {
+                        let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                        if let Some(wid) = window_id {
+                            crate::input::mouse::right_click_at_xy_with_window_local(
+                                pid,
+                                screen_x,
+                                screen_y,
+                                win_local_x,
+                                win_local_y,
+                                wid,
+                                &m,
+                            )
+                        } else {
+                            crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
+                        }
+                    };
+                    // Foreground rung: brief front → right-click → restore prior frontmost.
+                    match (fg, window_id) {
+                        (true, Some(wid)) => {
+                            crate::input::skylight::with_foreground_assist(
+                                pid as libc::pid_t,
+                                wid,
+                                do_it,
+                            )?;
+                            Ok(())
+                        }
+                        _ => do_it(),
+                    }
+                })
+                .await
+            },
+        )
         .await;
         let mode_label = if fg {
             " (delivery_mode:foreground)"

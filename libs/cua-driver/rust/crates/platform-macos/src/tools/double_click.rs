@@ -6,12 +6,11 @@ use cua_driver_core::{
 use serde_json::Value;
 use std::sync::Arc;
 
+use super::ToolState;
 use crate::ax::bindings::{
     copy_action_names, element_screen_center, kAXErrorActionUnsupported,
     kAXErrorAttributeUnsupported, kAXErrorSuccess, perform_action, AXError, AXUIElementRef,
 };
-
-use super::ToolState;
 
 pub struct DoubleClickTool {
     state: Arc<ToolState>,
@@ -163,33 +162,52 @@ impl Tool for DoubleClickTool {
             // so its ClickPulse lands on THIS session's cursor, not "default".
             let ck = cursor_key.clone();
             let foreground = delivery_mode.is_foreground();
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                if !foreground {
-                    return ax_double_click(pid, wid, element_ptr, idx, &ck, has_ax_open, false);
-                }
+            let prior_front = crate::apps::frontmost_pid();
+            let result = crate::focus_guard::with_focus_suppressed(
+                if foreground { None } else { Some(pid) },
+                prior_front,
+                "double_click.AX",
+                || async move {
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                        if !foreground {
+                            return ax_double_click(
+                                pid,
+                                wid,
+                                element_ptr,
+                                idx,
+                                &ck,
+                                has_ax_open,
+                                false,
+                            );
+                        }
 
-                let mut outcome = None;
-                let fronted = crate::input::skylight::with_foreground_assist(pid, wid, || {
-                    outcome = Some(ax_double_click(
-                        pid,
-                        wid,
-                        element_ptr,
-                        idx,
-                        &ck,
-                        has_ax_open,
-                        true,
-                    )?);
-                    Ok(())
-                })?;
-                let mut message = outcome
-                    .ok_or_else(|| anyhow::anyhow!("foreground double-click did not execute"))?;
-                if !fronted {
-                    message.push_str(
-                        " Foreground assist was unavailable; delivery used the exact window-local route.",
-                    );
-                }
-                Ok(message)
-            })
+                        let mut outcome = None;
+                        let fronted =
+                            crate::input::skylight::with_foreground_assist(pid, wid, || {
+                                outcome = Some(ax_double_click(
+                                    pid,
+                                    wid,
+                                    element_ptr,
+                                    idx,
+                                    &ck,
+                                    has_ax_open,
+                                    true,
+                                )?);
+                                Ok(())
+                            })?;
+                        let mut message = outcome.ok_or_else(|| {
+                            anyhow::anyhow!("foreground double-click did not execute")
+                        })?;
+                        if !fronted {
+                            message.push_str(
+                                " Foreground assist was unavailable; delivery used the exact window-local route.",
+                            );
+                        }
+                        Ok(message)
+                    })
+                    .await
+                },
+            )
             .await;
 
             return match result {
@@ -288,38 +306,47 @@ impl Tool for DoubleClickTool {
         }
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let do_click = move || -> anyhow::Result<()> {
-                if let Some(wid) = window_id {
-                    crate::input::mouse::click_at_xy_with_window_local(
-                        pid,
-                        screen_x,
-                        screen_y,
-                        win_local_x,
-                        win_local_y,
-                        wid,
-                        2,
-                        &[],
-                        crate::input::mouse::WindowClickDelivery::from_foreground(fg),
-                        None,
-                    )
-                } else {
-                    crate::input::mouse::click_at_xy(pid, screen_x, screen_y, 2, &[])
-                }
-            };
-            // Foreground rung: brief front → double-click → restore prior frontmost.
-            match (fg, window_id) {
-                (true, Some(wid)) => {
-                    crate::input::skylight::with_foreground_assist(
-                        pid as libc::pid_t,
-                        wid,
-                        do_click,
-                    )?;
-                    Ok(())
-                }
-                _ => do_click(),
-            }
-        })
+        let prior_front = crate::apps::frontmost_pid();
+        let result = crate::focus_guard::with_focus_suppressed(
+            if fg { None } else { Some(pid) },
+            prior_front,
+            "double_click.pixel",
+            || async move {
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let do_click = move || -> anyhow::Result<()> {
+                        if let Some(wid) = window_id {
+                            crate::input::mouse::click_at_xy_with_window_local(
+                                pid,
+                                screen_x,
+                                screen_y,
+                                win_local_x,
+                                win_local_y,
+                                wid,
+                                2,
+                                &[],
+                                crate::input::mouse::WindowClickDelivery::from_foreground(fg),
+                                None,
+                            )
+                        } else {
+                            crate::input::mouse::click_at_xy(pid, screen_x, screen_y, 2, &[])
+                        }
+                    };
+                    // Foreground rung: brief front → double-click → restore prior frontmost.
+                    match (fg, window_id) {
+                        (true, Some(wid)) => {
+                            crate::input::skylight::with_foreground_assist(
+                                pid as libc::pid_t,
+                                wid,
+                                do_click,
+                            )?;
+                            Ok(())
+                        }
+                        _ => do_click(),
+                    }
+                })
+                .await
+            },
+        )
         .await;
 
         let mode_label = if fg {

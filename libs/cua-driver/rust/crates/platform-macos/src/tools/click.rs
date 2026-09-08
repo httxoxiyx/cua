@@ -613,17 +613,17 @@ impl Tool for ClickTool {
             }
 
             // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
-            // Capture prior frontmost, arm the wildcard suppressor in the
-            // snapshot, then arm a targeted suppressor across the AX action
-            // itself via FocusGuard. After the action returns, detect any
-            // new-window / foreground side-effects and append a one-liner
-            // suffix matching Swift's wording.
+            // Capture prior frontmost and arm one target-only suppression
+            // lease for the complete background snapshot -> AX action ->
+            // detect interval. A user switch to an unrelated app must not be
+            // undone. After the action returns, detect any window / foreground
+            // side-effects and append the usual result suffix.
             let prior_front = apps::frontmost_pid();
             let foreground = delivery_mode.is_foreground();
             let snapshot = if foreground {
                 WindowChangeDetector::snapshot_without_suppression(prior_front)
             } else {
-                WindowChangeDetector::snapshot(prior_front)
+                WindowChangeDetector::snapshot_targeted(prior_front, pid)
             };
 
             // Run AX work on a blocking thread (can't block async executor).
@@ -636,7 +636,9 @@ impl Tool for ClickTool {
             let ck = cursor_key.clone();
             let selection_modifiers = modifiers.clone();
             let result = focus_guard::with_focus_suppressed(
-                if foreground { None } else { Some(pid) },
+                // The observation snapshot owns the canonical target-only
+                // lease; foreground delivery owns its activation.
+                None,
                 prior_front,
                 "click.AXPress",
                 || async move {
@@ -699,7 +701,7 @@ impl Tool for ClickTool {
             )
             .await;
 
-            // Drop the wildcard lease + detect window/foreground side-effects.
+            // Drop the configured lease + detect window/foreground side-effects.
             let changes = super::finish_window_observation(snapshot, &args).await;
 
             match result {
@@ -1006,13 +1008,17 @@ impl Tool for ClickTool {
 
             // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
             // A pixel click can land on a "Sign In" button that opens a sheet
-            // or a Safari link that activates a new tab — same side-effect
-            // shape as the AX path, so we wrap identically.
+            // or a Safari link that activates a new tab. Standard background
+            // delivery and synthetic target focus suppress only real target
+            // self-activation. Synthetic focus records that do not change the
+            // real frontmost pid are ignored by the suppressor's compare step.
+            // Foreground assist intentionally owns activation state, so the
+            // detector observes changes without a competing lease.
             let prior_front = apps::frontmost_pid();
             let snapshot = match activation_policy {
                 PixelActivationPolicy::SuppressTarget
                 | PixelActivationPolicy::SyntheticTargetFocus => {
-                    WindowChangeDetector::snapshot(prior_front)
+                    WindowChangeDetector::snapshot_targeted(prior_front, pid)
                 }
                 PixelActivationPolicy::ForegroundAssist => {
                     WindowChangeDetector::snapshot_without_suppression(prior_front)
@@ -1089,15 +1095,9 @@ impl Tool for ClickTool {
             // routed `click_at_xy_with_window_local` for back-compat.
             let button_kind = button_str.clone();
             let result = focus_guard::with_focus_suppressed(
-                if matches!(
-                    activation_policy,
-                    PixelActivationPolicy::SuppressTarget
-                        | PixelActivationPolicy::SyntheticTargetFocus
-                ) {
-                    Some(pid)
-                } else {
-                    None
-                },
+                // The observation snapshot owns the canonical target-only
+                // lease, including synthetic target-focus delivery.
+                None,
                 prior_front,
                 "click.pixel",
                 || async move {

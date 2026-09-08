@@ -551,7 +551,12 @@ impl Tool for ScrollTool {
             );
 
             let prior_front = apps::frontmost_pid();
-            let snapshot = WindowChangeDetector::snapshot(prior_front);
+            let fg = delivery_mode.is_foreground() && target.wid.is_some();
+            let snapshot = if fg {
+                WindowChangeDetector::snapshot_without_suppression(prior_front)
+            } else {
+                WindowChangeDetector::snapshot_targeted(prior_front, pid)
+            };
 
             let WheelTarget {
                 screen_x,
@@ -560,9 +565,10 @@ impl Tool for ScrollTool {
                 wid,
             } = target;
             let amount_ticks = amount;
-            let fg = delivery_mode.is_foreground() && wid.is_some();
             let result = focus_guard::with_focus_suppressed(
-                Some(pid),
+                // The observation snapshot owns the canonical target-only
+                // lease; foreground delivery owns its activation.
+                None,
                 prior_front,
                 "scroll.CGScrollWheel",
                 || async move {
@@ -664,18 +670,19 @@ impl Tool for ScrollTool {
         // with the other action tools.
         //
         // The AX focus_element() pre-write also runs inside the closure so
-        // any reflex activations it triggers are caught by both the wildcard
-        // snapshot suppressor and the targeted FocusGuard lease.
+        // any reflex activation it triggers is covered by the snapshot's
+        // target-only lease without interfering with unrelated user activity.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = WindowChangeDetector::snapshot_targeted(prior_front, pid);
 
         let result = focus_guard::with_focus_suppressed(
-            Some(pid),
+            // The observation snapshot owns the canonical target-only lease.
+            None,
             prior_front,
             "scroll.CGEvent",
             || async move {
-                // Pre-focus the element under suppression so its
-                // side-effects are captured by the snapshot + lease.
+                // Pre-focus the element while the snapshot lease is active so
+                // its side-effects remain covered.
                 if let Some(element_ptr) = pre_focus_ptr {
                     let _ = tokio::task::spawn_blocking(move || {
                         crate::input::ax_actions::focus_element(element_ptr)

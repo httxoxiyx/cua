@@ -51,19 +51,16 @@ enum PressKeyDeliveryOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PressKeyFocusSuppressionPolicy {
     suppress_window_changes: bool,
-    target_pid: Option<i32>,
 }
 
-fn focus_suppression_policy(foreground: bool, pid: i32) -> PressKeyFocusSuppressionPolicy {
+fn focus_suppression_policy(foreground: bool) -> PressKeyFocusSuppressionPolicy {
     if foreground {
         PressKeyFocusSuppressionPolicy {
             suppress_window_changes: false,
-            target_pid: None,
         }
     } else {
         PressKeyFocusSuppressionPolicy {
             suppress_window_changes: true,
-            target_pid: Some(pid),
         }
     }
 }
@@ -453,29 +450,29 @@ impl Tool for PressKeyTool {
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Single-key presses can fire autocomplete (Return on a search box
         // opens a results popover) or trigger menu shortcuts that open windows.
-        // Background delivery keeps the wildcard suppressor. Foreground
+        // Background delivery suppresses only reflex activation of the target;
+        // a user switch to an unrelated app must remain untouched. Foreground
         // delivery owns an exact-window activation guard below, so suppressing
         // the target here would race and undo that activation before the HID
         // transition reaches custom canvases such as Blender/GHOST.
         //
-        // The AX focus_element() pre-write also runs inside the closure
-        // so any reflex activations it triggers are caught by both background
-        // suppression layers.
+        // The AX focus_element() pre-write also runs inside the closure while
+        // the observation snapshot's canonical lease is active.
         let prior_front = apps::frontmost_pid();
-        let suppression_policy = focus_suppression_policy(fg, pid);
+        let suppression_policy = focus_suppression_policy(fg);
         let snapshot = if suppression_policy.suppress_window_changes {
-            WindowChangeDetector::snapshot(prior_front)
+            WindowChangeDetector::snapshot_targeted(prior_front, pid)
         } else {
             WindowChangeDetector::snapshot_without_suppression(prior_front)
         };
 
         let result = focus_guard::with_focus_suppressed(
-            suppression_policy.target_pid,
+            None,
             prior_front,
             "press_key.CGEvent",
             || async move {
-                // Pre-focus the element under suppression so its
-                // side-effects are captured by the snapshot + lease.
+                // Pre-focus the element while the snapshot lease is active so
+                // its side-effects remain covered.
                 if let Some(element_ptr) = pre_focus_ptr {
                     let _ = tokio::task::spawn_blocking(move || {
                         crate::input::ax_actions::focus_element(element_ptr)
@@ -596,17 +593,15 @@ mod tests {
     #[test]
     fn foreground_exact_window_guard_is_not_raced_by_focus_suppression() {
         assert_eq!(
-            focus_suppression_policy(true, 52_211),
+            focus_suppression_policy(true),
             PressKeyFocusSuppressionPolicy {
                 suppress_window_changes: false,
-                target_pid: None,
             }
         );
         assert_eq!(
-            focus_suppression_policy(false, 52_211),
+            focus_suppression_policy(false),
             PressKeyFocusSuppressionPolicy {
                 suppress_window_changes: true,
-                target_pid: Some(52_211),
             }
         );
     }

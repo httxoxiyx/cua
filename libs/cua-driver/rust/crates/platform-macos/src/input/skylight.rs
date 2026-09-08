@@ -587,6 +587,18 @@ fn current_front_process_psn() -> Option<[u8; 8]> {
     (unsafe { get_front(psn.as_mut_ptr() as *mut c_void) } == 0).then_some(psn)
 }
 
+fn should_restore_previous_process(
+    current_front_psn: Option<[u8; 8]>,
+    assisted_target_psn: [u8; 8],
+) -> bool {
+    // Restore is compare-and-swap, not unconditional. If the target is no
+    // longer frontmost, a user or unrelated system event has already chosen a
+    // newer foreground and must win. Same-process window changes can also be
+    // caused by the assisted action itself (for example Cmd+W), so foreground
+    // delivery still requires an external exclusive desktop lease.
+    current_front_psn == Some(assisted_target_psn)
+}
+
 fn should_deactivate_synthetic_target(
     current_front_psn: Option<[u8; 8]>,
     target_psn: [u8; 8],
@@ -842,7 +854,7 @@ pub fn with_foreground_assist(
 
     let result = body();
 
-    if prev_ok {
+    if prev_ok && should_restore_previous_process(current_front_process_psn(), target_psn) {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 
@@ -969,7 +981,7 @@ fn with_foreground_hid_activation_inner(
                 )
             }))
     {
-        if prev_ok {
+        if prev_ok && should_restore_previous_process(current_front_process_psn(), target_psn) {
             unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
         }
         anyhow::bail!("exact target window did not become focused for foreground HID delivery");
@@ -978,7 +990,7 @@ fn with_foreground_hid_activation_inner(
     let result = action();
     std::thread::sleep(std::time::Duration::from_millis(40));
 
-    if prev_ok {
+    if prev_ok && should_restore_previous_process(current_front_process_psn(), target_psn) {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 
@@ -1217,7 +1229,7 @@ pub fn with_menu_shortcut_activation(
     let result = action();
 
     // Restore prior frontmost (windowID=0, options=0x400).
-    if prev_ok {
+    if prev_ok && should_restore_previous_process(current_front_process_psn(), target_psn) {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 
@@ -1230,7 +1242,7 @@ mod tests {
     use super::{
         foreground_keyboard_focus_click_for_bundle_id, foreground_keyboard_focus_click_policy,
         make_key_window_record, preserves_exact_existing_focus, should_deactivate_synthetic_target,
-        synthetic_focus_record, synthetic_target_focus_plan,
+        should_restore_previous_process, synthetic_focus_record, synthetic_target_focus_plan,
         transient_route_authorizes_auxiliary_bypass,
     };
 
@@ -1335,6 +1347,19 @@ mod tests {
             !should_deactivate_synthetic_target(None, target),
             "an unknown real foreground must fail safe for user intervention"
         );
+    }
+
+    #[test]
+    fn foreground_restore_is_compare_and_swap() {
+        let target = [1, 2, 3, 4, 5, 6, 7, 8];
+        let user_takeover = [8, 7, 6, 5, 4, 3, 2, 1];
+
+        assert!(should_restore_previous_process(Some(target), target));
+        assert!(!should_restore_previous_process(
+            Some(user_takeover),
+            target
+        ));
+        assert!(!should_restore_previous_process(None, target));
     }
 
     #[test]

@@ -207,12 +207,16 @@ impl Tool for SetValueTool {
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // AXValue writes on popups / sliders can cause reflex activations
         // in Chromium-based apps; the AXPopUpButton path also AXPresses a
-        // child option which can trigger app activation in some setups.
+        // child option which can trigger app activation in some setups. Only
+        // suppress the target itself so a concurrent user app switch survives.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = WindowChangeDetector::snapshot_targeted(prior_front, pid);
 
         let result = focus_guard::with_focus_suppressed(
-            Some(pid),
+            // The WindowChangeDetector snapshot owns the one canonical
+            // target-only lease for this action. A second lease could retain a
+            // stale restore anchor after concurrent user focus changes.
+            None,
             prior_front,
             "set_value.AXValue",
             || async move {

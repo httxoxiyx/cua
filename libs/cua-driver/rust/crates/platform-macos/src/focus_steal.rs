@@ -327,28 +327,50 @@ impl Dispatcher {
     /// Snapshot the entries (cloned to a small Vec) — used by tests
     /// and the activation handler to evaluate matches without holding
     /// the lock across the restore call.
-    fn snapshot_matches(&self, activated_pid: i32) -> Vec<i32> {
+    fn snapshot_matches(&self, activated_pid: i32, current_front: Option<i32>) -> Vec<i32> {
         let mut guard = self.entries.lock().unwrap();
         // Reap expired entries first — keeps the dispatcher honest even
         // if the janitor hasn't ticked yet.
         let now = Instant::now();
         guard.retain(|_, e| e.deadline > now);
-        guard
-            .values()
-            .filter(|e| {
-                if e.allowed_pid == Some(activated_pid) {
-                    return false;
+        if current_front != Some(activated_pid) {
+            // NSWorkspace notifications can arrive after a newer activation.
+            // A stale notification is not evidence for either adoption or
+            // restoration, so leave every lease unchanged.
+            return Vec::new();
+        }
+        let mut restore_pids = Vec::new();
+        for entry in guard.values_mut() {
+            if entry.allowed_pid == Some(activated_pid) {
+                continue;
+            }
+            match entry.target_pid {
+                Some(target_pid)
+                    if target_pid == activated_pid && entry.restore_to != activated_pid =>
+                {
+                    restore_pids.push(entry.restore_to);
                 }
-                match e.target_pid {
-                    Some(p) => p == activated_pid,
-                    // Wildcard: match any activation except the restore_to
-                    // pid (don't fight ourselves when we re-activate the
-                    // prior frontmost).
-                    None => activated_pid != e.restore_to,
+                Some(target_pid) if target_pid == activated_pid => {}
+                Some(_) if activated_pid != entry.restore_to => {
+                    // The lease covers only its target. An unrelated
+                    // activation is therefore user/external state that must be
+                    // preserved. Track it as the new restore destination so a
+                    // later reflex activation of the target cannot pull the
+                    // user back to the app that happened to be frontmost when
+                    // the action started.
+                    entry.restore_to = activated_pid;
                 }
-            })
-            .map(|e| e.restore_to)
-            .collect()
+                Some(_) => {}
+                // Wildcard: match any activation except the restore_to pid
+                // (don't fight ourselves when we re-activate the prior
+                // frontmost).
+                None if activated_pid != entry.restore_to => {
+                    restore_pids.push(entry.restore_to);
+                }
+                None => {}
+            }
+        }
+        restore_pids
     }
 
     /// Number of entries (for tests).
@@ -515,10 +537,22 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
         pid as i32
     };
 
-    let restore_pids = dispatcher.snapshot_matches(activated_pid);
+    let current_front = crate::apps::frontmost_pid();
+    let restore_pids = dispatcher.snapshot_matches(activated_pid, current_front);
     for pid in restore_pids {
-        restore_focus(pid);
+        // Notification delivery and restoration are asynchronous. If another
+        // application is already frontmost, the user (or an unrelated system
+        // event) won the race; restoring the stale pid would steal focus from
+        // that newer foreground. Compare immediately before each restore and
+        // fail safe by leaving the newer foreground alone.
+        if should_restore_after_activation(crate::apps::frontmost_pid(), activated_pid) {
+            restore_focus(pid);
+        }
     }
+}
+
+fn should_restore_after_activation(current_front: Option<i32>, activated_pid: i32) -> bool {
+    current_front == Some(activated_pid)
 }
 
 /// Re-activate `pid` if it's still running. Safe to call from any
@@ -549,12 +583,69 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.add");
         assert_eq!(d.len(), 1);
-        let matches = d.snapshot_matches(42);
+        let matches = d.snapshot_matches(42, Some(42));
         assert_eq!(matches, vec![7]);
         // Non-matching pid: no restore candidates.
-        assert!(d.snapshot_matches(99).is_empty());
+        assert!(d.snapshot_matches(99, Some(99)).is_empty());
         d.remove(h);
         assert_eq!(d.len(), 0);
+    }
+
+    /// A target-only lease must not treat unrelated activation as a focus
+    /// steal. That activation can be the user switching apps while a
+    /// background action is still in its snapshot→detect window.
+    #[test]
+    fn targeted_lease_does_not_match_third_party_activation() {
+        let d = Arc::new(Dispatcher::new());
+        let _lease = d.add(Some(42), 7, "test.target_only");
+
+        assert_eq!(d.snapshot_matches(42, Some(42)), vec![7]);
+        assert!(
+            d.snapshot_matches(99, Some(99)).is_empty(),
+            "third-party activation must remain frontmost"
+        );
+        assert!(
+            d.snapshot_matches(7, Some(7)).is_empty(),
+            "restore target must not recursively match"
+        );
+    }
+
+    /// A third-party activation during a target-only lease becomes the latest
+    /// foreground to preserve. If the automated target activates afterwards,
+    /// it must restore that new app rather than the stale snapshot-time app.
+    #[test]
+    fn targeted_lease_tracks_latest_unrelated_foreground() {
+        let d = Arc::new(Dispatcher::new());
+        let _lease = d.add(Some(42), 7, "test.target_tracks_user");
+
+        assert!(d.snapshot_matches(99, Some(99)).is_empty());
+        assert_eq!(d.snapshot_matches(42, Some(42)), vec![99]);
+    }
+
+    #[test]
+    fn targeted_lease_does_not_restore_target_to_itself() {
+        let d = Arc::new(Dispatcher::new());
+        let _lease = d.add(Some(42), 42, "test.target_already_front");
+
+        assert!(d.snapshot_matches(42, Some(42)).is_empty());
+        assert!(d.snapshot_matches(99, Some(99)).is_empty());
+        assert_eq!(d.snapshot_matches(42, Some(42)), vec![99]);
+    }
+
+    #[test]
+    fn stale_activation_notification_does_not_replace_restore_target() {
+        let d = Arc::new(Dispatcher::new());
+        let _lease = d.add(Some(42), 7, "test.target_ignores_stale");
+
+        assert!(d.snapshot_matches(99, Some(123)).is_empty());
+        assert_eq!(d.snapshot_matches(42, Some(42)), vec![7]);
+    }
+
+    #[test]
+    fn restore_requires_target_to_still_be_frontmost() {
+        assert!(should_restore_after_activation(Some(42), 42));
+        assert!(!should_restore_after_activation(Some(99), 42));
+        assert!(!should_restore_after_activation(None, 42));
     }
 
     /// Wildcard entries (`target_pid = None`) match every activation
@@ -564,9 +655,9 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _h = d.add(None, 7, "test.wild");
         // pid 99 != restore_to 7 → should match.
-        assert_eq!(d.snapshot_matches(99), vec![7]);
+        assert_eq!(d.snapshot_matches(99, Some(99)), vec![7]);
         // pid 7 == restore_to → must NOT match (don't fight ourselves).
-        assert!(d.snapshot_matches(7).is_empty());
+        assert!(d.snapshot_matches(7, Some(7)).is_empty());
     }
 
     /// A background pixel click intentionally makes its target AppKit-active
@@ -578,16 +669,16 @@ mod tests {
         let _h = d.add_allowing(42, 7, "test.allow");
 
         assert!(
-            d.snapshot_matches(42).is_empty(),
+            d.snapshot_matches(42, Some(42)).is_empty(),
             "intentional target activation must not be restored before the click"
         );
         assert_eq!(
-            d.snapshot_matches(99),
+            d.snapshot_matches(99, Some(99)),
             vec![7],
             "unrelated activations must remain suppressed"
         );
         assert!(
-            d.snapshot_matches(7).is_empty(),
+            d.snapshot_matches(7, Some(7)).is_empty(),
             "restoring the original foreground must never recurse"
         );
     }
@@ -644,7 +735,7 @@ mod tests {
         }
         assert_eq!(d.len(), 1);
         // snapshot_matches reaps expired entries before matching.
-        let matches = d.snapshot_matches(42);
+        let matches = d.snapshot_matches(42, Some(42));
         assert!(matches.is_empty(), "expired entry should not fire");
         assert_eq!(d.len(), 0, "snapshot_matches should purge expired");
     }
@@ -729,7 +820,7 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _a = d.add(Some(42), 1, "test.m1");
         let _b = d.add(Some(42), 2, "test.m2");
-        let matches = d.snapshot_matches(42);
+        let matches = d.snapshot_matches(42, Some(42));
         assert_eq!(matches.len(), 2);
         // Set equality — order is HashMap-dependent.
         assert!(matches.contains(&1));

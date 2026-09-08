@@ -3,9 +3,8 @@
 //!
 //! ## What this does
 //!
-//! Wraps an individual AX-action call (the inside of a click / type /
-//! set_value / drag dispatch) with a **targeted** focus-steal suppression
-//! lease. Catches the case where dispatching an AX attribute write
+//! Can wrap an individual AX-action call with a **targeted** focus-steal
+//! suppression lease. Catches the case where dispatching an AX attribute write
 //! triggers a reflexive self-activation in the target app — Safari /
 //! WebKit will sometimes pull itself to the front when an
 //! `AXSelectedText` write hits a focused input, even when the AX call
@@ -29,9 +28,11 @@
 //! This Rust port only ships **layer 3** (the reactive suppressor).
 //! Layers 1+2 require AX assertion + AX attribute write/restore machinery
 //! that isn't yet ported — and empirically the layer-3 reactive guard
-//! catches the majority of side-effects when combined with
-//! `WindowChangeDetector`'s wildcard lease at the snapshot→detect
-//! boundary. This gap is a known, intentional limitation.
+//! catches the majority of side-effects. Ordinary action tools already hold
+//! `WindowChangeDetector`'s canonical target-only lease across the complete
+//! snapshot→action→detect boundary, so they call this wrapper without creating
+//! a second independent restore anchor. This gap is a known, intentional
+//! limitation.
 //!
 //! ## Why this is a separate module
 //!
@@ -57,8 +58,7 @@ use crate::focus_steal;
 ///
 /// - `target_pid` — the pid the action is dispatched to. `Some(pid)` is
 ///   the standard case; `None` skips the targeted entry entirely
-///   (caller relies on the surrounding `WindowChangeDetector` wildcard
-///   lease).
+///   (for example, foreground delivery owns its activation lifecycle).
 /// - `prior_frontmost` — the pid to restore focus to if the target
 ///   activates. Typically captured from `apps::frontmost_pid()` before
 ///   the snapshot.
@@ -126,9 +126,10 @@ where
 /// e.g. tools that only opt into the layer-3 guard without the
 /// snapshot/detect cycle.
 ///
-/// Most action tools should prefer `with_focus_suppressed` with an
-/// explicit `prior_frontmost` captured *before* the snapshot, so the
-/// wildcard lease + targeted lease both restore to the same pid.
+/// Callers that already hold a `WindowChangeDetector` target-only snapshot
+/// must not add a second independent lease: concurrent user focus changes can
+/// otherwise leave the two leases with different restore anchors. This helper
+/// is for paths that do not already own a detector lease.
 pub async fn with_focus_suppressed_now<F, Fut, R>(
     target_pid: Option<i32>,
     origin: &'static str,

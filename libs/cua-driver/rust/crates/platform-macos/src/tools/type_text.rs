@@ -389,10 +389,16 @@ impl Tool for TypeTextTool {
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Typing into a field can trigger autocomplete popovers or
         // Chrome/Safari's "Save Password?" prompt, both of which open
-        // helper windows. Wrap so callers see them in the result suffix
-        // and the wildcard suppressor catches reflex activations.
+        // helper windows. Wrap so callers see them in the result suffix.
+        // Background delivery suppresses only reflex activation of the target;
+        // foreground delivery owns its intentional activation and restoration.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let foreground = delivery_mode.is_foreground();
+        let snapshot = if foreground {
+            WindowChangeDetector::snapshot_without_suppression(prior_front)
+        } else {
+            WindowChangeDetector::snapshot_targeted(prior_front, pid)
+        };
 
         // Terminal-emulator short-circuit: when the target pid belongs
         // to a known terminal (Ghostty / Terminal.app / iTerm2 / …), the
@@ -403,7 +409,8 @@ impl Tool for TypeTextTool {
 
         let blocking_policy = keyboard_policy.clone();
         let result = focus_guard::with_focus_suppressed(
-            Some(pid),
+            // The observation snapshot owns the canonical target-only lease.
+            None,
             prior_front,
             "type_text.AXSelectedText",
             || async move {
