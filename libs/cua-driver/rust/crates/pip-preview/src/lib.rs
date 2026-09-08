@@ -267,6 +267,9 @@ pub const MAX_VISIBLE_PIP_CARDS: usize = 5;
 pub struct PipTarget {
     pub pid: i64,
     pub window_id: u64,
+    /// Internal runtime session that most recently published this card.
+    /// Kept out of the rendered UI and used only for lifecycle cleanup.
+    pub session_id: Option<String>,
     pub app_name: String,
     pub window_title: Option<String>,
 }
@@ -353,6 +356,37 @@ impl PipViewModel {
         removed
     }
 
+    /// Drop cards whose exact native window is no longer present in the
+    /// platform's current window inventory. Returns the removed app pids so a
+    /// backend can stop their live capture resources outside the model lock.
+    pub fn retain_live_targets(
+        &mut self,
+        mut target_is_live: impl FnMut(&PipTarget) -> bool,
+    ) -> Vec<i64> {
+        let removed = self
+            .publication_order
+            .iter()
+            .copied()
+            .filter(|pid| {
+                self.frames_by_pid
+                    .get(pid)
+                    .is_some_and(|frame| !target_is_live(&frame.target))
+            })
+            .collect::<Vec<_>>();
+        for pid in &removed {
+            self.frames_by_pid.remove(pid);
+        }
+        if !removed.is_empty() {
+            self.publication_order.retain(|pid| !removed.contains(pid));
+        }
+        removed
+    }
+
+    /// Remove every card last published by an ended runtime session.
+    pub fn remove_session(&mut self, session_id: &str) -> Vec<i64> {
+        self.retain_live_targets(|target| target.session_id.as_deref() != Some(session_id))
+    }
+
     /// Move an existing app to the front of the visual card stack.
     ///
     /// The platform renderer paints publication order back-to-front, so the
@@ -406,6 +440,9 @@ pub trait PipBackend: Send + Sync {
     /// must not synchronously capture on the caller's tool-dispatch path.
     fn ensure_target(&self, _target: PipTarget) {}
 
+    /// Remove cards owned by a runtime session that has ended.
+    fn end_session(&self, _session_id: &str) {}
+
     /// Synchronously make the presentation input-transparent while Computer
     /// Use performs a physical desktop action. This prevents an overlapping
     /// card from intercepting a click intended for the controlled app.
@@ -453,6 +490,7 @@ mod tests {
             target: PipTarget {
                 pid,
                 window_id,
+                session_id: Some("session-a".to_owned()),
                 app_name: format!("app-{pid}"),
                 window_title: None,
             },
@@ -525,5 +563,56 @@ mod tests {
             .map(|frame| frame.target.pid)
             .collect::<Vec<_>>();
         assert_eq!(order, vec![1, 2]);
+    }
+
+    #[test]
+    fn candidate_refresh_removes_closed_or_replaced_exact_windows() {
+        let mut model = PipViewModel::new(5);
+        model.upsert(frame(1, 11, 10));
+        model.upsert(frame(2, 22, 20));
+        model.upsert(frame(3, 33, 30));
+
+        let live = [(1, 11), (2, 99)];
+        let removed =
+            model.retain_live_targets(|target| live.contains(&(target.pid, target.window_id)));
+
+        assert_eq!(removed, vec![2, 3]);
+        assert_eq!(
+            model
+                .ordered_frames()
+                .iter()
+                .map(|frame| frame.target.pid)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn ending_a_session_removes_only_its_latest_cards() {
+        let mut model = PipViewModel::new(5);
+        model.upsert(frame(1, 11, 10));
+        let mut other = frame(2, 22, 20);
+        other.target.session_id = Some("session-b".to_owned());
+        model.upsert(other);
+
+        assert_eq!(model.remove_session("session-a"), vec![1]);
+        assert!(model.frame_for_app(1).is_none());
+        assert!(model.frame_for_app(2).is_some());
+        assert!(model.remove_session("missing").is_empty());
+    }
+
+    #[test]
+    fn same_app_window_refresh_remains_one_card_and_tracks_new_session() {
+        let mut model = PipViewModel::new(5);
+        model.upsert(frame(7, 70, 10));
+        let mut replacement = frame(7, 71, 20);
+        replacement.target.session_id = Some("session-b".to_owned());
+        assert!(model.upsert(replacement).window_changed);
+
+        assert_eq!(model.len(), 1);
+        let target = &model.frame_for_app(7).unwrap().target;
+        assert_eq!(target.window_id, 71);
+        assert_eq!(target.session_id.as_deref(), Some("session-b"));
+        assert!(model.remove_session("session-a").is_empty());
     }
 }

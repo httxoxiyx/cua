@@ -1701,7 +1701,11 @@ impl ToolRegistry {
                 png_bytes.is_some(),
             );
             if let Some((window_id, pid)) = pip_exact_native_target(&args) {
-                let target = pip_hook::PipHookTarget { pid, window_id };
+                let target = pip_hook::PipHookTarget {
+                    pid,
+                    window_id,
+                    session_id: runtime_session.clone(),
+                };
                 match (update, png_bytes) {
                     (PipUpdateKind::SeedObservation, Some(png_bytes)) => {
                         pip_hook::push_pip_frame(pip_hook::PipHookFrame {

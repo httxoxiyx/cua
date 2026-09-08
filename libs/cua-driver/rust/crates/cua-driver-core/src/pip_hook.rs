@@ -15,10 +15,11 @@
 
 use std::sync::OnceLock;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PipHookTarget {
     pub pid: i64,
     pub window_id: u64,
+    pub session_id: Option<String>,
 }
 
 /// Synthesized per-call frame payload. Kept structurally identical
@@ -34,6 +35,7 @@ pub struct PipHookFrame {
 pub enum PipHookEvent {
     Upsert(PipHookFrame),
     Ensure(PipHookTarget),
+    EndSession(String),
     SetInputPassthrough { passthrough: bool },
 }
 
@@ -58,7 +60,9 @@ static PIP_EVENT_FN: OnceLock<PipEventFnBox> = OnceLock::new();
 /// Register the platform-side push callback. `main.rs` calls this
 /// once after starting the PiP backend.
 pub fn set_pip_event_fn(f: impl Fn(PipHookEvent) -> Result<(), String> + Send + Sync + 'static) {
-    let _ = PIP_EVENT_FN.set(Box::new(f));
+    if PIP_EVENT_FN.set(Box::new(f)).is_ok() {
+        crate::session::register_session_end_hook(end_pip_session);
+    }
 }
 
 /// True when a PiP backend is wired up. Tool dispatcher uses this to
@@ -90,5 +94,12 @@ pub fn push_pip_frame(frame: PipHookFrame) {
 pub fn ensure_pip_target(target: PipHookTarget) {
     if let Some(f) = PIP_EVENT_FN.get() {
         let _ = f(PipHookEvent::Ensure(target));
+    }
+}
+
+/// Remove frames associated with an ended runtime session.
+pub fn end_pip_session(session_id: &str) {
+    if let Some(f) = PIP_EVENT_FN.get() {
+        let _ = f(PipHookEvent::EndSession(session_id.to_owned()));
     }
 }

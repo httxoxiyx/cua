@@ -266,6 +266,7 @@ fn maybe_init_pip() {
                                     target: pip_preview::PipTarget {
                                         pid: frame.target.pid,
                                         window_id: frame.target.window_id,
+                                        session_id: frame.target.session_id,
                                         app_name: String::new(),
                                         window_title: None,
                                     },
@@ -277,9 +278,13 @@ fn maybe_init_pip() {
                                 b.ensure_target(pip_preview::PipTarget {
                                     pid: target.pid,
                                     window_id: target.window_id,
+                                    session_id: target.session_id,
                                     app_name: String::new(),
                                     window_title: None,
                                 });
+                            }
+                            cua_driver_core::pip_hook::PipHookEvent::EndSession(session_id) => {
+                                b.end_session(&session_id);
                             }
                             cua_driver_core::pip_hook::PipHookEvent::SetInputPassthrough {
                                 passthrough,
