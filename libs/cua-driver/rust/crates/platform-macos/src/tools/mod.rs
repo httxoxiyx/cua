@@ -777,6 +777,12 @@ pub struct ToolState {
     pub cursor_registry: Arc<CursorRegistry>,
     pub zoom_registry: Arc<ZoomRegistry>,
     pub resize_registry: Arc<ResizeRegistry>,
+    /// A full observation may discover that the host application's current
+    /// modal UI lives in an out-of-process AppKit view service.  Keep that
+    /// exact, revalidated alias so TBH-style wrappers can continue addressing
+    /// the stable host pid/window while explicit foreground keyboard actions
+    /// reach the transient that was actually shown to the model.
+    pub(crate) transient_ui_registry: Arc<crate::transient_ui::TransientUiRegistry>,
     /// Global, disk-persisted config — the base layer and the only one the
     /// anonymous session / CLI writes.
     pub config: Arc<std::sync::RwLock<DriverConfig>>,
@@ -816,6 +822,7 @@ impl ToolState {
             cursor_registry: Arc::new(CursorRegistry::new()),
             zoom_registry: Arc::new(ZoomRegistry::new()),
             resize_registry: Arc::new(ResizeRegistry::new()),
+            transient_ui_registry: Arc::new(crate::transient_ui::TransientUiRegistry::new()),
             // Load persisted config from ~/.cua-driver/config.json so that
             // `cua-driver config set` changes carry over into MCP sessions.
             config: Arc::new(std::sync::RwLock::new(load_driver_config())),
@@ -826,6 +833,327 @@ impl ToolState {
             host_bundle_id,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ForegroundKeyboardTarget {
+    pub(crate) pid: i32,
+    pub(crate) window_id: Option<u32>,
+    pub(crate) transient_route: Option<crate::transient_ui::TransientRoute>,
+}
+
+/// Resolve the exact keyboard target for an explicit foreground action.
+///
+/// Background calls never enter this function, preserving the normal
+/// background-first contract.  A stale helper alias is a hard stop rather than
+/// a fallback to the host window, because that fallback could type into a
+/// previously focused host control (for example Shortcuts' Search Actions).
+pub(crate) async fn resolve_foreground_keyboard_target(
+    state: &ToolState,
+    session: &crate::transient_ui::TransientSessionKey,
+    pid: i32,
+    window_id: Option<u32>,
+    has_explicit_element_or_point: bool,
+) -> Result<ForegroundKeyboardTarget, cua_driver_core::protocol::ToolResult> {
+    if tokio::task::spawn_blocking(move || {
+        crate::transient_ui::is_trusted_transient_helper_process(pid)
+    })
+    .await
+    .unwrap_or(true)
+    {
+        return Err(transient_ui_direct_target_refusal(pid, window_id));
+    }
+    let Some(source_window_id) = window_id else {
+        let detection = tokio::task::spawn_blocking(move || {
+            crate::transient_ui::detect_any_visible_transient_helper_for_host(pid)
+        })
+        .await;
+        return match detection {
+            Ok(detection) if detection.helper_is_visible() => {
+                Err(transient_ui_unobserved_refusal(pid, 0, detection))
+            }
+            Ok(_) => Ok(ForegroundKeyboardTarget {
+                pid,
+                window_id,
+                transient_route: None,
+            }),
+            Err(error) => Err(cua_driver_core::protocol::ToolResult::error(format!(
+                "Could not check for transient UI before foreground keyboard delivery: {error}"
+            ))),
+        };
+    };
+    let source = crate::transient_ui::WindowTarget {
+        pid,
+        window_id: source_window_id,
+    };
+    let registry = state.transient_ui_registry.clone();
+    let session_for_lookup = session.clone();
+    let resolution =
+        tokio::task::spawn_blocking(move || registry.resolve_live(&session_for_lookup, source))
+            .await;
+    match resolution {
+        Ok(crate::transient_ui::RouteResolution::None) => {
+            let detection = tokio::task::spawn_blocking(move || {
+                crate::transient_ui::detect_visible_transient_helper(source)
+            })
+            .await;
+            match detection {
+                Ok(detection) => foreground_keyboard_target_from_evidence(
+                    pid,
+                    source_window_id,
+                    crate::transient_ui::RouteResolution::None,
+                    Some(detection),
+                    has_explicit_element_or_point,
+                    cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite(
+                    ),
+                ),
+                Err(error) => Err(cua_driver_core::protocol::ToolResult::error(format!(
+                    "Could not check for transient UI before foreground keyboard delivery: {error}"
+                ))),
+            }
+        }
+        Ok(resolution) => foreground_keyboard_target_from_evidence(
+            pid,
+            source_window_id,
+            resolution,
+            None,
+            has_explicit_element_or_point,
+            cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite(),
+        ),
+        Err(error) => Err(cua_driver_core::protocol::ToolResult::error(format!(
+            "Could not revalidate transient UI routing: {error}"
+        ))),
+    }
+}
+
+fn foreground_keyboard_target_from_evidence(
+    pid: i32,
+    window_id: u32,
+    resolution: crate::transient_ui::RouteResolution,
+    fresh_detection: Option<crate::transient_ui::TransientHelperDetection>,
+    has_explicit_element_or_point: bool,
+    target_rewrite_allowed: bool,
+) -> Result<ForegroundKeyboardTarget, cua_driver_core::protocol::ToolResult> {
+    match resolution {
+        crate::transient_ui::RouteResolution::None => {
+            let detection = fresh_detection
+                .unwrap_or(crate::transient_ui::TransientHelperDetection::None);
+            if detection.helper_is_visible() {
+                return Err(transient_ui_unobserved_refusal(pid, window_id, detection));
+            }
+            Ok(ForegroundKeyboardTarget {
+                pid,
+                window_id: Some(window_id),
+                transient_route: None,
+            })
+        }
+        crate::transient_ui::RouteResolution::Live(route) => {
+            if !target_rewrite_allowed {
+                return Err(transient_ui_policy_refusal(
+                    route.source.pid,
+                    route.source.window_id,
+                ));
+            }
+            if has_explicit_element_or_point {
+                return Err(
+                    cua_driver_core::protocol::ToolResult::error(
+                        "The host currently presents an observed transient helper, so an element- or point-addressed foreground keyboard action cannot be safely redirected. Re-observe and use an unaddressed foreground type_text/press_key call; no input was sent.",
+                    )
+                    .with_structured(serde_json::json!({
+                        "code": "transient_ui_explicit_target_unsupported",
+                        "effect": "refused",
+                        "pid": route.source.pid,
+                        "window_id": route.source.window_id,
+                        "observed_transient_pid": route.target.pid,
+                        "observed_transient_window_id": route.target.window_id,
+                        "retryable": true,
+                    })),
+                );
+            }
+            Ok(ForegroundKeyboardTarget {
+                pid: route.target.pid,
+                window_id: Some(route.target.window_id),
+                transient_route: Some(route),
+            })
+        }
+        crate::transient_ui::RouteResolution::Stale(route) => Err(
+            cua_driver_core::protocol::ToolResult::error(
+                "The observed transient UI closed or changed before foreground keyboard delivery. Re-observe the host app before retrying; no input was sent.",
+            )
+            .with_structured(serde_json::json!({
+                "code": "transient_ui_stale",
+                "effect": "refused",
+                "pid": route.source.pid,
+                "window_id": route.source.window_id,
+                "observed_transient_pid": route.target.pid,
+                "observed_transient_window_id": route.target.window_id,
+                "retryable": true,
+                "suggestion": "Call get_window_state for the host app again before retrying."
+            })),
+        ),
+    }
+}
+
+pub(crate) fn transient_ui_policy_refusal(
+    pid: i32,
+    window_id: u32,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "The requested host is authorized, but its transient helper is a different protected target. This authorization mode cannot safely inherit the host grant; no helper content was observed and no input was sent.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "transient_ui_target_reauthorization_required",
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "retryable": false,
+        "reason": "bounded mode and capability manifests require exact protected-resource authorization before target substitution"
+    }))
+}
+
+pub(crate) fn transient_ui_direct_target_refusal(
+    pid: i32,
+    window_id: Option<u32>,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "A transient helper is not a public application target. Address the original host app/window and re-observe it before input; no action was sent.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "transient_ui_direct_target_unsupported",
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "retryable": true,
+        "suggestion": "Use the original host pid/window_id from get_window_state, never transient_ui.visual_target directly."
+    }))
+}
+
+pub(crate) async fn guard_transient_pointer_target(
+    state: &ToolState,
+    session: &crate::transient_ui::TransientSessionKey,
+    pid: i32,
+    window_id: Option<u32>,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    if tokio::task::spawn_blocking(move || {
+        crate::transient_ui::is_trusted_transient_helper_process(pid)
+    })
+    .await
+    .unwrap_or(true)
+    {
+        return Err(transient_ui_pointer_refusal(pid, window_id, false));
+    }
+    let Some(window_id) = window_id else {
+        let detection = tokio::task::spawn_blocking(move || {
+            crate::transient_ui::detect_any_visible_transient_helper_for_host(pid)
+        })
+        .await
+        .map_err(|error| {
+            cua_driver_core::protocol::ToolResult::error(format!(
+                "Could not check for transient UI before pointer delivery: {error}"
+            ))
+        })?;
+        return if detection.helper_is_visible() {
+            Err(transient_ui_pointer_refusal(pid, None, false))
+        } else {
+            Ok(())
+        };
+    };
+
+    let source = crate::transient_ui::WindowTarget { pid, window_id };
+    let registry = state.transient_ui_registry.clone();
+    let session = session.clone();
+    let resolution = tokio::task::spawn_blocking(move || registry.resolve_live(&session, source))
+        .await
+        .map_err(|error| {
+            cua_driver_core::protocol::ToolResult::error(format!(
+                "Could not revalidate transient UI before pointer delivery: {error}"
+            ))
+        })?;
+    match resolution {
+        crate::transient_ui::RouteResolution::None => {
+            let detection = tokio::task::spawn_blocking(move || {
+                crate::transient_ui::detect_visible_transient_helper(source)
+            })
+            .await
+            .map_err(|error| {
+                cua_driver_core::protocol::ToolResult::error(format!(
+                    "Could not check for transient UI before pointer delivery: {error}"
+                ))
+            })?;
+            transient_pointer_target_from_evidence(
+                pid,
+                Some(window_id),
+                resolution,
+                Some(detection),
+            )
+        }
+        resolution => {
+            transient_pointer_target_from_evidence(pid, Some(window_id), resolution, None)
+        }
+    }
+}
+
+fn transient_pointer_target_from_evidence(
+    pid: i32,
+    window_id: Option<u32>,
+    resolution: crate::transient_ui::RouteResolution,
+    fresh_detection: Option<crate::transient_ui::TransientHelperDetection>,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    match resolution {
+        crate::transient_ui::RouteResolution::Live(_)
+        | crate::transient_ui::RouteResolution::Stale(_) => {
+            Err(transient_ui_pointer_refusal(pid, window_id, true))
+        }
+        crate::transient_ui::RouteResolution::None => {
+            if fresh_detection.is_some_and(|detection| detection.helper_is_visible()) {
+                Err(transient_ui_pointer_refusal(pid, window_id, false))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn transient_ui_pointer_refusal(
+    pid: i32,
+    window_id: Option<u32>,
+    previously_observed: bool,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "The requested host currently presents a transient helper whose screenshot coordinates and AX elements are not valid host pointer targets. No pointer input was sent.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "transient_ui_pointer_unsupported",
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "previously_observed": previously_observed,
+        "retryable": true,
+        "suggestion": "Use an unaddressed foreground keyboard action against the host, or close the transient helper and re-observe before using pointer input."
+    }))
+}
+
+fn transient_ui_unobserved_refusal(
+    pid: i32,
+    window_id: u32,
+    detection: crate::transient_ui::TransientHelperDetection,
+) -> cua_driver_core::protocol::ToolResult {
+    let ambiguous = matches!(
+        detection,
+        crate::transient_ui::TransientHelperDetection::Ambiguous
+    );
+    cua_driver_core::protocol::ToolResult::error(
+        "A trusted transient helper is visible, but this session has not successfully observed it. Re-observe the host app before retrying; no input was sent.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "transient_ui_unobserved",
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "ambiguous": ambiguous,
+        "retryable": true,
+        "suggestion": "Call get_window_state for this host app/window in the same session before retrying."
+    }))
 }
 
 /// Read the logical pointer remembered for the caller's own session without
@@ -933,9 +1261,11 @@ pub fn register_all(
     {
         let session_config = state.session_config.clone();
         let cursor_registry = state.cursor_registry.clone();
+        let transient_ui_registry = state.transient_ui_registry.clone();
         let registration =
             cua_driver_core::session::register_scoped_session_end_hook(move |session_id| {
                 session_config.clear(session_id);
+                transient_ui_registry.clear_session(session_id);
                 // Per-session agent cursor: the session_id is the cursor key when
                 // the caller gave no explicit cursor_id, so dropping it here both
                 // prunes the metadata registry and stops the overlay painting that
@@ -1194,6 +1524,172 @@ mod resize_registry_tests {
             reg.ratio(800, None),
             None,
             "disagreeing windows must not pick one arbitrarily"
+        );
+    }
+}
+
+#[cfg(test)]
+mod transient_keyboard_routing_tests {
+    use super::*;
+
+    fn error_code(result: cua_driver_core::protocol::ToolResult) -> String {
+        result
+            .structured_content
+            .and_then(|value| value.get("code").cloned())
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .expect("structured refusal code")
+    }
+
+    #[test]
+    fn visible_helper_without_same_session_observation_refuses_host_fallback() {
+        let helper = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let error = foreground_keyboard_target_from_evidence(
+            10,
+            100,
+            crate::transient_ui::RouteResolution::None,
+            Some(crate::transient_ui::TransientHelperDetection::Unique(
+                helper,
+            )),
+            false,
+            true,
+        )
+        .expect_err("unobserved helper must fail closed");
+        assert_eq!(error_code(error), "transient_ui_unobserved");
+    }
+
+    #[test]
+    fn no_visible_helper_keeps_the_normal_host_foreground_path() {
+        let target = foreground_keyboard_target_from_evidence(
+            10,
+            100,
+            crate::transient_ui::RouteResolution::None,
+            Some(crate::transient_ui::TransientHelperDetection::None),
+            false,
+            true,
+        )
+        .expect("ordinary host target");
+        assert_eq!(target.pid, 10);
+        assert_eq!(target.window_id, Some(100));
+        assert_eq!(target.transient_route, None);
+    }
+
+    #[test]
+    fn live_helper_route_is_refused_when_exact_policy_cannot_be_reauthorized() {
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let helper = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let error = foreground_keyboard_target_from_evidence(
+            source.pid,
+            source.window_id,
+            crate::transient_ui::RouteResolution::Live(crate::transient_ui::TransientRoute {
+                source,
+                target: helper,
+            }),
+            None,
+            false,
+            false,
+        )
+        .expect_err("manifest/bounded routing must fail closed");
+        assert_eq!(
+            error_code(error),
+            "transient_ui_target_reauthorization_required"
+        );
+    }
+
+    #[test]
+    fn stale_then_removed_route_still_refuses_a_visible_unobserved_helper() {
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let helper = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let first = foreground_keyboard_target_from_evidence(
+            source.pid,
+            source.window_id,
+            crate::transient_ui::RouteResolution::Stale(crate::transient_ui::TransientRoute {
+                source,
+                target: helper,
+            }),
+            None,
+            false,
+            true,
+        )
+        .expect_err("stale route must refuse");
+        assert_eq!(error_code(first), "transient_ui_stale");
+
+        let second = foreground_keyboard_target_from_evidence(
+            source.pid,
+            source.window_id,
+            crate::transient_ui::RouteResolution::None,
+            Some(crate::transient_ui::TransientHelperDetection::Unique(
+                helper,
+            )),
+            false,
+            true,
+        )
+        .expect_err("fresh detection must prevent host fallback after stale cleanup");
+        assert_eq!(error_code(second), "transient_ui_unobserved");
+    }
+
+    #[test]
+    fn transient_pointer_surface_is_never_exposed_as_host_coordinates() {
+        let refusal = transient_ui_pointer_refusal(10, Some(100), true);
+        let structured = refusal.structured_content.unwrap();
+        assert_eq!(structured["code"], "transient_ui_pointer_unsupported");
+        assert_eq!(structured["pid"], 10);
+        assert_eq!(structured["window_id"], 100);
+        assert_eq!(structured["previously_observed"], true);
+
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let target = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        assert!(transient_pointer_target_from_evidence(
+            10,
+            Some(100),
+            crate::transient_ui::RouteResolution::Live(crate::transient_ui::TransientRoute {
+                source,
+                target,
+            }),
+            None,
+        )
+        .is_err());
+        assert!(transient_pointer_target_from_evidence(
+            10,
+            Some(100),
+            crate::transient_ui::RouteResolution::None,
+            Some(crate::transient_ui::TransientHelperDetection::Unique(
+                target,
+            )),
+        )
+        .is_err());
+        assert!(transient_pointer_target_from_evidence(
+            10,
+            Some(100),
+            crate::transient_ui::RouteResolution::None,
+            Some(crate::transient_ui::TransientHelperDetection::None),
+        )
+        .is_ok());
+
+        let direct = transient_ui_direct_target_refusal(20, Some(200));
+        assert_eq!(
+            direct.structured_content.unwrap()["code"],
+            "transient_ui_direct_target_unsupported"
         );
     }
 }

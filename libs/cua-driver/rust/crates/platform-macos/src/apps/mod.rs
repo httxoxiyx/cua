@@ -635,6 +635,31 @@ pub fn frontmost_pid() -> Option<i32> {
     }
 }
 
+/// Whether `pid` is a non-regular AppKit process that may host a transient UI
+/// surface for another application.  These processes stay out of `list_apps`;
+/// this predicate is used only after WindowServer has supplied a tightly
+/// associated helper-window candidate.
+pub(crate) fn is_auxiliary_application(pid: i32) -> bool {
+    use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
+    unsafe {
+        let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
+            return false;
+        };
+        !app.isTerminated() && app.activationPolicy() != NSApplicationActivationPolicy::Regular
+    }
+}
+
+pub(crate) fn is_active_auxiliary_application(pid: i32) -> bool {
+    use objc2_app_kit::NSRunningApplication;
+    if !is_auxiliary_application(pid) {
+        return false;
+    }
+    unsafe {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .is_some_and(|app| app.isActive())
+    }
+}
+
 /// Re-activate the app with `pid` via
 /// `NSRunningApplication.runningApplicationWithProcessIdentifier(pid)?.activateWithOptions([])`.
 /// Returns `true` if the app was found and activate was attempted.
@@ -667,6 +692,20 @@ pub fn bundle_id_for_pid(pid: i32) -> Option<String> {
         let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
         let ns = app.bundleIdentifier()?;
         Some(ns.to_string())
+    }
+}
+
+/// Return the live process executable path reported by NSRunningApplication.
+/// Used only for narrow system-helper identity checks; unlike application
+/// launch resolution, this is the already-running executable and does not
+/// need LaunchServices alias preservation.
+pub(crate) fn executable_path_for_pid(pid: i32) -> Option<String> {
+    use objc2_app_kit::NSRunningApplication;
+    unsafe {
+        let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
+        let url = app.executableURL()?;
+        let path = url.path()?;
+        Some(path.to_string())
     }
 }
 

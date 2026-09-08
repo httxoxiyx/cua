@@ -52,7 +52,13 @@ fn def() -> &'static ToolDef {
             refused with `window_id_not_found`, and one owned by another process is \
             refused with `window_owner_pid_mismatch` naming the real `owner_pid` to retry \
             with (macOS hosts a sandboxed app's Open/Save panel out-of-process, so its \
-            window belongs to the panel service, not the app). If the window is live under \
+            window belongs to the panel service, not the app). When the requested Shortcuts \
+            host window has its trusted system WorkflowKit view-service modal visible, \
+            this call observes that transient surface and reports `transient_ui`; callers \
+            may keep using the host target for a subsequent unaddressed foreground \
+            type_text/press_key/hotkey action. Helper AX elements and screenshot coordinates \
+            are intentionally non-actionable; pointer calls fail closed. The helper remains \
+            absent from app inventory. If the window is live under \
             this pid but its accessibility surface can't be resolved, the tree comes back \
             EMPTY with `degraded_reason: ax_window_unresolved` and the screenshot of the \
             requested window — act by pixel there. This tool never returns another \
@@ -134,6 +140,114 @@ fn observation_plan(
         Err(NO_OBSERVATION_CONTENT)
     } else {
         Ok(plan)
+    }
+}
+
+fn begin_transient_observation(
+    registry: &crate::transient_ui::TransientUiRegistry,
+    session: &crate::transient_ui::TransientSessionKey,
+    source: crate::transient_ui::WindowTarget,
+    observation_only: bool,
+) -> Option<crate::transient_ui::WindowTarget> {
+    if !observation_only {
+        // Revoke first. Every early return below therefore leaves no stale
+        // keyboard authorization from an older successful observation.
+        registry.clear_route(session, source)
+    } else {
+        None
+    }
+}
+
+fn invalidate_observation_target_state(
+    state: &ToolState,
+    target: crate::transient_ui::WindowTarget,
+) {
+    state
+        .element_cache
+        .update(target.pid, target.window_id, &[]);
+    state
+        .resize_registry
+        .clear_ratio(target.pid, target.window_id);
+    // Mint an unexposed empty generation to invalidate every previously
+    // published token for this exact target. No token for this generation is
+    // returned to the caller.
+    cua_driver_core::element_token::global().register_snapshot(target.pid, target.window_id, 0);
+}
+
+fn transient_target_from_detection(
+    detection: crate::transient_ui::TransientHelperDetection,
+    source: crate::transient_ui::WindowTarget,
+    rewrite_allowed: bool,
+) -> Result<Option<crate::transient_ui::WindowTarget>, ToolResult> {
+    match detection {
+        crate::transient_ui::TransientHelperDetection::None => Ok(None),
+        crate::transient_ui::TransientHelperDetection::Unique(target) if rewrite_allowed => {
+            Ok(Some(target))
+        }
+        crate::transient_ui::TransientHelperDetection::Unique(_) => {
+            Err(super::transient_ui_policy_refusal(source.pid, source.window_id))
+        }
+        crate::transient_ui::TransientHelperDetection::Ambiguous => Err(
+            ToolResult::error(
+                "Multiple trusted transient helper surfaces match the requested host window. The observation is ambiguous and was refused.",
+            )
+            .with_structured(serde_json::json!({
+                "code": "transient_ui_ambiguous",
+                "effect": "refused",
+                "pid": source.pid,
+                "window_id": source.window_id,
+                "retryable": true,
+                "suggestion": "Close the extra modal surface, then call get_window_state again."
+            })),
+        ),
+    }
+}
+
+fn apply_transient_observation_contract(
+    structured: &mut serde_json::Value,
+    source: crate::transient_ui::WindowTarget,
+    target: crate::transient_ui::WindowTarget,
+) {
+    // The stable public target remains the caller-authorized host. The helper
+    // is deliberately nested as a non-actionable visual surface so clients do
+    // not feed its pid/window or screenshot coordinates back into ordinary
+    // click/AX APIs.
+    structured["pid"] = serde_json::json!(source.pid);
+    structured["window_id"] = serde_json::json!(source.window_id);
+    structured["transient_ui"] = serde_json::json!({
+        "routed": true,
+        "host_pid": source.pid,
+        "host_window_id": source.window_id,
+        "host_target": {
+            "pid": source.pid,
+            "window_id": source.window_id
+        },
+        "visual_target": {
+            "pid": target.pid,
+            "window_id": target.window_id,
+            "screenshot_visible": true,
+            "pixel_actions_supported": false,
+            "ax_actions_supported": false
+        },
+        "input_policy": "foreground_keyboard_only",
+        "reason": "visible out-of-process modal helper associated with the requested host window",
+        "action_guidance": "Keep using the host pid/window_id. Only an unaddressed type_text, press_key, or hotkey with delivery_mode:\"foreground\" may be routed after revalidation; do not use screenshot coordinates, element_index, element_token, or the helper target directly."
+    });
+    structured["screenshot_target"] = serde_json::json!("transient_ui.visual_target");
+    structured["_note"] = serde_json::json!(
+        "This response keeps the requested host as the public target. The image shows transient_ui.visual_target for visual verification only; no actionable AX elements or pixel coordinate target are published for that helper."
+    );
+}
+
+fn commit_transient_observation(
+    registry: &crate::transient_ui::TransientUiRegistry,
+    session: &crate::transient_ui::TransientSessionKey,
+    source: crate::transient_ui::WindowTarget,
+    target: crate::transient_ui::WindowTarget,
+    observation_only: bool,
+) {
+    if !observation_only {
+        registry.record(session, source, Some(target));
     }
 }
 
@@ -234,14 +348,65 @@ impl Tool for GetWindowStateTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
-        let pid = match args.require_i32("pid") {
+        let requested_pid = match args.require_i32("pid") {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let window_id = match args.require_u32("window_id") {
+        let requested_window_id = match args.require_u32("window_id") {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let direct_helper = tokio::task::spawn_blocking(move || {
+            crate::transient_ui::is_trusted_transient_helper_process(requested_pid)
+        })
+        .await;
+        match direct_helper {
+            Ok(true) => {
+                return super::transient_ui_direct_target_refusal(
+                    requested_pid,
+                    Some(requested_window_id),
+                )
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "Could not validate the requested observation target: {error}"
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "transient_ui_resolution_failed",
+                    "effect": "refused",
+                    "pid": requested_pid,
+                    "window_id": requested_window_id,
+                    "retryable": true
+                }))
+            }
+        }
+        // Internal direct-tool mode used by verify_state. Registry ingress
+        // strips underscore-prefixed arguments before public dispatch; only
+        // a trusted direct in-process invocation can enable this mode.
+        let observation_only = args
+            .get("_observation_only")
+            .and_then(|value| value.as_bool())
+            == Some(true);
+        let transient_session = crate::transient_ui::TransientSessionKey::from_args(&args);
+        let source_target = crate::transient_ui::WindowTarget {
+            pid: requested_pid,
+            window_id: requested_window_id,
+        };
+        let previous_transient_target = begin_transient_observation(
+            &self.state.transient_ui_registry,
+            &transient_session,
+            source_target,
+            observation_only,
+        );
+        if !observation_only {
+            invalidate_observation_target_state(&self.state, source_target);
+            if let Some(previous) = previous_transient_target {
+                if previous != source_target {
+                    invalidate_observation_target_state(&self.state, previous);
+                }
+            }
+        }
 
         // Issue #2237: pre-flight the requested window against WindowServer
         // BEFORE the (up to 20 s) AX walk. An id that no window carries, or
@@ -253,19 +418,63 @@ impl Tool for GetWindowStateTool {
         // shape is routine, and the caller must be told the real owner pid.
         {
             let owner = match tokio::task::spawn_blocking(move || {
-                crate::windows::resolve_window_owner(pid, window_id)
+                crate::windows::resolve_window_owner(requested_pid, requested_window_id)
             })
             .await
             {
                 Ok(owner) => owner,
-                Err(e) => return window_owner_resolution_failure(pid, window_id, e.to_string()),
+                Err(e) => {
+                    return window_owner_resolution_failure(
+                        requested_pid,
+                        requested_window_id,
+                        e.to_string(),
+                    )
+                }
             };
             if let Some(scope) = crate::ax::window_scope::scope_from_owner(&owner) {
-                if let Some(refusal) = window_scope_refusal(pid, window_id, &scope) {
+                if let Some(refusal) =
+                    window_scope_refusal(requested_pid, requested_window_id, &scope)
+                {
                     return refusal;
                 }
             }
         }
+
+        // A modal UI can be rendered by an AppKit/XPC helper while the
+        // public app identity and cached host window remain stable. Resolve
+        // only the explicitly trusted Shortcuts → system WorkflowKit service
+        // pair, then additionally require matching WindowServer name/title,
+        // modal layer, and containment. This does not add the helper to
+        // list_apps.
+        let transient_detection = tokio::task::spawn_blocking(move || {
+            crate::transient_ui::detect_visible_transient_helper(source_target)
+        })
+        .await;
+        let transient_target = match transient_detection {
+            Ok(detection) => match transient_target_from_detection(
+                detection,
+                source_target,
+                cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite(),
+            ) {
+                Ok(target) => target,
+                Err(refusal) => return refusal,
+            },
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "Could not resolve transient UI for the requested host window: {error}"
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "transient_ui_resolution_failed",
+                    "effect": "refused",
+                    "pid": requested_pid,
+                    "window_id": requested_window_id,
+                    "retryable": true
+                }))
+            }
+        };
+        let (pid, window_id) = transient_target
+            .map(|target| (target.pid, target.window_id))
+            .unwrap_or((requested_pid, requested_window_id));
 
         let query = args.opt_str("query");
         let screenshot_out_file = args.opt_str("screenshot_out_file").map(|s| {
@@ -305,13 +514,19 @@ impl Tool for GetWindowStateTool {
                 }))
             }
         };
-        // Internal direct-tool mode used by verify_state. Registry ingress
-        // strips underscore-prefixed arguments before public dispatch; only
-        // a trusted direct in-process invocation can enable this mode.
-        let observation_only = args
-            .get("_observation_only")
-            .and_then(|value| value.as_bool())
-            == Some(true);
+        if transient_target.is_some() && !plan.include_screenshot {
+            return ToolResult::error(
+                "A trusted transient helper is visible, but helper AX elements are intentionally non-actionable. Re-call with include_screenshot:true to observe its visual surface safely.",
+            )
+            .with_structured(serde_json::json!({
+                "code": "transient_ui_requires_visual_observation",
+                "effect": "refused",
+                "pid": requested_pid,
+                "window_id": requested_window_id,
+                "retryable": true,
+                "suggestion": "Call get_window_state again with include_screenshot:true."
+            }));
+        }
         // Optional caps — when omitted, fall back to the defaults baked into
         // the AX walker (#22865). minimum:1 keyed in the schema, but defend
         // against 0 here as well so a misbehaving client can't disable the
@@ -332,7 +547,7 @@ impl Tool for GetWindowStateTool {
         // either. Default latency becomes approximately max(tree, screenshot)
         // instead of their sum.
         let tree_branch = async {
-            if !plan.include_elements {
+            if !plan.include_elements || transient_target.is_some() {
                 return Ok::<Option<crate::ax::tree::TreeWalkResult>, ToolResult>(None);
             }
             let q = query.clone();
@@ -394,6 +609,34 @@ impl Tool for GetWindowStateTool {
         };
         let (captured_screenshot, screenshot_frame_error) = screenshot_result;
 
+        if let Some(target) = transient_target {
+            // Re-prove the association before any file, cache, token, resize,
+            // route, or response state is committed. The capture itself is
+            // side-effect free; everything after this point can safely use the
+            // same validated physical surface.
+            let final_detection = tokio::task::spawn_blocking(move || {
+                crate::transient_ui::detect_visible_transient_helper(source_target)
+            })
+            .await;
+            if !matches!(
+                final_detection,
+                Ok(crate::transient_ui::TransientHelperDetection::Unique(current))
+                    if current == target
+            ) {
+                return ToolResult::error(
+                    "The transient helper changed or closed while it was being observed. Re-observe the host app; no foreground input route was retained.",
+                )
+                .with_structured(serde_json::json!({
+                    "code": "transient_ui_changed_during_observation",
+                    "effect": "refused",
+                    "pid": requested_pid,
+                    "window_id": requested_window_id,
+                    "retryable": true,
+                    "suggestion": "Call get_window_state for the host app again."
+                }));
+            }
+        }
+
         // Re-prove the exact native owner after the pixels were captured and
         // before any image/file-path is returned. A CGWindowID can disappear
         // or be recycled while the AX walk and screenshot run in parallel;
@@ -434,7 +677,7 @@ impl Tool for GetWindowStateTool {
                 // Record resize ratio so ClickTool can scale screenshot-space
                 // coordinates back up. This happens only after the exact
                 // post-capture ownership proof succeeds.
-                if !observation_only {
+                if !observation_only && transient_target.is_none() {
                     if let Some(original_width) = original_width {
                         if width > 0 {
                             self.state.resize_registry.set_ratio(
@@ -478,23 +721,38 @@ impl Tool for GetWindowStateTool {
         // For an unresolved scope, replace any prior entry with an empty
         // snapshot so a stale index map cannot be clicked through either.
         if !observation_only {
-            match tree_result.as_ref() {
-                Some(result) if scope_matched => {
-                    self.state
-                        .element_cache
-                        .update(pid, window_id, &result.nodes);
-                }
-                _ => {
-                    // A screenshot-only observation intentionally creates no
-                    // new AX binding. Empty the old cache so integer indices
-                    // from an earlier frame cannot be replayed after the UI
-                    // may have changed.
-                    self.state.element_cache.update(pid, window_id, &[]);
+            if transient_target.is_some() {
+                // A helper screenshot is visual evidence only. Never publish
+                // or retain its AX rows as an actionable surface: callers must
+                // continue using the host target, and the only supported input
+                // is an unaddressed foreground keyboard action.
+                invalidate_observation_target_state(
+                    &self.state,
+                    crate::transient_ui::WindowTarget { pid, window_id },
+                );
+            } else {
+                match tree_result.as_ref() {
+                    Some(result) if scope_matched => {
+                        self.state
+                            .element_cache
+                            .update(pid, window_id, &result.nodes);
+                    }
+                    _ => {
+                        // A screenshot-only observation intentionally creates no
+                        // new AX binding. Empty the old cache so integer indices
+                        // from an earlier frame cannot be replayed after the UI
+                        // may have changed.
+                        self.state.element_cache.update(pid, window_id, &[]);
+                    }
                 }
             }
         }
 
-        if screenshot.is_none() && plan.include_screenshot && !observation_only {
+        if screenshot.is_none()
+            && plan.include_screenshot
+            && !observation_only
+            && transient_target.is_none()
+        {
             self.state.resize_registry.clear_ratio(pid, window_id);
         }
 
@@ -509,6 +767,11 @@ impl Tool for GetWindowStateTool {
 
         // Build response.
         let mut content: Vec<Content> = Vec::new();
+        let published_tree_result = if transient_target.is_some() {
+            None
+        } else {
+            tree_result.as_ref()
+        };
 
         if let Some((b64_opt, _file_path, w, h, _bounds, _scale)) = screenshot {
             if let Some(b64) = b64_opt {
@@ -516,23 +779,32 @@ impl Tool for GetWindowStateTool {
             }
 
             // Summary text line (matching Swift reference format).
-            let element_count = tree_result
-                .as_ref()
+            let element_count = published_tree_result
                 .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
                 .unwrap_or(0);
-            let summary = if let Some(ref r) = tree_result {
+            let target_summary = transient_target.map_or_else(
+                || format!("window_id={requested_window_id} pid={requested_pid}"),
+                |target| {
+                    format!(
+                        "window_id={requested_window_id} pid={requested_pid} \
+                         visual_target_window_id={} visual_target_pid={}",
+                        target.window_id, target.pid
+                    )
+                },
+            );
+            let summary = if let Some(r) = published_tree_result {
                 format!(
-                    "window_id={window_id} pid={pid} size={}x{} elements={element_count}\n\n{}",
+                    "{target_summary} size={}x{} elements={element_count}\n\n{}",
                     w, h, r.tree_markdown
                 )
             } else {
-                format!("window_id={window_id} pid={pid} size={}x{}", w, h)
+                format!("{target_summary} size={}x{}", w, h)
             };
             content.push(Content::text(summary));
-        } else if let Some(ref r) = tree_result {
+        } else if let Some(r) = published_tree_result {
             let element_count = r.nodes.iter().filter(|n| n.element_index.is_some()).count();
             content.push(Content::text(format!(
-                "window_id={window_id} pid={pid} elements={element_count}\n\n{}",
+                "window_id={requested_window_id} pid={requested_pid} elements={element_count}\n\n{}",
                 r.tree_markdown
             )));
         }
@@ -549,12 +821,10 @@ impl Tool for GetWindowStateTool {
             );
         }
 
-        let element_count = tree_result
-            .as_ref()
+        let element_count = published_tree_result
             .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
             .unwrap_or(0);
-        let tree_md = tree_result
-            .as_ref()
+        let tree_md = published_tree_result
             .map(|r| r.tree_markdown.clone())
             .unwrap_or_default();
 
@@ -569,11 +839,14 @@ impl Tool for GetWindowStateTool {
         // Skipped entirely for an unresolved window scope: an element_token is
         // a promise that index N addresses a row of THIS window, and there is
         // no such row to promise (issue #2237).
-        let elem_count_for_snapshot = tree_result
-            .as_ref()
+        let elem_count_for_snapshot = published_tree_result
             .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
             .unwrap_or(0);
-        let snapshot_id = if plan.include_elements && scope_matched && !observation_only {
+        let snapshot_id = if plan.include_elements
+            && scope_matched
+            && !observation_only
+            && transient_target.is_none()
+        {
             Some(cua_driver_core::element_token::global().register_snapshot(
                 pid,
                 window_id,
@@ -589,7 +862,7 @@ impl Tool for GetWindowStateTool {
         // alongside for back-compat with existing text-parsing callers
         // (Hermes' regex parser, Codex, Claude Code) and is signalled as
         // preferred-for-back-compat-only via the `_note` field below.
-        let elements_json: Vec<serde_json::Value> = match (snapshot_id, tree_result.as_ref()) {
+        let elements_json: Vec<serde_json::Value> = match (snapshot_id, published_tree_result) {
             (Some(sid), Some(r)) => build_elements_array_with_token(&r.nodes, sid),
             (None, Some(r)) if scope_matched => build_elements_array(&r.nodes),
             _ => Vec::new(),
@@ -607,9 +880,9 @@ impl Tool for GetWindowStateTool {
         let elements_complete = false;
 
         let mut structured = serde_json::json!({
-            "window_id": window_id,
-            "pid": pid,
-            "elements_included": plan.include_elements,
+            "window_id": requested_window_id,
+            "pid": requested_pid,
+            "elements_included": plan.include_elements && transient_target.is_none(),
             "element_count": element_count,
             "total_element_count": element_count,
             "returned_element_count": filtered_element_count,
@@ -621,6 +894,9 @@ impl Tool for GetWindowStateTool {
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
                 AX walk on apps with very large trees."
         });
+        if let Some(target) = transient_target {
+            apply_transient_observation_contract(&mut structured, source_target, target);
+        }
         if query.is_some() {
             structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
         }
@@ -641,43 +917,78 @@ impl Tool for GetWindowStateTool {
         // the screenshot already in this response and click by pixel (x,y).
         // macOS can pixel-target in the background, so the recommendation is
         // `px`, not `foreground`.
-        match degradation_for(tree_result.is_some(), element_count, window_scope.as_ref()) {
+        let degradation = if transient_target.is_some() {
+            Degradation::AxTreeEmpty
+        } else {
+            degradation_for(tree_result.is_some(), element_count, window_scope.as_ref())
+        };
+        match degradation {
             Degradation::None => {}
             Degradation::AxTreeEmpty => {
                 structured["degraded"] = serde_json::json!(true);
-                structured["degraded_reason"] = serde_json::json!(
-                    "ax_tree_empty: the AX walk returned no actionable elements. The \
-                     window may be a non-AX surface (canvas/WebGL/custom-drawn) or its \
-                     accessibility tree was not ready (Chromium/Electron require an \
-                     AX-enable + settle). Do not treat element data as authoritative — \
-                     re-snapshot if the app just launched, otherwise switch to the \
-                     visual path."
-                );
-                structured["escalation"] = serde_json::json!({
-                    "recommended": "px",
-                    "reason": "non-AX surface — act by pixel (x,y) off the screenshot \
-                               in this response (an element px action)."
-                });
+                if transient_target.is_some() {
+                    structured["degraded_reason"] = serde_json::json!(
+                        "transient_ui_visual_only: the image belongs to a trusted out-of-process modal helper. Its AX rows and pixel coordinate target are intentionally withheld so they cannot be replayed against the public host target."
+                    );
+                    structured["escalation"] = serde_json::json!({
+                        "recommended": "foreground_keyboard",
+                        "reason": "Use an unaddressed type_text, press_key, or hotkey with delivery_mode:\"foreground\" against the original host pid/window_id."
+                    });
+                } else {
+                    structured["degraded_reason"] = serde_json::json!(
+                        "ax_tree_empty: the AX walk returned no actionable elements. The \
+                         window may be a non-AX surface (canvas/WebGL/custom-drawn) or its \
+                         accessibility tree was not ready (Chromium/Electron require an \
+                         AX-enable + settle). Do not treat element data as authoritative — \
+                         re-snapshot if the app just launched, otherwise switch to the \
+                         visual path."
+                    );
+                    structured["escalation"] = serde_json::json!({
+                        "recommended": "px",
+                        "reason": "non-AX surface — act by pixel (x,y) off the screenshot \
+                                   in this response (an element px action)."
+                    });
+                }
             }
             Degradation::AxWindowUnresolved { ax_window_count } => {
                 structured["degraded"] = serde_json::json!(true);
-                structured["degraded_reason"] = serde_json::json!(format!(
-                    "ax_window_unresolved: window_id {window_id} exists and is owned by \
-                     pid {pid}, but none of the {ax_window_count} AXWindow element(s) \
-                     under that pid reports this CGWindowID. The tree is returned EMPTY \
-                     on purpose: the accessibility elements reachable under this pid \
-                     belong to other surfaces (the menu bar, other windows), not to the \
-                     requested window, so presenting them would misground the next \
-                     action."
-                ));
-                structured["escalation"] = serde_json::json!({
-                    "recommended": "foreground",
-                    "reason": "observation-only: the screenshot in this response IS the \
-                               requested window, but background input (including px) is \
-                               refused while its AX surface is unresolved — events could \
-                               reach a same-process sibling window. Re-snapshot after the \
-                               app settles, or act with delivery_mode:\"foreground\"."
-                });
+                if transient_target.is_some() {
+                    // TBH's host-window recovery intentionally keys on the
+                    // ordinary `ax_window_unresolved:` prefix.  A view-service
+                    // panel is already the correct visible surface, so do not
+                    // invite a host activation that would steal focus back to
+                    // its previous field.
+                    structured["degraded_reason"] = serde_json::json!(format!(
+                        "transient_ui_ax_unresolved: the associated helper window \
+                         {window_id} is visible under pid {pid}, but none of its \
+                         {ax_window_count} AXWindow element(s) reports this CGWindowID. \
+                         The screenshot is authoritative and the tree is empty on purpose."
+                    ));
+                    structured["escalation"] = serde_json::json!({
+                        "recommended": "foreground_keyboard",
+                        "reason": "Use type_text or press_key with delivery_mode:\"foreground\" \
+                                   against the original host target. The driver will revalidate \
+                                   and route that one keyboard action to this helper."
+                    });
+                } else {
+                    structured["degraded_reason"] = serde_json::json!(format!(
+                        "ax_window_unresolved: window_id {window_id} exists and is owned by \
+                         pid {pid}, but none of the {ax_window_count} AXWindow element(s) \
+                         under that pid reports this CGWindowID. The tree is returned EMPTY \
+                         on purpose: the accessibility elements reachable under this pid \
+                         belong to other surfaces (the menu bar, other windows), not to the \
+                         requested window, so presenting them would misground the next \
+                         action."
+                    ));
+                    structured["escalation"] = serde_json::json!({
+                        "recommended": "foreground",
+                        "reason": "observation-only: the screenshot in this response IS the \
+                                   requested window, but background input (including px) is \
+                                   refused while its AX surface is unresolved — events could \
+                                   reach a same-process sibling window. Re-snapshot after the \
+                                   app settles, or act with delivery_mode:\"foreground\"."
+                    });
+                }
             }
         }
         // Additive read-only `background_input` capability section (macOS
@@ -685,7 +996,7 @@ impl Tool for GetWindowStateTool {
         // background mutation, reported per route so an agent can choose
         // before acting. Every action still revalidates — this is advisory,
         // not a promise. Old consumers ignore the extra field.
-        if plan.include_elements {
+        if plan.include_elements && transient_target.is_none() {
             let capture_available = screenshot_dims.is_some();
             let report = tokio::task::spawn_blocking(move || {
                 let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
@@ -710,15 +1021,30 @@ impl Tool for GetWindowStateTool {
             // `mimeType` on the protocol image part — this mirrors it onto
             // the structured side. Additive: keeps every existing field.
             structured["screenshot_mime_type"] = serde_json::json!("image/png");
+            if transient_target.is_some() {
+                structured["transient_ui"]["visual_target"]["screenshot_width"] =
+                    serde_json::json!(sw);
+                structured["transient_ui"]["visual_target"]["screenshot_height"] =
+                    serde_json::json!(sh);
+                structured["transient_ui"]["visual_target"]["screenshot_mime_type"] =
+                    serde_json::json!("image/png");
+            }
         }
         if let Some((bounds, scale)) = screenshot_frame {
-            structured["window_bounds"] = serde_json::json!({
+            let frame = serde_json::json!({
                 "x": bounds.x,
                 "y": bounds.y,
                 "width": bounds.width,
                 "height": bounds.height
             });
-            structured["screenshot_scale"] = serde_json::json!(scale);
+            if transient_target.is_some() {
+                structured["transient_ui"]["visual_target"]["window_bounds"] = frame;
+                structured["transient_ui"]["visual_target"]["screenshot_scale"] =
+                    serde_json::json!(scale);
+            } else {
+                structured["window_bounds"] = frame;
+                structured["screenshot_scale"] = serde_json::json!(scale);
+            }
             structured["screenshot_frame_valid"] = serde_json::json!(true);
         }
         if let Some(error) = screenshot_frame_error {
@@ -727,13 +1053,51 @@ impl Tool for GetWindowStateTool {
         }
         if let Some(ref fp) = screenshot_file_path {
             structured["screenshot_file_path"] = serde_json::json!(fp);
+            if transient_target.is_some() {
+                structured["transient_ui"]["visual_target"]["screenshot_file_path"] =
+                    serde_json::json!(fp);
+            }
         }
         cua_driver_core::window_inspection::mark_browser_chrome_capture_coverage(
             &mut structured,
-            chromium_browser_window(pid).then_some(
+            chromium_browser_window(requested_pid).then_some(
                 cua_driver_core::window_inspection::BrowserChromeCaptureCoverage::MayBeIncomplete,
             ),
         );
+        if let Some(target) = transient_target {
+            // Keep the authorization hand-off adjacent to the route commit as
+            // well as before state publication above. If the modal disappears
+            // during response construction, never leave a route that the
+            // caller could consume on its next foreground keyboard action.
+            let commit_detection = tokio::task::spawn_blocking(move || {
+                crate::transient_ui::detect_visible_transient_helper(source_target)
+            })
+            .await;
+            if !matches!(
+                commit_detection,
+                Ok(crate::transient_ui::TransientHelperDetection::Unique(current))
+                    if current == target
+            ) {
+                return ToolResult::error(
+                    "The transient helper changed or closed before its observation could be committed. Re-observe the host app; no foreground input route was retained.",
+                )
+                .with_structured(serde_json::json!({
+                    "code": "transient_ui_changed_during_observation",
+                    "effect": "refused",
+                    "pid": requested_pid,
+                    "window_id": requested_window_id,
+                    "retryable": true,
+                    "suggestion": "Call get_window_state for the host app again."
+                }));
+            }
+            commit_transient_observation(
+                &self.state.transient_ui_registry,
+                &transient_session,
+                source_target,
+                target,
+                observation_only,
+            );
+        }
         ToolResult {
             content,
             is_error: None,
@@ -1032,6 +1396,165 @@ mod window_scope_contract_tests {
         result
             .structured_content
             .expect("refusals carry structured content")
+    }
+
+    #[test]
+    fn public_observation_revokes_old_route_before_any_possible_failure() {
+        let registry = crate::transient_ui::TransientUiRegistry::new();
+        let session = crate::transient_ui::TransientSessionKey::Session(
+            "failed-observation-session".to_owned(),
+        );
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let target = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        registry.record(&session, source, Some(target));
+
+        let cleared = begin_transient_observation(&registry, &session, source, false);
+        assert_eq!(cleared, Some(target));
+        // Simulate any later early-return: no commit occurs.
+        assert_eq!(registry.recorded_target(&session, source), None);
+    }
+
+    #[test]
+    fn only_successful_public_observation_commits_and_internal_probe_is_inert() {
+        let registry = crate::transient_ui::TransientUiRegistry::new();
+        let session = crate::transient_ui::TransientSessionKey::Session(
+            "successful-observation-session".to_owned(),
+        );
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let old_target = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let new_target = crate::transient_ui::WindowTarget {
+            pid: 30,
+            window_id: 300,
+        };
+        registry.record(&session, source, Some(old_target));
+
+        let _ = begin_transient_observation(&registry, &session, source, true);
+        commit_transient_observation(&registry, &session, source, new_target, true);
+        assert_eq!(
+            registry.recorded_target(&session, source),
+            Some(old_target),
+            "internal observation-only probes must not mutate public authorization"
+        );
+
+        let _ = begin_transient_observation(&registry, &session, source, false);
+        commit_transient_observation(&registry, &session, source, new_target, false);
+        assert_eq!(registry.recorded_target(&session, source), Some(new_target));
+    }
+
+    #[test]
+    fn transient_contract_keeps_host_public_and_nests_non_actionable_visual_target() {
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let target = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let mut structured = serde_json::json!({
+            "pid": target.pid,
+            "window_id": target.window_id,
+            "elements": [],
+        });
+        apply_transient_observation_contract(&mut structured, source, target);
+
+        assert_eq!(structured["pid"], source.pid);
+        assert_eq!(structured["window_id"], source.window_id);
+        assert_eq!(
+            structured["transient_ui"]["visual_target"]["pid"],
+            target.pid
+        );
+        assert_eq!(
+            structured["transient_ui"]["visual_target"]["window_id"],
+            target.window_id
+        );
+        assert_eq!(
+            structured["transient_ui"]["visual_target"]["pixel_actions_supported"],
+            false
+        );
+        assert!(structured["transient_ui"].get("pid").is_none());
+        assert!(structured["transient_ui"].get("window_id").is_none());
+    }
+
+    #[test]
+    fn ambiguous_or_policy_blocked_transient_detection_never_falls_back_to_host() {
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let target = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let ambiguous = transient_target_from_detection(
+            crate::transient_ui::TransientHelperDetection::Ambiguous,
+            source,
+            true,
+        )
+        .expect_err("ambiguous helper detection must fail closed");
+        assert_eq!(
+            ambiguous.structured_content.unwrap()["code"],
+            "transient_ui_ambiguous"
+        );
+
+        let policy = transient_target_from_detection(
+            crate::transient_ui::TransientHelperDetection::Unique(target),
+            source,
+            false,
+        )
+        .expect_err("exact policy must refuse post-authorization target substitution");
+        assert_eq!(
+            policy.structured_content.unwrap()["code"],
+            "transient_ui_target_reauthorization_required"
+        );
+    }
+
+    #[test]
+    fn invalidating_visual_target_state_stales_old_tokens_and_resize_mapping() {
+        let state = ToolState::new(false, true, None);
+        let target = crate::transient_ui::WindowTarget {
+            pid: 91_337,
+            window_id: 73_119,
+        };
+        let snapshot = cua_driver_core::element_token::global().register_snapshot(
+            target.pid,
+            target.window_id,
+            1,
+        );
+        let token = cua_driver_core::element_token::token_for(snapshot, 0);
+        state
+            .resize_registry
+            .set_ratio(target.pid, target.window_id, 2.0);
+        assert!(cua_driver_core::element_token::global()
+            .resolve(target.pid, &token)
+            .is_ok());
+
+        invalidate_observation_target_state(&state, target);
+
+        assert_eq!(
+            cua_driver_core::element_token::global()
+                .resolve(target.pid, &token)
+                .unwrap_err(),
+            cua_driver_core::element_token::STALE_TOKEN_ERROR
+        );
+        assert_eq!(
+            state
+                .resize_registry
+                .ratio(target.pid, Some(target.window_id)),
+            None
+        );
     }
 
     #[test]

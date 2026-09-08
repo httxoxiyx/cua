@@ -143,6 +143,30 @@ fn screen_sharing_modifier_delivery_error(
     )
 }
 
+fn background_transient_hotkey_refusal(
+    foreground: bool,
+    requested_pid: i32,
+    requested_window_id: Option<u32>,
+    route: Option<crate::transient_ui::TransientRoute>,
+) -> Option<ToolResult> {
+    if foreground || route.is_none() {
+        return None;
+    }
+    Some(
+        ToolResult::error(
+            "A trusted transient helper is visible. Background hotkeys are not redirected and cannot safely fall back to the host; retry with delivery_mode:\"foreground\" against the original host target.",
+        )
+        .with_structured(serde_json::json!({
+            "code": "transient_ui_requires_foreground_keyboard",
+            "effect": "refused",
+            "pid": requested_pid,
+            "window_id": requested_window_id,
+            "retryable": true,
+            "suggestion": "Re-call hotkey with delivery_mode:\"foreground\" and the same host pid/window_id."
+        })),
+    )
+}
+
 #[async_trait]
 impl Tool for HotkeyTool {
     fn def(&self) -> &ToolDef {
@@ -192,7 +216,7 @@ impl Tool for HotkeyTool {
             };
         }
 
-        let pid = match args.require_i32("pid") {
+        let requested_pid = match args.require_i32("pid") {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -232,7 +256,7 @@ impl Tool for HotkeyTool {
         let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
-            pid,
+            requested_pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
@@ -268,6 +292,35 @@ impl Tool for HotkeyTool {
                 "Pass either element_index (ax) or x,y (px) to hotkey, not both.",
             );
         }
+
+        // Resolve modal view-service routing before element-cache lookup,
+        // background gating, pixel focus, or any other input side effect. A
+        // background hotkey never inherits the helper route; it fails closed
+        // and asks for the explicit foreground rung instead.
+        let transient_session = crate::transient_ui::TransientSessionKey::from_args(&args);
+        let keyboard_target = match super::resolve_foreground_keyboard_target(
+            &self.state,
+            &transient_session,
+            requested_pid,
+            window_id,
+            element_index.is_some() || px.is_some() || py.is_some(),
+        )
+        .await
+        {
+            Ok(target) => target,
+            Err(error) => return error,
+        };
+        if let Some(refusal) = background_transient_hotkey_refusal(
+            fg,
+            requested_pid,
+            window_id,
+            keyboard_target.transient_route,
+        ) {
+            return refusal;
+        }
+        let pid = keyboard_target.pid;
+        let window_id = keyboard_target.window_id;
+        let transient_route = keyboard_target.transient_route;
 
         let element_guard = if let (Some(index), Some(window_id)) = (element_index, window_id) {
             match self
@@ -422,11 +475,12 @@ impl Tool for HotkeyTool {
                         // target frontmost until both key events are consumed;
                         // otherwise Cmd+A/Cmd+V can be silently ignored.
                         (true, true, Some(wid), _) => {
-                            crate::input::skylight::with_foreground_keyboard_target_activation(
+                            crate::input::skylight::with_foreground_keyboard_target_activation_routed(
                                 pid as libc::pid_t,
                                 wid,
                                 remembered_cursor,
                                 true,
+                                transient_route,
                                 || crate::input::keyboard::press_key_global(&key, &m),
                             )?;
                             Ok(())
@@ -436,11 +490,12 @@ impl Tool for HotkeyTool {
                         // establish and confirm the requested child focus after
                         // activation, then use the guarded global HID queue.
                         (true, false, Some(wid), Some(ptr)) => {
-                            crate::input::skylight::with_foreground_keyboard_target_activation(
+                            crate::input::skylight::with_foreground_keyboard_target_activation_routed(
                                 pid as libc::pid_t,
                                 wid,
                                 remembered_cursor,
                                 true,
+                                transient_route,
                                 || {
                                     focus_hotkey_element(pid, ptr)?;
                                     crate::input::keyboard::press_key_global(&key, &m)
@@ -455,11 +510,12 @@ impl Tool for HotkeyTool {
                         (true, false, Some(wid), None)
                             if crate::input::keyboard::is_screen_sharing_pid(pid) =>
                         {
-                            crate::input::skylight::with_foreground_keyboard_target_activation(
+                            crate::input::skylight::with_foreground_keyboard_target_activation_routed(
                                 pid as libc::pid_t,
                                 wid,
                                 remembered_cursor,
                                 false,
+                                transient_route,
                                 || crate::input::keyboard::press_key_global(&key, &m),
                             )?;
                             Ok(())
@@ -471,11 +527,12 @@ impl Tool for HotkeyTool {
                         // Blender/GHOST. Keep the exact window frontmost through
                         // Cmd-down/base-down/base-up/Cmd-up, then restore it.
                         (true, false, Some(wid), None) => {
-                            crate::input::skylight::with_foreground_keyboard_target_activation(
+                            crate::input::skylight::with_foreground_keyboard_target_activation_routed(
                                 pid as libc::pid_t,
                                 wid,
                                 remembered_cursor,
                                 false,
+                                transient_route,
                                 || crate::input::keyboard::press_key_global(&key, &m),
                             )?;
                             Ok(())
@@ -520,6 +577,17 @@ impl Tool for HotkeyTool {
                                    pixel-click to focus then type_text instead.)"
                     });
                 }
+                if let Some(route) = transient_route {
+                    structured["transient_ui"] = serde_json::json!({
+                        "routed": true,
+                        "host_pid": route.source.pid,
+                        "host_window_id": route.source.window_id,
+                        "visual_target": {
+                            "pid": route.target.pid,
+                            "window_id": route.target.window_id
+                        }
+                    });
+                }
                 ToolResult::text(format!(
                     "Pressed {key_display} on pid {pid}{label}.{}",
                     changes.result_suffix()
@@ -561,5 +629,27 @@ mod tests {
         assert!(screen_sharing_modifier_delivery_error(true, true, true, Some(7)).is_none());
         assert!(screen_sharing_modifier_delivery_error(true, false, false, None).is_none());
         assert!(screen_sharing_modifier_delivery_error(false, true, false, None).is_none());
+    }
+
+    #[test]
+    fn background_hotkey_never_inherits_a_transient_route() {
+        let route = crate::transient_ui::TransientRoute {
+            source: crate::transient_ui::WindowTarget {
+                pid: 10,
+                window_id: 100,
+            },
+            target: crate::transient_ui::WindowTarget {
+                pid: 20,
+                window_id: 200,
+            },
+        };
+        let refusal = background_transient_hotkey_refusal(false, 10, Some(100), Some(route))
+            .expect("background hotkey must fail closed");
+        assert_eq!(
+            refusal.structured_content.unwrap()["code"],
+            "transient_ui_requires_foreground_keyboard"
+        );
+        assert!(background_transient_hotkey_refusal(true, 10, Some(100), Some(route)).is_none());
+        assert!(background_transient_hotkey_refusal(false, 10, Some(100), None).is_none());
     }
 }

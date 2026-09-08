@@ -49,6 +49,30 @@ pub(crate) fn current_dispatch_authorization_context(
     DISPATCH_AUTHORIZATION_CONTEXT.try_with(Arc::clone).ok()
 }
 
+/// Whether the current dispatch may internally redirect a protected desktop
+/// operation from the caller-authorized target to a separately owned trusted
+/// transient surface.
+///
+/// Exact capability manifests are resource ceilings, so authorizing the host
+/// `(pid, window_id)` cannot implicitly authorize a helper process. Until the
+/// helper can be canonicalized before the normal authorization boundary, fail
+/// closed for bounded mode and for every manifest-bearing context. The narrow
+/// redirect remains available only to standard/unrestricted calls without a
+/// manifest, after the platform independently proves the trusted helper pair.
+#[doc(hidden)]
+pub fn current_dispatch_allows_trusted_transient_target_rewrite() -> bool {
+    current_dispatch_authorization_context()
+        .as_deref()
+        .is_some_and(authorization_context_allows_trusted_transient_target_rewrite)
+}
+
+fn authorization_context_allows_trusted_transient_target_rewrite(
+    context: &crate::session_authorization::EffectiveAuthorizationContext,
+) -> bool {
+    context.mode() != crate::authorization::PermissionMode::Bounded
+        && context.capability_manifest().is_none()
+}
+
 #[doc(hidden)]
 pub fn current_dispatch_runtime_scope() -> Option<String> {
     DISPATCH_RUNTIME_SCOPE
@@ -2847,9 +2871,10 @@ fn restore_public_runtime_value(value: &mut Value, runtime_prefix: &str) -> bool
 #[cfg(test)]
 mod runtime_isolation_tests {
     use super::{
-        canonical_proposed_path, desktop_action_coordinator, namespace_runtime_args,
-        publish_action_result, restore_public_runtime_result, try_admit_text_input,
-        TrustedInvocationEvidence, DISPATCH_RUNTIME_SCOPE,
+        authorization_context_allows_trusted_transient_target_rewrite, canonical_proposed_path,
+        desktop_action_coordinator, namespace_runtime_args, publish_action_result,
+        restore_public_runtime_result, try_admit_text_input, TrustedInvocationEvidence,
+        DISPATCH_RUNTIME_SCOPE,
     };
     use crate::{
         authorization::PermissionMode,
@@ -2916,6 +2941,47 @@ mod runtime_isolation_tests {
         SessionAuthorizationRegistry::with_ceiling(ceiling)
             .compatibility_context(mode, Some(manifest))
             .unwrap()
+    }
+
+    #[test]
+    fn trusted_transient_target_rewrite_is_refused_for_bounded_or_manifest_contexts() {
+        assert!(
+            !super::current_dispatch_allows_trusted_transient_target_rewrite(),
+            "missing canonical dispatch context must fail closed"
+        );
+        assert!(
+            authorization_context_allows_trusted_transient_target_rewrite(
+                standard_context().as_ref()
+            )
+        );
+        assert!(
+            authorization_context_allows_trusted_transient_target_rewrite(
+                unrestricted_context().as_ref()
+            )
+        );
+
+        let manifest = r#"
+version: 3
+expires_after: 1h
+idle_timeout: 30m
+allow:
+  tools: [type_text]
+resources:
+  desktop:
+    windows:
+      - pid: 42
+        window_id: 7
+"#;
+        assert!(
+            !authorization_context_allows_trusted_transient_target_rewrite(
+                bounded_context(manifest).as_ref()
+            )
+        );
+        assert!(
+            !authorization_context_allows_trusted_transient_target_rewrite(
+                manifest_context(PermissionMode::Standard, manifest).as_ref()
+            )
+        );
     }
 
     struct ReplayProbe {

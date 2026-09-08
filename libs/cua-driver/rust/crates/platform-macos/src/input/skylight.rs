@@ -901,6 +901,36 @@ pub fn with_foreground_hid_activation(
     target_wid: u32,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    with_foreground_hid_activation_inner(target_pid, target_wid, None, action)
+}
+
+fn with_foreground_hid_activation_inner(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    transient_route: Option<crate::transient_ui::TransientRoute>,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let transient_target = crate::transient_ui::WindowTarget {
+        pid: target_pid,
+        window_id: target_wid,
+    };
+    if transient_route_authorizes_auxiliary_bypass(transient_route, transient_target)
+        && transient_route.is_some_and(|route| {
+            crate::transient_ui::active_helper_has_unique_visible_window_for_route(
+                route,
+                transient_target,
+            )
+        })
+    {
+        // View-service panels often have no AXWindow→CGWindowID bridge even
+        // though WindowServer shows a single visible window and
+        // NSRunningApplication reports that helper as active.  In that narrow
+        // case, the existing foreground is already the strongest available
+        // exact-target proof; re-activating the host would steal first
+        // responder back to its last field.
+        return action();
+    }
+
     let set_front = set_front_process_fn()
         .ok_or_else(|| anyhow::anyhow!("foreground HID delivery is unavailable"))?;
 
@@ -930,7 +960,15 @@ pub fn with_foreground_hid_activation(
     }
 
     make_exact_window_key(target_pid, target_wid);
-    if !await_window_focused(target_pid, target_wid) {
+    if !await_window_focused(target_pid, target_wid)
+        && !(transient_route_authorizes_auxiliary_bypass(transient_route, transient_target)
+            && transient_route.is_some_and(|route| {
+                crate::transient_ui::active_helper_has_unique_visible_window_for_route(
+                    route,
+                    transient_target,
+                )
+            }))
+    {
         if prev_ok {
             unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
         }
@@ -945,6 +983,13 @@ pub fn with_foreground_hid_activation(
     }
 
     result
+}
+
+fn transient_route_authorizes_auxiliary_bypass(
+    route: Option<crate::transient_ui::TransientRoute>,
+    target: crate::transient_ui::WindowTarget,
+) -> bool {
+    route.is_some_and(|route| route.target == target)
 }
 
 const BLENDER_BUNDLE_ID: &str = "org.blenderfoundation.blender";
@@ -988,6 +1033,25 @@ pub fn with_foreground_keyboard_target_activation(
         target_wid,
         remembered_cursor,
         foreground_keyboard_focus_click_for_pid(target_pid, explicit_focus_already_established),
+        None,
+        action,
+    )
+}
+
+pub(crate) fn with_foreground_keyboard_target_activation_routed(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    remembered_cursor: Option<(f64, f64)>,
+    explicit_focus_already_established: bool,
+    transient_route: Option<crate::transient_ui::TransientRoute>,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_foreground_keyboard_context_activation_inner(
+        target_pid,
+        target_wid,
+        remembered_cursor,
+        foreground_keyboard_focus_click_for_pid(target_pid, explicit_focus_already_established),
+        transient_route,
         action,
     )
 }
@@ -1012,6 +1076,24 @@ pub fn with_foreground_keyboard_context_activation(
         target_wid,
         remembered_cursor,
         false,
+        None,
+        action,
+    )
+}
+
+pub(crate) fn with_foreground_keyboard_context_activation_routed(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    remembered_cursor: Option<(f64, f64)>,
+    transient_route: Option<crate::transient_ui::TransientRoute>,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_foreground_keyboard_context_activation_inner(
+        target_pid,
+        target_wid,
+        remembered_cursor,
+        false,
+        transient_route,
         action,
     )
 }
@@ -1030,6 +1112,24 @@ pub fn with_foreground_keyboard_focus_activation(
         target_wid,
         remembered_cursor,
         true,
+        None,
+        action,
+    )
+}
+
+pub(crate) fn with_foreground_keyboard_focus_activation_routed(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    remembered_cursor: Option<(f64, f64)>,
+    transient_route: Option<crate::transient_ui::TransientRoute>,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_foreground_keyboard_context_activation_inner(
+        target_pid,
+        target_wid,
+        remembered_cursor,
+        true,
+        transient_route,
         action,
     )
 }
@@ -1039,9 +1139,10 @@ fn with_foreground_keyboard_context_activation_inner(
     target_wid: u32,
     remembered_cursor: Option<(f64, f64)>,
     focus_click: bool,
+    transient_route: Option<crate::transient_ui::TransientRoute>,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    with_foreground_hid_activation(target_pid, target_wid, || {
+    with_foreground_hid_activation_inner(target_pid, target_wid, transient_route, || {
         let bounds = crate::windows::window_bounds_by_id(target_wid).ok_or_else(|| {
             anyhow::anyhow!("target window {target_wid} closed before foreground keyboard delivery")
         })?;
@@ -1130,7 +1231,38 @@ mod tests {
         foreground_keyboard_focus_click_for_bundle_id, foreground_keyboard_focus_click_policy,
         make_key_window_record, preserves_exact_existing_focus, should_deactivate_synthetic_target,
         synthetic_focus_record, synthetic_target_focus_plan,
+        transient_route_authorizes_auxiliary_bypass,
     };
+
+    #[test]
+    fn direct_helper_target_never_gets_the_no_ax_window_bypass() {
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let helper = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        assert!(!transient_route_authorizes_auxiliary_bypass(None, helper));
+        assert!(!transient_route_authorizes_auxiliary_bypass(
+            Some(crate::transient_ui::TransientRoute {
+                source,
+                target: crate::transient_ui::WindowTarget {
+                    pid: 30,
+                    window_id: 300,
+                },
+            }),
+            helper,
+        ));
+        assert!(transient_route_authorizes_auxiliary_bypass(
+            Some(crate::transient_ui::TransientRoute {
+                source,
+                target: helper,
+            }),
+            helper,
+        ));
+    }
 
     #[test]
     fn foreground_keyboard_focus_click_is_blender_unaddressed_only() {

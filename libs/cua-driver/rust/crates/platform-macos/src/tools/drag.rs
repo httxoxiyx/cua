@@ -236,6 +236,14 @@ impl Tool for DragTool {
             }
         };
 
+        let transient_session = crate::transient_ui::TransientSessionKey::from_args(&args);
+        if let Err(refusal) =
+            super::guard_transient_pointer_target(&self.state, &transient_session, pid, window_id)
+                .await
+        {
+            return refusal;
+        }
+
         // from_zoom: translate from last zoom crop context.
         if from_zoom {
             match self.state.zoom_registry.get(pid) {

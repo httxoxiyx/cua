@@ -125,7 +125,7 @@ pub(crate) fn visible_automation_windows_with_space_snapshot() -> WindowEnumerat
 /// layer filter on enumeration and off identity lookup is what lets
 /// `get_window_state` tell "no such window" apart from "exists, but is not a
 /// layer-0 window" (issue #2237).
-fn all_windows_any_layer() -> Vec<WindowInfo> {
+pub(crate) fn all_windows_including_accessory_layers() -> Vec<WindowInfo> {
     enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer).windows
 }
 
@@ -470,7 +470,7 @@ fn get_bounds_num(
 /// Returns `None` only when WindowServer has no record of the id at all —
 /// which is precisely the "closed or fabricated window_id" signal callers need.
 pub fn window_info_by_id(window_id: u32) -> Option<WindowInfo> {
-    all_windows_any_layer()
+    all_windows_including_accessory_layers()
         .into_iter()
         .find(|w| w.window_id == window_id)
 }
@@ -517,7 +517,7 @@ pub fn resolve_window_owner_in(windows: &[WindowInfo], pid: i32, window_id: u32)
 /// Resolve whether `pid` really owns `window_id`. Blocking (one CGWindowList
 /// enumeration).
 pub fn resolve_window_owner(pid: i32, window_id: u32) -> WindowOwner {
-    resolve_window_owner_in(&all_windows_any_layer(), pid, window_id)
+    resolve_window_owner_in(&all_windows_including_accessory_layers(), pid, window_id)
 }
 
 /// Select the best window_id for a pid.

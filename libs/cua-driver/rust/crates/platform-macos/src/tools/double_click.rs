@@ -114,6 +114,13 @@ impl Tool for DoubleClickTool {
                 via_token: _,
             } => (Some(idx), wid),
         };
+        let transient_session = crate::transient_ui::TransientSessionKey::from_args(&args);
+        if let Err(refusal) =
+            super::guard_transient_pointer_target(&self.state, &transient_session, pid, window_id)
+                .await
+        {
+            return refusal;
+        }
 
         // ── AX element path ──────────────────────────────────────────────────
         if let (Some(idx), Some(wid)) = (element_index, window_id) {

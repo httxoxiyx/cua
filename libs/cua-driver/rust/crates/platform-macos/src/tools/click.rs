@@ -419,6 +419,14 @@ impl Tool for ClickTool {
             }));
         }
 
+        let transient_session = crate::transient_ui::TransientSessionKey::from_args(&args);
+        if let Err(refusal) =
+            super::guard_transient_pointer_target(&self.state, &transient_session, pid, window_id)
+                .await
+        {
+            return refusal;
+        }
+
         if let (Some(idx), Some(wid)) = (element_index, window_id) {
             // ── AX element path ────────────────────────────────────────────
             // Retain the element out of the cache so it can't be freed by a

@@ -194,7 +194,7 @@ impl Tool for TypeTextTool {
                 Err(error) => ToolResult::error(format!("desktop type_text task failed: {error}")),
             };
         }
-        let pid = match args.require_i32("pid") {
+        let requested_pid = match args.require_i32("pid") {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -211,7 +211,7 @@ impl Tool for TypeTextTool {
         let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
-            pid,
+            requested_pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
@@ -231,6 +231,42 @@ impl Tool for TypeTextTool {
         };
         let delay_ms = args.u64_or("delay_ms", 30);
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
+
+        // Argument-shape errors are reported before transient routing or any
+        // retained lookup: a malformed call must fail identically regardless
+        // of whether a helper is currently visible.
+        let px = args.get("x").and_then(|v| v.as_f64());
+        let py = args.get("y").and_then(|v| v.as_f64());
+        if px.is_some() && py.is_some() && element_index.is_some() {
+            return ToolResult::error(
+                "Pass either element_index (ax) or x,y (px) to type_text, not both.",
+            );
+        }
+
+        let foreground_target = if delivery_mode.is_foreground() {
+            let transient_session = crate::transient_ui::TransientSessionKey::from_args(&args);
+            match super::resolve_foreground_keyboard_target(
+                &self.state,
+                &transient_session,
+                requested_pid,
+                window_id,
+                element_index.is_some() || px.is_some() || py.is_some(),
+            )
+            .await
+            {
+                Ok(target) => target,
+                Err(error) => return error,
+            }
+        } else {
+            super::ForegroundKeyboardTarget {
+                pid: requested_pid,
+                window_id,
+                transient_route: None,
+            }
+        };
+        let pid = foreground_target.pid;
+        let window_id = foreground_target.window_id;
+        let transient_route = foreground_target.transient_route;
         let remembered_cursor = if delivery_mode.is_foreground() {
             super::remembered_agent_cursor_position(&self.state, &args)
         } else {
@@ -248,17 +284,6 @@ impl Tool for TypeTextTool {
         // the legacy integer path; token path already resolved window_id).
         if element_index.is_some() && window_id.is_none() {
             return ToolResult::error("window_id is required when element_index is used.");
-        }
-
-        // Argument-shape errors are reported before any gating or retained
-        // lookups: a malformed call must fail the same way regardless of
-        // background-target state.
-        let px = args.get("x").and_then(|v| v.as_f64());
-        let py = args.get("y").and_then(|v| v.as_f64());
-        if px.is_some() && py.is_some() && element_index.is_some() {
-            return ToolResult::error(
-                "Pass either element_index (ax) or x,y (px) to type_text, not both.",
-            );
         }
 
         // Resolve the element pointer (if element_index given). Retain it out
@@ -393,6 +418,7 @@ impl Tool for TypeTextTool {
                         window_id,
                         blocking_policy,
                         remembered_cursor,
+                        transient_route,
                     )
                 })
                 .await
@@ -560,6 +586,15 @@ impl Tool for TypeTextTool {
                             "reason": "background insert could not be confirmed — \
                                        re-call with delivery_mode:\"foreground\" if a \
                                        screenshot shows the text didn't land."
+                        });
+                    }
+                    if let Some(route) = transient_route {
+                        s["transient_ui"] = serde_json::json!({
+                            "routed": true,
+                            "host_pid": route.source.pid,
+                            "host_window_id": route.source.window_id,
+                            "pid": route.target.pid,
+                            "window_id": route.target.window_id,
                         });
                     }
                     s
@@ -1201,6 +1236,7 @@ fn type_text_blocking(
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
     remembered_cursor: Option<(f64, f64)>,
+    transient_route: Option<crate::transient_ui::TransientRoute>,
 ) -> anyhow::Result<TypeTextDelivery> {
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
@@ -1269,10 +1305,11 @@ fn type_text_blocking(
                 // turn Cmd+V into plain "v". The explicit foreground rung may
                 // safely use the global HID queue while the exact target is
                 // guarded and restored.
-                crate::input::skylight::with_foreground_keyboard_context_activation(
+                crate::input::skylight::with_foreground_keyboard_context_activation_routed(
                     pid as libc::pid_t,
                     wid,
                     remembered_cursor,
+                    transient_route,
                     || {
                         if foreground_settle_ms > 0 {
                             std::thread::sleep(std::time::Duration::from_millis(
@@ -1295,17 +1332,19 @@ fn type_text_blocking(
                     Ok(())
                 };
                 if focus_click {
-                    crate::input::skylight::with_foreground_keyboard_focus_activation(
+                    crate::input::skylight::with_foreground_keyboard_focus_activation_routed(
                         pid as libc::pid_t,
                         wid,
                         remembered_cursor,
+                        transient_route,
                         type_action,
                     )?;
                 } else {
-                    crate::input::skylight::with_foreground_keyboard_context_activation(
+                    crate::input::skylight::with_foreground_keyboard_context_activation_routed(
                         pid as libc::pid_t,
                         wid,
                         remembered_cursor,
+                        transient_route,
                         type_action,
                     )?;
                 }
@@ -1679,6 +1718,7 @@ mod tests {
             None,
             BackgroundKeyboardPolicy::Allowed,
             None,
+            None,
         );
         // We don't care whether r is Ok or Err — what matters is that
         // calling it with is_terminal_target=true is safe and never
@@ -1706,6 +1746,7 @@ mod tests {
             Some(7),
             BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
             None,
+            None,
         );
         match r {
             Ok(TypeTextDelivery::Refused(returned)) => assert_eq!(returned, refusal),
@@ -1725,6 +1766,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
+            None,
             None,
         )
         .expect("preflight refusal must not attempt the invalid pid");

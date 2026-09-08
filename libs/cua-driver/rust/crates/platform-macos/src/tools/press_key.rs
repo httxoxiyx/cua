@@ -281,7 +281,7 @@ impl Tool for PressKeyTool {
                 Err(error) => ToolResult::error(format!("desktop press_key task failed: {error}")),
             };
         }
-        let pid = match args.require_i32("pid") {
+        let requested_pid = match args.require_i32("pid") {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -295,7 +295,7 @@ impl Tool for PressKeyTool {
         let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
-            pid,
+            requested_pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
@@ -313,10 +313,6 @@ impl Tool for PressKeyTool {
                 via_token: _,
             } => (Some(idx), wid),
         };
-
-        if let Err(error) = validate_post_target(pid) {
-            return delivery_failed(error);
-        }
 
         // Remap "+" / "plus" → "=" + Shift (same physical key on US layout).
         let key = if key_raw == "+" || key_raw == "plus" {
@@ -347,6 +343,35 @@ impl Tool for PressKeyTool {
             return ToolResult::error(
                 "Pass either element_index (ax) or x,y (px) to press_key, not both.",
             );
+        }
+
+        let foreground_target = if fg {
+            let transient_session = crate::transient_ui::TransientSessionKey::from_args(&args);
+            match super::resolve_foreground_keyboard_target(
+                &self.state,
+                &transient_session,
+                requested_pid,
+                window_id,
+                element_index.is_some() || px.is_some() || py.is_some(),
+            )
+            .await
+            {
+                Ok(target) => target,
+                Err(error) => return error,
+            }
+        } else {
+            super::ForegroundKeyboardTarget {
+                pid: requested_pid,
+                window_id,
+                transient_route: None,
+            }
+        };
+        let pid = foreground_target.pid;
+        let window_id = foreground_target.window_id;
+        let transient_route = foreground_target.transient_route;
+
+        if let Err(error) = validate_post_target(pid) {
+            return delivery_failed(error);
         }
 
         // Resolve the pre-focus element pointer (if requested) outside
@@ -486,11 +511,12 @@ impl Tool for PressKeyTool {
                                 }
                                 crate::input::keyboard::press_key_global(&key, &m)
                             };
-                            crate::input::skylight::with_foreground_keyboard_target_activation(
+                            crate::input::skylight::with_foreground_keyboard_target_activation_routed(
                                 pid as libc::pid_t,
                                 wid,
                                 remembered_cursor,
                                 coordinate_focus || pre_focus_ptr.is_some(),
+                                transient_route,
                                 key_action,
                             )
                         });
@@ -523,11 +549,20 @@ impl Tool for PressKeyTool {
                 } else {
                     ""
                 };
-                let structured = serde_json::json!({
+                let mut structured = serde_json::json!({
                     "path": if fg { "key_events_fg" } else { "key_events" },
                     "verified": confirmed,
                     "effect": if confirmed { "confirmed" } else { "unverifiable" },
                 });
+                if let Some(route) = transient_route {
+                    structured["transient_ui"] = serde_json::json!({
+                        "routed": true,
+                        "host_pid": route.source.pid,
+                        "host_window_id": route.source.window_id,
+                        "pid": route.target.pid,
+                        "window_id": route.target.window_id,
+                    });
+                }
                 ToolResult::text(format!(
                     "✅ Pressed {display_key} on pid {pid}{label}.{}",
                     changes.result_suffix()

@@ -41,6 +41,8 @@ pub mod terminal;
 #[cfg(target_os = "macos")]
 pub mod tools;
 #[cfg(target_os = "macos")]
+pub(crate) mod transient_ui;
+#[cfg(target_os = "macos")]
 pub mod video_sckit;
 #[cfg(target_os = "macos")]
 pub mod window_change_detector;
