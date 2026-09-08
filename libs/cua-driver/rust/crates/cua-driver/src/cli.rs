@@ -53,6 +53,9 @@ pub enum Command {
     },
     Serve {
         socket: Option<String>,
+        /// Override the daemon pid-file path while preserving the caller's
+        /// real HOME for every other runtime behavior.
+        pid_file: Option<String>,
         /// Immutable agent-authorization mode selected at trusted daemon
         /// startup. This is distinct from the macOS OS-permissions gate.
         permission_mode: Option<String>,
@@ -90,6 +93,7 @@ pub enum Command {
     },
     Status {
         socket: Option<String>,
+        pid_file: Option<String>,
     },
     /// `cua-driver sessions list [--json]` — content-free operator view of
     /// the live sessions owned by the selected daemon runtime.
@@ -483,6 +487,37 @@ fn experimental_pip_requested(args: &[String]) -> bool {
         .any(|arg| arg == "--experimental-pip" || arg == "--pip")
 }
 
+fn parse_serve_command(
+    args: &[String],
+    socket: Option<String>,
+    claude_code_compat: bool,
+    grants: Vec<String>,
+) -> Command {
+    Command::Serve {
+        socket,
+        pid_file: flag_value(args, "--pid-file"),
+        permission_mode: flag_value(args, "--permission-mode"),
+        dangerously_bypass_approvals: args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals"),
+        capability_manifest: aliased_flag_value(args, "--capability-manifest", "--session-policy"),
+        approve_capability_manifest: args
+            .iter()
+            .any(|arg| arg == "--approve-capability-manifest" || arg == "--approve-session-policy"),
+        no_permissions_gate: args.iter().any(|arg| arg == "--no-permissions-gate"),
+        claude_code_compat,
+        grants,
+        experimental_history: args.iter().any(|arg| arg == "--experimental-history"),
+    }
+}
+
+fn parse_status_command(args: &[String], socket: Option<String>) -> Command {
+    Command::Status {
+        socket,
+        pid_file: flag_value(args, "--pid-file"),
+    }
+}
+
 /// Parse the first non-flag positional argument from argv to determine which
 /// subcommand to run.  Cursor-overlay flags are consumed by `CursorConfig`
 /// independently; we only care about the first non-`--` arg here.
@@ -766,26 +801,7 @@ pub fn parse_command() -> Command {
         },
         Some("list-tools") => Command::ListTools,
         Some("mcp-config") => Command::McpConfig { client: mcp_client },
-        Some("serve") => Command::Serve {
-            socket,
-            permission_mode: flag_value(&args, "--permission-mode"),
-            dangerously_bypass_approvals: args
-                .iter()
-                .any(|a| a == "--dangerously-bypass-approvals"),
-            capability_manifest: aliased_flag_value(
-                &args,
-                "--capability-manifest",
-                "--session-policy",
-            ),
-            approve_capability_manifest: args
-                .iter()
-                .any(|a| a == "--approve-capability-manifest" || a == "--approve-session-policy"),
-            // Bare flag — present anywhere on argv counts as "skip the gate".
-            no_permissions_gate: args.iter().any(|a| a == "--no-permissions-gate"),
-            claude_code_compat,
-            grants,
-            experimental_history: args.iter().any(|a| a == "--experimental-history"),
-        },
+        Some("serve") => parse_serve_command(&args, socket, claude_code_compat, grants),
         Some("stop") => Command::Stop {
             socket,
             expected_pid: expected_stop_pid,
@@ -802,7 +818,7 @@ pub fn parse_command() -> Command {
                 all,
             }
         }
-        Some("status") => Command::Status { socket },
+        Some("status") => parse_status_command(&args, socket),
         Some("sessions") => {
             let subcommand = pos.next().unwrap_or("list");
             if subcommand != "list" {
@@ -4805,6 +4821,56 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn serve_pid_file_value_flag_is_parsed_in_both_supported_forms() {
+        assert_eq!(
+            flag_value(
+                &args(&["serve", "--pid-file", "/tmp/private-cua.pid"]),
+                "--pid-file"
+            ),
+            Some("/tmp/private-cua.pid".to_owned())
+        );
+        assert_eq!(
+            flag_value(
+                &args(&["serve", "--pid-file=/tmp/equals-cua.pid"]),
+                "--pid-file"
+            ),
+            Some("/tmp/equals-cua.pid".to_owned())
+        );
+
+        let parsed = parse_serve_command(
+            &args(&["serve", "--pid-file", "/tmp/command-cua.pid"]),
+            Some("/tmp/private.sock".to_owned()),
+            false,
+            Vec::new(),
+        );
+        match parsed {
+            Command::Serve {
+                socket, pid_file, ..
+            } => {
+                assert_eq!(socket.as_deref(), Some("/tmp/private.sock"));
+                assert_eq!(pid_file.as_deref(), Some("/tmp/command-cua.pid"));
+            }
+            _ => panic!("serve parser must produce Command::Serve"),
+        }
+    }
+
+    #[test]
+    fn status_pid_file_value_flag_is_wired_in_both_supported_forms() {
+        for argv in [
+            args(&["status", "--pid-file", "/tmp/status-cua.pid"]),
+            args(&["status", "--pid-file=/tmp/status-cua.pid"]),
+        ] {
+            match parse_status_command(&argv, Some("/tmp/private.sock".to_owned())) {
+                Command::Status { socket, pid_file } => {
+                    assert_eq!(socket.as_deref(), Some("/tmp/private.sock"));
+                    assert_eq!(pid_file.as_deref(), Some("/tmp/status-cua.pid"));
+                }
+                _ => panic!("status parser must produce Command::Status"),
+            }
+        }
     }
 
     #[test]

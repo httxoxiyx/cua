@@ -602,6 +602,7 @@ fn main() {
         }
         cli::Command::Serve {
             socket,
+            pid_file,
             permission_mode,
             dangerously_bypass_approvals,
             capability_manifest,
@@ -692,7 +693,7 @@ fn main() {
                 }
             };
             let sp = socket.unwrap_or_else(serve::default_socket_path);
-            let pid_path = serve::default_pid_file_path();
+            let pid_path = serve::pid_file_path_or_default(pid_file);
 
             // Bind the Unix socket FIRST, on a background thread, BEFORE
             // running the (blocking) permissions gate (#1761).
@@ -809,9 +810,9 @@ fn main() {
             let sp = socket.unwrap_or_else(serve::default_socket_path);
             serve::run_revoke_cmd(&sp, session.as_deref(), all);
         }
-        cli::Command::Status { socket } => {
+        cli::Command::Status { socket, pid_file } => {
             let sp = socket.unwrap_or_else(serve::default_socket_path);
-            let pid_path = serve::default_pid_file_path();
+            let pid_path = serve::pid_file_path_or_default(pid_file);
             serve::run_status_cmd(&sp, &pid_path);
         }
         cli::Command::Sessions { json, socket } => {
@@ -1011,6 +1012,7 @@ fn main() -> anyhow::Result<()> {
         }
         cli::Command::Serve {
             socket,
+            pid_file,
             permission_mode,
             dangerously_bypass_approvals,
             capability_manifest,
@@ -1063,7 +1065,7 @@ fn main() -> anyhow::Result<()> {
             )?;
             maybe_init_pip();
             let sp = socket.unwrap_or_else(serve::default_socket_path);
-            let pid_path = serve::default_pid_file_path();
+            let pid_path = serve::pid_file_path_or_default(pid_file);
             // run_serve_cmd builds its own runtime; must run on a fresh thread.
             std::thread::spawn(move || {
                 serve::run_serve_cmd(driver, &sp, Some(&pid_path));
@@ -1092,9 +1094,9 @@ fn main() -> anyhow::Result<()> {
             serve::run_revoke_cmd(&sp, session.as_deref(), all);
             return Ok(());
         }
-        cli::Command::Status { socket } => {
+        cli::Command::Status { socket, pid_file } => {
             let sp = socket.unwrap_or_else(serve::default_socket_path);
-            let pid_path = serve::default_pid_file_path();
+            let pid_path = serve::pid_file_path_or_default(pid_file);
             serve::run_status_cmd(&sp, &pid_path);
             return Ok(());
         }

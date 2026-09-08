@@ -397,6 +397,31 @@ pub fn default_pid_file_path() -> String {
     }
 }
 
+/// Resolve the pid-file path selected by the trusted `serve` launcher.
+/// Keeping this separate from HOME lets private daemons isolate their
+/// lifecycle file without relocating every other user-scoped CUA resource.
+pub fn pid_file_path_or_default(explicit: Option<String>) -> String {
+    explicit.unwrap_or_else(default_pid_file_path)
+}
+
+#[cfg(test)]
+mod pid_file_path_tests {
+    use super::{default_pid_file_path, pid_file_path_or_default};
+
+    #[test]
+    fn explicit_serve_pid_file_overrides_the_home_derived_default() {
+        assert_eq!(
+            pid_file_path_or_default(Some("/tmp/private-cua.pid".to_owned())),
+            "/tmp/private-cua.pid"
+        );
+    }
+
+    #[test]
+    fn omitted_serve_pid_file_keeps_the_existing_default() {
+        assert_eq!(pid_file_path_or_default(None), default_pid_file_path());
+    }
+}
+
 // ── Protocol types ────────────────────────────────────────────────────────────
 
 fn daemon_observation_transport(req: &DaemonRequest) -> Option<crate::telemetry::Transport> {
