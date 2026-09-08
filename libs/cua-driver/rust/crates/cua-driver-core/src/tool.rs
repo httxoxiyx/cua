@@ -1699,6 +1699,7 @@ impl ToolRegistry {
                 should_record,
                 result.is_error == Some(true),
                 png_bytes.is_some(),
+                runtime_session.is_some(),
             );
             if let Some((window_id, pid)) = pip_exact_native_target(&args) {
                 let target = pip_hook::PipHookTarget {
@@ -2652,7 +2653,13 @@ fn pip_update_kind(
     should_record: bool,
     result_is_error: bool,
     has_embedded_png: bool,
+    has_runtime_session: bool,
 ) -> PipUpdateKind {
+    // A persistent card must have the same lifecycle key that removes it.
+    // Raw/direct callers without one would otherwise leave an immortal card.
+    if !has_runtime_session {
+        return PipUpdateKind::Skip;
+    }
     if tool_name == "get_window_state" && !result_is_error {
         if has_embedded_png {
             PipUpdateKind::SeedObservation
@@ -5655,23 +5662,35 @@ mod capability_tests {
     #[test]
     fn pip_update_policy_reuses_observations_and_never_recaptures_mutations() {
         assert_eq!(
-            super::pip_update_kind("get_window_state", false, false, true),
+            super::pip_update_kind("get_window_state", false, false, true, true),
             super::PipUpdateKind::SeedObservation
         );
         assert_eq!(
-            super::pip_update_kind("get_window_state", false, false, false),
+            super::pip_update_kind("get_window_state", false, false, false, true),
             super::PipUpdateKind::EnsureTarget
         );
         assert_eq!(
-            super::pip_update_kind("click", true, false, false),
+            super::pip_update_kind("click", true, false, false, true),
             super::PipUpdateKind::EnsureTarget
         );
         assert_eq!(
-            super::pip_update_kind("get_window_state", false, true, true),
+            super::pip_update_kind("get_window_state", false, true, true, true),
             super::PipUpdateKind::Skip
         );
         assert_eq!(
-            super::pip_update_kind("list_apps", false, false, false),
+            super::pip_update_kind("list_apps", false, false, false, true),
+            super::PipUpdateKind::Skip
+        );
+    }
+
+    #[test]
+    fn pip_never_publishes_without_runtime_session_identity() {
+        assert_eq!(
+            super::pip_update_kind("get_window_state", false, false, true, false),
+            super::PipUpdateKind::Skip
+        );
+        assert_eq!(
+            super::pip_update_kind("click", true, false, false, false),
             super::PipUpdateKind::Skip
         );
     }
