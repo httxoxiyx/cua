@@ -11,10 +11,12 @@ use core_foundation::base::{CFRelease, CFTypeRef};
 use cua_driver_core::background_input::{
     BackgroundTargetFacts, ElementAncestry, WindowServerOwnership,
 };
+use std::collections::{HashMap, HashSet};
 
 use super::bindings::{
     ax_get_window_id, copy_ax_windows, copy_bool_attr, copy_element_attr, copy_string_attr,
-    focused_element_of_pid, AXUIElementCreateApplication, AXUIElementRef,
+    focused_element_of_pid, kAXErrorSuccess, try_copy_ax_windows, AXUIElementCreateApplication,
+    AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use crate::windows::{all_automation_windows, resolve_window_owner, WindowOwner};
 
@@ -92,9 +94,54 @@ pub unsafe fn focused_element_in_window(pid: i32, window_id: u32) -> Option<AXUI
 /// One fresh `AXWindows` row: the mapped CGWindowID plus its minimized state.
 /// `minimized: None` means the attribute could not be read — unknown, not
 /// "not minimized".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AxWindowRecord {
     window_id: u32,
     minimized: Option<bool>,
+}
+
+/// Fresh evidence about whether one WindowServer row still has an exact AX
+/// top-level window. This deliberately does not call `WindowServerOnly`
+/// "closed": some applications expose legitimate compositor-only surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AxWindowLifecycleEvidence {
+    AxPresent {
+        minimized: Option<bool>,
+        app_hidden: Option<bool>,
+        snapshot_complete: bool,
+    },
+    WindowServerOnly {
+        app_hidden: Option<bool>,
+    },
+    AxUnavailable {
+        app_hidden: Option<bool>,
+        query_succeeded: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AxWindowSnapshot {
+    records: Vec<AxWindowRecord>,
+    complete: bool,
+}
+
+/// Hard bound on per-call exact AX window work. Each AX attribute read can use
+/// the 200 ms messaging timeout, so an unbounded AXWindows array would otherwise
+/// turn an opt-in lifecycle probe into an unbounded worker.
+const MAX_LIFECYCLE_AX_WINDOWS: usize = 32;
+
+fn bounded_ax_window_count(total: usize) -> (usize, bool) {
+    (
+        total.min(MAX_LIFECYCLE_AX_WINDOWS),
+        total <= MAX_LIFECYCLE_AX_WINDOWS,
+    )
+}
+
+fn read_minimized_if_requested<F>(requested: &HashSet<u32>, window_id: u32, read: F) -> Option<bool>
+where
+    F: FnOnce() -> Option<bool>,
+{
+    requested.contains(&window_id).then(read).flatten()
 }
 
 /// Map the application's fresh `AXWindows` through `_AXUIElementGetWindow`.
@@ -110,6 +157,128 @@ unsafe fn ax_window_records(app: AXUIElementRef) -> Vec<AxWindowRecord> {
             });
             CFRelease(window as CFTypeRef);
             record
+        })
+        .collect()
+}
+
+fn classify_ax_window_lifecycle(
+    snapshot: Option<&AxWindowSnapshot>,
+    window_id: u32,
+    app_hidden: Option<bool>,
+) -> AxWindowLifecycleEvidence {
+    let Some(snapshot) = snapshot else {
+        return AxWindowLifecycleEvidence::AxUnavailable {
+            app_hidden,
+            query_succeeded: false,
+        };
+    };
+    if let Some(record) = snapshot
+        .records
+        .iter()
+        .find(|record| record.window_id == window_id)
+    {
+        return AxWindowLifecycleEvidence::AxPresent {
+            minimized: record.minimized,
+            app_hidden,
+            snapshot_complete: snapshot.complete,
+        };
+    }
+    if snapshot.complete {
+        AxWindowLifecycleEvidence::WindowServerOnly { app_hidden }
+    } else {
+        AxWindowLifecycleEvidence::AxUnavailable {
+            app_hidden,
+            query_succeeded: true,
+        }
+    }
+}
+
+/// Gather one bounded, fresh `AXWindows` membership snapshot for a process and
+/// classify the requested CGWindowIDs against it.
+///
+/// This is intentionally opt-in from `list_windows`: the ordinary enumeration
+/// stays a cheap WindowServer read, while teardown/lifecycle consumers can ask
+/// for the additional proof needed to distinguish a minimized or off-Space AX
+/// window from a stale WindowServer-only row.
+pub(crate) fn gather_ax_window_lifecycle_evidence(
+    pid: i32,
+    window_ids: impl IntoIterator<Item = u32>,
+) -> HashMap<u32, AxWindowLifecycleEvidence> {
+    const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 0.2;
+
+    let window_ids: HashSet<u32> = window_ids.into_iter().collect();
+    if window_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    // SAFETY: the application element is created and released here. Every
+    // window returned from try_copy_ax_windows is released after its two
+    // bounded attributes are read.
+    let (records, app_hidden) = unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            (None, None)
+        } else {
+            if AXUIElementSetMessagingTimeout(app, AX_MESSAGING_TIMEOUT_SECONDS) != kAXErrorSuccess
+            {
+                CFRelease(app as CFTypeRef);
+                return window_ids
+                    .into_iter()
+                    .map(|window_id| {
+                        (
+                            window_id,
+                            AxWindowLifecycleEvidence::AxUnavailable {
+                                app_hidden: None,
+                                query_succeeded: false,
+                            },
+                        )
+                    })
+                    .collect();
+            }
+            super::enablement::ensure_chromium_ax_enabled(pid, app);
+            let app_hidden = copy_bool_attr(app, "AXHidden");
+            let records = try_copy_ax_windows(app).ok().map(|ax_snapshot| {
+                let (scan_count, within_limit) = bounded_ax_window_count(ax_snapshot.windows.len());
+                let mut records = Vec::with_capacity(scan_count);
+                let mut complete = ax_snapshot.complete && within_limit;
+                for (index, window) in ax_snapshot.windows.into_iter().enumerate() {
+                    if index >= scan_count {
+                        CFRelease(window as CFTypeRef);
+                        continue;
+                    }
+                    if AXUIElementSetMessagingTimeout(window, AX_MESSAGING_TIMEOUT_SECONDS)
+                        != kAXErrorSuccess
+                    {
+                        complete = false;
+                        CFRelease(window as CFTypeRef);
+                        continue;
+                    }
+                    if let Some(window_id) = ax_get_window_id(window) {
+                        records.push(AxWindowRecord {
+                            window_id,
+                            minimized: read_minimized_if_requested(&window_ids, window_id, || {
+                                copy_bool_attr(window, "AXMinimized")
+                            }),
+                        });
+                    } else {
+                        complete = false;
+                    }
+                    CFRelease(window as CFTypeRef);
+                }
+                AxWindowSnapshot { records, complete }
+            });
+            CFRelease(app as CFTypeRef);
+            (records, app_hidden)
+        }
+    };
+
+    window_ids
+        .into_iter()
+        .map(|window_id| {
+            (
+                window_id,
+                classify_ax_window_lifecycle(records.as_ref(), window_id, app_hidden),
+            )
         })
         .collect()
 }
@@ -207,7 +376,12 @@ pub fn gather_background_facts(
 
 #[cfg(test)]
 mod tests {
-    use super::{count_competing_keyboard_destinations, AxWindowRecord};
+    use super::{
+        bounded_ax_window_count, classify_ax_window_lifecycle,
+        count_competing_keyboard_destinations, read_minimized_if_requested,
+        AxWindowLifecycleEvidence, AxWindowRecord, AxWindowSnapshot, MAX_LIFECYCLE_AX_WINDOWS,
+    };
+    use std::{cell::Cell, collections::HashSet};
 
     fn ax_window(window_id: u32, minimized: Option<bool>) -> AxWindowRecord {
         AxWindowRecord {
@@ -258,5 +432,86 @@ mod tests {
             count_competing_keyboard_destinations(42, 10, rows, &records),
             0
         );
+    }
+
+    #[test]
+    fn lifecycle_evidence_distinguishes_minimized_ax_window_from_server_only_row() {
+        let records = [ax_window(10, Some(true)), ax_window(11, Some(false))];
+        let complete = AxWindowSnapshot {
+            records: records.to_vec(),
+            complete: true,
+        };
+
+        assert_eq!(
+            classify_ax_window_lifecycle(Some(&complete), 10, Some(false)),
+            AxWindowLifecycleEvidence::AxPresent {
+                minimized: Some(true),
+                app_hidden: Some(false),
+                snapshot_complete: true
+            }
+        );
+        assert_eq!(
+            classify_ax_window_lifecycle(Some(&complete), 99, Some(false)),
+            AxWindowLifecycleEvidence::WindowServerOnly {
+                app_hidden: Some(false)
+            }
+        );
+        assert_eq!(
+            classify_ax_window_lifecycle(None, 10, Some(false)),
+            AxWindowLifecycleEvidence::AxUnavailable {
+                app_hidden: Some(false),
+                query_succeeded: false
+            }
+        );
+    }
+
+    #[test]
+    fn partial_ax_mapping_never_becomes_authoritative_absence() {
+        let partial = AxWindowSnapshot {
+            records: vec![ax_window(10, Some(false))],
+            complete: false,
+        };
+
+        assert_eq!(
+            classify_ax_window_lifecycle(Some(&partial), 10, Some(false)),
+            AxWindowLifecycleEvidence::AxPresent {
+                minimized: Some(false),
+                app_hidden: Some(false),
+                snapshot_complete: false
+            }
+        );
+        assert_eq!(
+            classify_ax_window_lifecycle(Some(&partial), 99, Some(false)),
+            AxWindowLifecycleEvidence::AxUnavailable {
+                app_hidden: Some(false),
+                query_succeeded: true
+            }
+        );
+    }
+
+    #[test]
+    fn lifecycle_ax_scan_has_a_fixed_upper_bound() {
+        assert_eq!(bounded_ax_window_count(0), (0, true));
+        assert_eq!(
+            bounded_ax_window_count(MAX_LIFECYCLE_AX_WINDOWS),
+            (32, true)
+        );
+        assert_eq!(
+            bounded_ax_window_count(MAX_LIFECYCLE_AX_WINDOWS + 1),
+            (32, false)
+        );
+    }
+
+    #[test]
+    fn minimized_attribute_is_not_read_for_non_requested_ax_windows() {
+        let requested = HashSet::from([10]);
+        let called = Cell::new(false);
+        let minimized = read_minimized_if_requested(&requested, 11, || {
+            called.set(true);
+            Some(false)
+        });
+
+        assert_eq!(minimized, None);
+        assert!(!called.get());
     }
 }

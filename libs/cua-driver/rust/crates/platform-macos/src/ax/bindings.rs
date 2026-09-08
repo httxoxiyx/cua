@@ -687,6 +687,67 @@ pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
     }
 }
 
+pub(crate) struct AxWindowsSnapshot {
+    pub(crate) windows: Vec<AXUIElementRef>,
+    /// False when AXWindows contained any non-AX member. Callers making an
+    /// absence decision must treat that snapshot as incomplete.
+    pub(crate) complete: bool,
+}
+
+unsafe fn retain_ax_windows_from_array(
+    arr: &core_foundation::array::CFArray<CFTypeRef>,
+) -> AxWindowsSnapshot {
+    let ax_type_id = AXUIElementGetTypeID();
+    let mut windows = Vec::with_capacity(arr.len() as usize);
+    let mut complete = true;
+    for index in 0..arr.len() {
+        match arr.get(index) {
+            Some(item) if core_foundation::base::CFGetTypeID(*item) == ax_type_id => {
+                let item = *item;
+                CFRetain(item);
+                windows.push(item as AXUIElementRef);
+            }
+            _ => complete = false,
+        }
+    }
+    AxWindowsSnapshot { windows, complete }
+}
+
+/// Read the `AXWindows` attribute of an application element, preserving whether
+/// the AX query itself succeeded.
+///
+/// Unlike `AXChildren`, this returns the window list regardless of whether the
+/// app is frontmost. The returned elements are retained. An empty successful
+/// result is distinct from an AX failure so lifecycle callers do not mistake an
+/// unreadable application for one that positively omitted a window.
+///
+/// # Safety
+///
+/// `element` must be valid, and the caller must release every returned element.
+pub(crate) unsafe fn try_copy_ax_windows(
+    element: AXUIElementRef,
+) -> Result<AxWindowsSnapshot, AXError> {
+    let attr = CFStr::new("AXWindows");
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err != kAXErrorSuccess {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return Err(err);
+    }
+    if value.is_null() {
+        return Err(kAXErrorNoValue);
+    }
+    let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
+    if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
+        CFRelease(value);
+        return Err(kAXErrorFailure);
+    }
+    let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+    Ok(retain_ax_windows_from_array(&arr))
+}
+
 /// Read the `AXWindows` attribute of an application element.
 /// Unlike `AXChildren`, this returns the window list regardless of whether
 /// the app is frontmost. Returns a Vec of retained AXUIElementRefs.
@@ -695,36 +756,27 @@ pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
-    let attr = CFStr::new("AXWindows");
-    let mut value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if err != kAXErrorSuccess || value.is_null() {
-        return vec![];
-    }
-    let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
-    if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
-        CFRelease(value);
-        return vec![];
-    }
-    let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
-    let ax_type_id = AXUIElementGetTypeID();
-    (0..arr.len())
-        .filter_map(|i| {
-            let item = *arr.get(i)?;
-            if core_foundation::base::CFGetTypeID(item) == ax_type_id {
-                CFRetain(item);
-                Some(item as AXUIElementRef)
-            } else {
-                None
-            }
-        })
-        .collect()
+    try_copy_ax_windows(element)
+        .map(|snapshot| snapshot.windows)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_foundation::{boolean::CFBoolean, number::CFNumber};
+    use core_foundation::{
+        array::CFArray, base::TCFType, boolean::CFBoolean, number::CFNumber, string::CFString,
+    };
+
+    #[test]
+    fn non_ax_array_member_marks_window_snapshot_incomplete() {
+        let value = CFString::new("not-an-ax-window");
+        let array = CFArray::<CFTypeRef>::from_copyable(&[value.as_CFTypeRef()]);
+        let snapshot = unsafe { retain_ax_windows_from_array(&array) };
+
+        assert!(!snapshot.complete);
+        assert!(snapshot.windows.is_empty());
+    }
 
     #[test]
     fn stringish_value_coerces_cfstring_cfnumber_and_cfboolean() {
