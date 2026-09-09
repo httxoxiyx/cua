@@ -293,6 +293,14 @@ impl Tool for HotkeyTool {
             );
         }
 
+        // Revalidate before either background gating or foreground activation.
+        // A same-process modal can appear after observation, so a retained host
+        // target must redirect before any modifier transition is sent.
+        if let Err(refusal) = super::guard_same_pid_transient_target(requested_pid, window_id).await
+        {
+            return refusal;
+        }
+
         // Resolve modal view-service routing before element-cache lookup,
         // background gating, pixel focus, or any other input side effect. A
         // background hotkey never inherits the helper route; it fails closed

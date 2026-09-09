@@ -1,16 +1,30 @@
-//! Routing for app-owned UI that macOS renders in a transient helper process.
+//! Routing and detection for app-owned transient UI.
 //!
 //! AppKit and system frameworks sometimes put a modal prompt in an XPC view
 //! service rather than in the requesting application's process.  The helper is
 //! intentionally absent from `list_apps`, but its WindowServer surface still
 //! needs to be observable and, after an explicit foreground escalation,
 //! keyboard-addressable through the host application's stable public target.
+//!
+//! Some applications (notably Blender) instead create a second layer-0 window
+//! in the same process for a modal workflow.  Capturing the original window can
+//! still composite that front window into the returned image, while coordinates
+//! and input remain scoped to the original CGWindowID.  The bounded detector
+//! below recognizes only one uniquely focused, contained, frontmost successor;
+//! callers must then re-address that exact window rather than silently replaying
+//! coordinates against the cached host.
 
 use std::{
     collections::HashMap,
     sync::{Mutex, MutexGuard},
 };
 
+use core_foundation::base::{CFRelease, CFTypeRef};
+
+use crate::ax::bindings::{
+    ax_get_window_id, copy_bool_attr, copy_string_attr, try_copy_ax_windows,
+    AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
+};
 use crate::windows::{WindowBounds, WindowInfo};
 
 // AppKit's `NSModalPanelWindowLevel` / CoreGraphics layer for modal panels.
@@ -21,6 +35,8 @@ const SHORTCUTS_HOST_BUNDLE_ID: &str = "com.apple.shortcuts";
 const SHORTCUTS_HELPER_BUNDLE_ID: &str = "com.apple.WorkflowKit.ShortcutsViewService";
 const SHORTCUTS_HELPER_SYSTEM_PATH: &str = "/System/Library/PrivateFrameworks/WorkflowKit.framework/XPCServices/ShortcutsViewService.xpc/Contents/MacOS/ShortcutsViewService";
 const CRYPTEX_SYSTEM_PREFIX: &str = "/System/Volumes/Preboot/Cryptexes/";
+const BLENDER_BUNDLE_ID: &str = "org.blenderfoundation.blender";
+const BLENDER_FILE_VIEW_TITLE: &str = "Blender File View";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct WindowTarget {
@@ -78,6 +94,62 @@ pub(crate) enum TransientHelperDetection {
     None,
     Unique(WindowTarget),
     Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SamePidTransientClassification {
+    DialogMetadata,
+    TrustedBlenderFileView,
+}
+
+impl SamePidTransientClassification {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DialogMetadata => "dialog_metadata",
+            Self::TrustedBlenderFileView => "trusted_blender_file_view",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SamePidTransientProof {
+    pub(crate) source: WindowTarget,
+    pub(crate) target: WindowTarget,
+    pub(crate) classification: SamePidTransientClassification,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SamePidTransientDetection {
+    None,
+    Unique(SamePidTransientProof),
+    Ambiguous,
+    Indeterminate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SamePidAxWindowFacts {
+    window_id: u32,
+    /// Position in the application's `AXWindows` array (front/focused first).
+    order: usize,
+    subrole: Option<String>,
+    identifier: Option<String>,
+    modal: Option<bool>,
+    focused: Option<bool>,
+    main: Option<bool>,
+}
+
+impl SamePidAxWindowFacts {
+    fn has_dialog_metadata(&self) -> bool {
+        self.modal == Some(true)
+            || self
+                .subrole
+                .as_deref()
+                .is_some_and(|value| matches!(value, "AXDialog" | "AXSystemDialog" | "AXSheet"))
+            || self
+                .identifier
+                .as_deref()
+                .is_some_and(|value| matches!(value, "open-panel" | "save-panel"))
+    }
 }
 
 impl TransientHelperDetection {
@@ -240,6 +312,204 @@ impl TransientUiRegistry {
 
 pub(crate) fn resolve_visible_transient_helper(source: WindowTarget) -> Option<WindowTarget> {
     detect_visible_transient_helper(source).unique_target()
+}
+
+/// Detect a same-process transient window that has taken exclusive foreground
+/// ownership from `source`.
+///
+/// This is intentionally much narrower than "pick the topmost window for the
+/// pid".  A candidate must be a live layer-0 AX window on the same current
+/// Space, strictly contained by the requested source, precede it in the app's
+/// AX window order, and be both the application's focused and main AX window
+/// while the source is neither. Generic windows additionally require native
+/// dialog/modal metadata. Blender 4.5's File View exposes neither, so its only
+/// fallback is a deliberately narrow bundle-id plus exact native window-title
+/// allowlist. A merely focused, contained sibling is never redirectable.
+pub(crate) fn detect_same_pid_transient_in_front(
+    source: WindowTarget,
+) -> SamePidTransientDetection {
+    let enumeration = crate::windows::all_automation_windows_with_space_snapshot();
+    if !enumeration.succeeded {
+        return SamePidTransientDetection::Indeterminate;
+    }
+    let windows = enumeration.windows;
+    // Avoid an AX round-trip on the overwhelmingly common single-window path.
+    // WindowServer geometry is only a prefilter; it never authorizes a
+    // redirect without the exact AX focus/main proof collected below.
+    if !has_same_pid_transient_geometry_candidate(&windows, source) {
+        return SamePidTransientDetection::None;
+    }
+    let ax_facts = match same_pid_ax_window_facts(source.pid) {
+        Ok(facts) => facts,
+        Err(()) => return SamePidTransientDetection::Indeterminate,
+    };
+    let trusted_blender_file_view =
+        crate::apps::bundle_id_for_pid(source.pid).as_deref() == Some(BLENDER_BUNDLE_ID);
+    detect_same_pid_transient_in_front_in(
+        &windows,
+        Some(&ax_facts),
+        source,
+        trusted_blender_file_view,
+    )
+}
+
+fn has_same_pid_transient_geometry_candidate(windows: &[WindowInfo], source: WindowTarget) -> bool {
+    let Some(source_window) = eligible_same_pid_source(windows, source) else {
+        return false;
+    };
+    windows
+        .iter()
+        .any(|candidate| is_same_pid_transient_geometry_candidate(candidate, source_window))
+}
+
+fn same_pid_ax_window_facts(pid: i32) -> Result<Vec<SamePidAxWindowFacts>, ()> {
+    const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 0.2;
+
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return Err(());
+        }
+        let _ = AXUIElementSetMessagingTimeout(app, AX_MESSAGING_TIMEOUT_SECONDS);
+        let snapshot = match try_copy_ax_windows(app) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                CFRelease(app as CFTypeRef);
+                return Err(());
+            }
+        };
+        CFRelease(app as CFTypeRef);
+
+        let mut complete = snapshot.complete;
+        let facts = snapshot
+            .windows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(order, window)| {
+                let _ = AXUIElementSetMessagingTimeout(window, AX_MESSAGING_TIMEOUT_SECONDS);
+                let facts = ax_get_window_id(window).map(|window_id| SamePidAxWindowFacts {
+                    window_id,
+                    order,
+                    subrole: copy_string_attr(window, "AXSubrole"),
+                    identifier: copy_string_attr(window, "AXIdentifier"),
+                    modal: copy_bool_attr(window, "AXModal"),
+                    focused: copy_bool_attr(window, "AXFocused"),
+                    main: copy_bool_attr(window, "AXMain"),
+                });
+                if facts.is_none() {
+                    complete = false;
+                }
+                CFRelease(window as CFTypeRef);
+                facts
+            })
+            .collect::<Vec<_>>();
+        complete.then_some(facts).ok_or(())
+    }
+}
+
+fn detect_same_pid_transient_in_front_in(
+    windows: &[WindowInfo],
+    ax_facts: Option<&[SamePidAxWindowFacts]>,
+    source: WindowTarget,
+    trusted_blender_file_view: bool,
+) -> SamePidTransientDetection {
+    let Some(source_window) = eligible_same_pid_source(windows, source) else {
+        return SamePidTransientDetection::None;
+    };
+    let Some(ax_facts) = ax_facts else {
+        return SamePidTransientDetection::Indeterminate;
+    };
+    let Some(source_ax) = ax_facts
+        .iter()
+        .find(|facts| facts.window_id == source.window_id)
+    else {
+        return SamePidTransientDetection::Indeterminate;
+    };
+    let (Some(source_focused), Some(source_main)) = (source_ax.focused, source_ax.main) else {
+        return SamePidTransientDetection::Indeterminate;
+    };
+
+    let mut matches = Vec::new();
+    let mut unproven_focused_successor = false;
+    for candidate in windows {
+        if !is_same_pid_transient_geometry_candidate(candidate, source_window) {
+            continue;
+        }
+        let Some(candidate_ax) = ax_facts
+            .iter()
+            .find(|facts| facts.window_id == candidate.window_id)
+        else {
+            return SamePidTransientDetection::Indeterminate;
+        };
+        let (Some(candidate_focused), Some(candidate_main)) =
+            (candidate_ax.focused, candidate_ax.main)
+        else {
+            return SamePidTransientDetection::Indeterminate;
+        };
+        let exclusive_focus_handoff = candidate_ax.order < source_ax.order
+            && candidate_focused
+            && candidate_main
+            && !source_focused
+            && !source_main;
+        if !exclusive_focus_handoff {
+            continue;
+        }
+        let classification = if candidate_ax.has_dialog_metadata() {
+            Some(SamePidTransientClassification::DialogMetadata)
+        } else if trusted_blender_file_view && candidate.title == BLENDER_FILE_VIEW_TITLE {
+            Some(SamePidTransientClassification::TrustedBlenderFileView)
+        } else {
+            None
+        };
+        let Some(classification) = classification else {
+            unproven_focused_successor = true;
+            continue;
+        };
+        matches.push(SamePidTransientProof {
+            source,
+            target: WindowTarget {
+                pid: candidate.pid,
+                window_id: candidate.window_id,
+            },
+            classification,
+        });
+    }
+
+    if unproven_focused_successor || matches.len() > 1 {
+        return SamePidTransientDetection::Ambiguous;
+    }
+    let Some(candidate) = matches.into_iter().next() else {
+        return SamePidTransientDetection::None;
+    };
+    SamePidTransientDetection::Unique(candidate)
+}
+
+fn eligible_same_pid_source(windows: &[WindowInfo], source: WindowTarget) -> Option<&WindowInfo> {
+    windows.iter().find(|window| {
+        window.pid == source.pid
+            && window.window_id == source.window_id
+            && window.layer == 0
+            && window.is_on_screen
+            && window.on_current_space == Some(true)
+    })
+}
+
+fn is_same_pid_transient_geometry_candidate(candidate: &WindowInfo, source: &WindowInfo) -> bool {
+    candidate.pid == source.pid
+        && candidate.window_id != source.window_id
+        && candidate.layer == 0
+        && candidate.is_on_screen
+        && candidate.on_current_space == Some(true)
+        && !candidate.title.trim().is_empty()
+        && contained_by(&candidate.bounds, &source.bounds)
+        && same_known_space(candidate, source)
+}
+
+fn same_known_space(left: &WindowInfo, right: &WindowInfo) -> bool {
+    match (left.current_space_id, right.current_space_id) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 pub(crate) fn detect_visible_transient_helper(source: WindowTarget) -> TransientHelperDetection {
@@ -478,6 +748,270 @@ mod tests {
 
     fn session(name: &str) -> TransientSessionKey {
         TransientSessionKey::Session(name.to_owned())
+    }
+
+    fn same_pid_ax(
+        window_id: u32,
+        order: usize,
+        focused: bool,
+        main: bool,
+        modal: bool,
+    ) -> SamePidAxWindowFacts {
+        SamePidAxWindowFacts {
+            window_id,
+            order,
+            subrole: Some("AXStandardWindow".into()),
+            identifier: None,
+            modal: Some(modal),
+            focused: Some(focused),
+            main: Some(main),
+        }
+    }
+
+    fn current_window(
+        pid: i32,
+        window_id: u32,
+        title: &str,
+        z_index: usize,
+        bounds: WindowBounds,
+    ) -> WindowInfo {
+        let mut window = window(pid, window_id, "Blender", title, 0, bounds);
+        window.z_index = z_index;
+        window.current_space_id = Some(1);
+        window.on_current_space = Some(true);
+        window.space_ids = Some(vec![1]);
+        window
+    }
+
+    #[test]
+    fn detects_only_the_trusted_blender_file_view_fallback() {
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 100,
+        };
+        let windows = vec![
+            current_window(
+                42,
+                200,
+                BLENDER_FILE_VIEW_TITLE,
+                // Blender's File View can be visually composited above its
+                // host even when CGWindow ordering reports the host first.
+                5,
+                rect(200.0, 180.0, 600.0, 420.0),
+            ),
+            current_window(
+                42,
+                100,
+                "arbitrary host title",
+                10,
+                rect(0.0, 0.0, 1000.0, 800.0),
+            ),
+        ];
+        let ax_facts = vec![
+            same_pid_ax(200, 0, true, true, false),
+            same_pid_ax(100, 1, false, false, false),
+        ];
+
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&ax_facts), source, true),
+            SamePidTransientDetection::Unique(SamePidTransientProof {
+                source,
+                target: WindowTarget {
+                    pid: 42,
+                    window_id: 200,
+                },
+                classification: SamePidTransientClassification::TrustedBlenderFileView,
+            })
+        );
+    }
+
+    #[test]
+    fn contained_ordinary_same_pid_sibling_is_refused_without_redirect() {
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 100,
+        };
+        let windows = vec![
+            current_window(
+                42,
+                200,
+                "other document",
+                20,
+                rect(200.0, 180.0, 600.0, 420.0),
+            ),
+            current_window(42, 100, "host document", 10, rect(0.0, 0.0, 1000.0, 800.0)),
+        ];
+        let ax_facts = vec![
+            same_pid_ax(200, 0, true, true, false),
+            same_pid_ax(100, 1, false, false, false),
+        ];
+
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&ax_facts), source, true),
+            SamePidTransientDetection::Ambiguous,
+            "focus and containment alone must never authorize a sibling redirect"
+        );
+    }
+
+    #[test]
+    fn native_dialog_metadata_allows_a_generic_same_pid_redirect() {
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 100,
+        };
+        let windows = vec![
+            current_window(42, 200, "Confirm", 20, rect(200.0, 180.0, 600.0, 420.0)),
+            current_window(42, 100, "host", 10, rect(0.0, 0.0, 1000.0, 800.0)),
+        ];
+        let ax_facts = vec![
+            same_pid_ax(200, 0, true, true, true),
+            same_pid_ax(100, 1, false, false, false),
+        ];
+
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&ax_facts), source, false),
+            SamePidTransientDetection::Unique(SamePidTransientProof {
+                source,
+                target: WindowTarget {
+                    pid: 42,
+                    window_id: 200,
+                },
+                classification: SamePidTransientClassification::DialogMetadata,
+            })
+        );
+    }
+
+    #[test]
+    fn geometry_candidate_with_unavailable_ax_evidence_is_indeterminate() {
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 100,
+        };
+        let windows = vec![
+            current_window(42, 200, "child", 20, rect(200.0, 180.0, 600.0, 420.0)),
+            current_window(42, 100, "host", 10, rect(0.0, 0.0, 1000.0, 800.0)),
+        ];
+
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, None, source, false),
+            SamePidTransientDetection::Indeterminate
+        );
+
+        let source_only = vec![same_pid_ax(100, 1, false, false, false)];
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&source_only), source, false),
+            SamePidTransientDetection::Indeterminate,
+            "an unmapped geometry candidate must not be treated as absent"
+        );
+
+        let mut unknown_focus = same_pid_ax(200, 0, true, true, true);
+        unknown_focus.focused = None;
+        let incomplete = vec![unknown_focus, same_pid_ax(100, 1, false, false, false)];
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&incomplete), source, false),
+            SamePidTransientDetection::Indeterminate,
+            "unknown required focus metadata must fail closed"
+        );
+    }
+
+    #[test]
+    fn does_not_redirect_to_an_ordinary_same_pid_sibling() {
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 100,
+        };
+        let windows = vec![
+            current_window(
+                42,
+                200,
+                "other document",
+                20,
+                rect(1100.0, 0.0, 600.0, 700.0),
+            ),
+            current_window(42, 100, "host document", 10, rect(0.0, 0.0, 1000.0, 800.0)),
+        ];
+        let ax_facts = vec![
+            same_pid_ax(200, 0, true, true, false),
+            same_pid_ax(100, 1, false, false, false),
+        ];
+
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&ax_facts), source, false),
+            SamePidTransientDetection::None,
+            "a focused sibling is not enough without containment"
+        );
+    }
+
+    #[test]
+    fn requires_an_exclusive_focus_handoff_even_for_contained_windows() {
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 100,
+        };
+        let windows = vec![
+            current_window(42, 200, "palette", 20, rect(200.0, 180.0, 600.0, 420.0)),
+            current_window(42, 100, "host", 10, rect(0.0, 0.0, 1000.0, 800.0)),
+        ];
+        let ax_facts = vec![
+            same_pid_ax(200, 0, false, false, false),
+            same_pid_ax(100, 1, true, true, false),
+        ];
+
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&ax_facts), source, false),
+            SamePidTransientDetection::None
+        );
+    }
+
+    #[test]
+    fn requires_the_transient_to_precede_the_source_in_ax_window_order() {
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 100,
+        };
+        let windows = vec![
+            current_window(
+                42,
+                200,
+                "contained sibling",
+                20,
+                rect(200.0, 180.0, 600.0, 420.0),
+            ),
+            current_window(42, 100, "host", 10, rect(0.0, 0.0, 1000.0, 800.0)),
+        ];
+        let ax_facts = vec![
+            same_pid_ax(100, 0, false, false, false),
+            same_pid_ax(200, 1, true, true, false),
+        ];
+
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&ax_facts), source, false),
+            SamePidTransientDetection::None,
+            "focus flags alone do not override the app's AX window order"
+        );
+    }
+
+    #[test]
+    fn multiple_proven_successors_fail_closed_as_ambiguous() {
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 100,
+        };
+        let windows = vec![
+            current_window(42, 200, "first", 30, rect(100.0, 100.0, 700.0, 500.0)),
+            current_window(42, 300, "second", 20, rect(200.0, 180.0, 600.0, 420.0)),
+            current_window(42, 100, "host", 10, rect(0.0, 0.0, 1000.0, 800.0)),
+        ];
+        let ax_facts = vec![
+            same_pid_ax(200, 0, true, true, true),
+            same_pid_ax(300, 1, true, true, true),
+            same_pid_ax(100, 2, false, false, false),
+        ];
+
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&ax_facts), source, false),
+            SamePidTransientDetection::Ambiguous
+        );
     }
 
     #[test]

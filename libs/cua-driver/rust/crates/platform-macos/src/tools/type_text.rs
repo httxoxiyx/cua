@@ -243,6 +243,14 @@ impl Tool for TypeTextTool {
             );
         }
 
+        // Revalidate before either background gating or foreground activation.
+        // A same-process modal can appear after observation, so a retained host
+        // target must redirect before any text is sent.
+        if let Err(refusal) = super::guard_same_pid_transient_target(requested_pid, window_id).await
+        {
+            return refusal;
+        }
+
         let foreground_target = if delivery_mode.is_foreground() {
             let transient_session = crate::transient_ui::TransientSessionKey::from_args(&args);
             match super::resolve_foreground_keyboard_target(

@@ -1028,6 +1028,102 @@ pub(crate) fn transient_ui_direct_target_refusal(
     }))
 }
 
+pub(crate) fn same_pid_transient_refusal(
+    proof: crate::transient_ui::SamePidTransientProof,
+) -> cua_driver_core::protocol::ToolResult {
+    let dialog_metadata = matches!(
+        proof.classification,
+        crate::transient_ui::SamePidTransientClassification::DialogMetadata
+    );
+    cua_driver_core::protocol::ToolResult::error(
+        "A unique same-process transient window is focused above the requested window. Re-observe that exact transient before acting; no input was sent.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "same_pid_transient_in_front",
+        "effect": "refused",
+        "pid": proof.source.pid,
+        "window_id": proof.source.window_id,
+        "retryable": true,
+        "redirect": {
+            "kind": "same_pid_modal",
+            "pid": proof.target.pid,
+            "window_id": proof.target.window_id,
+            "proof": {
+                "same_pid": true,
+                "unique": true,
+                "layer_zero": true,
+                "on_current_space": true,
+                "above_source": true,
+                "contained_by_source": true,
+                "ax_window_live": true,
+                "focused": true,
+                "main": true,
+                "dialog_metadata": dialog_metadata,
+                "classification": proof.classification.as_str()
+            }
+        },
+        "suggestion": "Call get_window_state with the redirect pid/window_id, then use only that fresh observation for input."
+    }))
+}
+
+pub(crate) async fn guard_same_pid_transient_target(
+    pid: i32,
+    window_id: Option<u32>,
+) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    let Some(window_id) = window_id else {
+        return Ok(());
+    };
+    let source = crate::transient_ui::WindowTarget { pid, window_id };
+    let detection = tokio::task::spawn_blocking(move || {
+        crate::transient_ui::detect_same_pid_transient_in_front(source)
+    })
+    .await
+    .map_err(|error| {
+        cua_driver_core::protocol::ToolResult::error(format!(
+            "Could not check for a same-process transient before input: {error}"
+        ))
+        .with_structured(serde_json::json!({
+            "code": "same_pid_transient_resolution_failed",
+            "effect": "refused",
+            "pid": pid,
+            "window_id": window_id,
+            "retryable": true
+        }))
+    })?;
+    match detection {
+        crate::transient_ui::SamePidTransientDetection::None => Ok(()),
+        crate::transient_ui::SamePidTransientDetection::Unique(proof) => {
+            Err(same_pid_transient_refusal(proof))
+        }
+        crate::transient_ui::SamePidTransientDetection::Ambiguous => Err(
+            cua_driver_core::protocol::ToolResult::error(
+                "One or more same-process windows cover the requested target, but no unique trusted modal successor could be proven. No input was sent.",
+            )
+            .with_structured(serde_json::json!({
+                "code": "same_pid_transient_ambiguous",
+                "effect": "refused",
+                "pid": pid,
+                "window_id": window_id,
+                "retryable": true,
+                "suggestion": "Close extra transient windows and observe the app again."
+            })),
+        ),
+        crate::transient_ui::SamePidTransientDetection::Indeterminate => Err(
+            cua_driver_core::protocol::ToolResult::error(
+                "A same-process window may cover the requested target, but its accessibility relationship could not be proven. No input was sent.",
+            )
+            .with_structured(serde_json::json!({
+                "code": "same_pid_transient_resolution_failed",
+                "effect": "refused",
+                "pid": pid,
+                "window_id": window_id,
+                "retryable": true,
+                "suggestion": "Re-observe the app after the transient settles or close the extra window."
+            })),
+        ),
+    }
+}
+
 pub(crate) async fn guard_transient_pointer_target(
     state: &ToolState,
     session: &crate::transient_ui::TransientSessionKey,
@@ -1690,6 +1786,49 @@ mod transient_keyboard_routing_tests {
         assert_eq!(
             direct.structured_content.unwrap()["code"],
             "transient_ui_direct_target_unsupported"
+        );
+    }
+
+    #[test]
+    fn same_pid_transient_refusal_exposes_only_a_narrow_exact_redirect() {
+        let refusal = same_pid_transient_refusal(crate::transient_ui::SamePidTransientProof {
+            source: crate::transient_ui::WindowTarget {
+                pid: 42,
+                window_id: 100,
+            },
+            target: crate::transient_ui::WindowTarget {
+                pid: 42,
+                window_id: 200,
+            },
+            classification:
+                crate::transient_ui::SamePidTransientClassification::TrustedBlenderFileView,
+        });
+        assert_eq!(refusal.is_error, Some(true));
+        let structured = refusal.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], "same_pid_transient_in_front");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["pid"], 42);
+        assert_eq!(structured["window_id"], 100);
+        assert_eq!(structured["redirect"]["kind"], "same_pid_modal");
+        assert_eq!(structured["redirect"]["pid"], 42);
+        assert_eq!(structured["redirect"]["window_id"], 200);
+        for field in [
+            "same_pid",
+            "unique",
+            "layer_zero",
+            "on_current_space",
+            "above_source",
+            "contained_by_source",
+            "ax_window_live",
+            "focused",
+            "main",
+        ] {
+            assert_eq!(structured["redirect"]["proof"][field], true, "{field}");
+        }
+        assert_eq!(structured["redirect"]["proof"]["dialog_metadata"], false);
+        assert_eq!(
+            structured["redirect"]["proof"]["classification"],
+            "trusted_blender_file_view"
         );
     }
 }

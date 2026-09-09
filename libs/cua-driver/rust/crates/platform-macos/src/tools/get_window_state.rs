@@ -440,6 +440,18 @@ impl Tool for GetWindowStateTool {
             }
         }
 
+        // Window-specific capture APIs can composite a same-process child
+        // window over the requested host even though input remains addressed
+        // to the host CGWindowID.  Refuse that split-brain observation and
+        // return one narrowly proven redirect instead.  The caller must make a
+        // second exact get_window_state call for the transient, which keeps the
+        // normal exact-window cache/token contract intact.
+        if let Err(refusal) =
+            super::guard_same_pid_transient_target(requested_pid, Some(requested_window_id)).await
+        {
+            return refusal;
+        }
+
         // A modal UI can be rendered by an AppKit/XPC helper while the
         // public app identity and cached host window remain stable. Resolve
         // only the explicitly trusted Shortcuts → system WorkflowKit service

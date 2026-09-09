@@ -137,6 +137,9 @@ impl Tool for RightClickTool {
         if element_index.is_some() && window_id.is_none() {
             return ToolResult::error("window_id is required when element_index is used.");
         }
+        if let Err(refusal) = super::guard_same_pid_transient_target(pid, window_id).await {
+            return refusal;
+        }
         let transient_session = crate::transient_ui::TransientSessionKey::from_args(&args);
         if let Err(refusal) =
             super::guard_transient_pointer_target(&self.state, &transient_session, pid, window_id)

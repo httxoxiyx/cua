@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use pip_preview::{
     PipBackend, PipBackendFactory, PipConfig, PipFrame, PipGeometry, PipViewModel,
@@ -77,11 +77,10 @@ struct ClickedTarget {
 
 #[derive(Default)]
 struct ForegroundVisibilityState {
-    suppressed_pid: Option<i64>,
+    suppressed_pids: HashSet<i64>,
 }
 
-struct SuppressedForegroundWatcher {
-    pid: i64,
+struct ForegroundVisibilityWatcher {
     cancelled: Arc<AtomicBool>,
 }
 
@@ -112,11 +111,10 @@ static CARD_GESTURE: Mutex<Option<CardGesture>> = Mutex::new(None);
 static CURSOR_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 static FOREGROUND_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 static LAST_FOREGROUND_CHECK_MS: AtomicU64 = AtomicU64::new(0);
-static FOREGROUND_VISIBILITY_STATE: Mutex<ForegroundVisibilityState> =
-    Mutex::new(ForegroundVisibilityState {
-        suppressed_pid: None,
-    });
-static SUPPRESSED_FOREGROUND_WATCHER: Mutex<Option<SuppressedForegroundWatcher>> = Mutex::new(None);
+static FOREGROUND_CLOCK_ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+static FOREGROUND_VISIBILITY_STATE: LazyLock<Mutex<ForegroundVisibilityState>> =
+    LazyLock::new(|| Mutex::new(ForegroundVisibilityState::default()));
+static FOREGROUND_VISIBILITY_WATCHER: Mutex<Option<ForegroundVisibilityWatcher>> = Mutex::new(None);
 static LIVE_STREAMS: LazyLock<Mutex<HashMap<i64, LiveStreamEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -139,6 +137,7 @@ const MINIMUM_PIP_HEIGHT: f64 = 180.0;
 const MAXIMUM_DEFAULT_PIP_WIDTH: f64 = 480.0;
 const MAXIMUM_DEFAULT_PIP_HEIGHT: f64 = 300.0;
 const CLICK_DRAG_THRESHOLD: f64 = 4.0;
+const PIP_WINDOW_LEVEL: i64 = 3;
 
 const RESIZE_LEFT: isize = 1;
 const RESIZE_RIGHT: isize = 2;
@@ -255,7 +254,7 @@ impl PipBackend for MacosPipBackend {
     }
 
     fn shutdown(self: Box<Self>) {
-        stop_suppressed_foreground_watcher();
+        stop_foreground_visibility_watcher();
         stop_all_live_capture();
         dispatch_to_main((), shutdown_cb);
     }
@@ -312,7 +311,7 @@ unsafe extern "C" fn push_frame_cb(ctx: *mut c_void) {
     if outcome.window_changed {
         stop_live_capture_for(pid);
     }
-    let (snapshot, _) = refresh_live_candidates();
+    let snapshot = current_snapshot();
     render_snapshot(&snapshot);
 }
 
@@ -346,35 +345,97 @@ fn current_snapshot() -> Vec<PipFrame> {
         .unwrap_or_default()
 }
 
-fn frame_is_suppressed(frame: &PipFrame, suppressed_pid: Option<i64>) -> bool {
-    suppressed_pid == Some(frame.target.pid)
+fn frame_is_suppressed(frame: &PipFrame, suppressed_pids: &HashSet<i64>) -> bool {
+    suppressed_pids.contains(&frame.target.pid)
 }
 
-fn frame_needs_live_capture(frame: &PipFrame, suppressed_pid: Option<i64>) -> bool {
-    !frame_is_suppressed(frame, suppressed_pid)
+fn frame_needs_live_capture(frame: &PipFrame, suppressed_pids: &HashSet<i64>) -> bool {
+    !frame_is_suppressed(frame, suppressed_pids)
 }
 
-fn foreground_candidate_pid(snapshot: &[PipFrame], frontmost_pid: Option<i32>) -> Option<i64> {
-    let frontmost_pid = i64::from(frontmost_pid?);
+fn snapshot_candidate_pid(snapshot: &[PipFrame], pid: Option<i32>) -> Option<i64> {
+    let pid = i64::from(pid?);
     snapshot
         .iter()
-        .any(|frame| frame.target.pid == frontmost_pid)
-        .then_some(frontmost_pid)
+        .any(|frame| frame.target.pid == pid)
+        .then_some(pid)
+}
+
+fn visually_frontmost_pid_in(
+    windows: &[crate::windows::WindowInfo],
+    local_pid: i32,
+    mut is_auxiliary: impl FnMut(i32) -> bool,
+) -> Option<i32> {
+    let mut candidates = windows
+        .iter()
+        .filter(|window| {
+            window.pid > 0
+                && window.pid != local_pid
+                && window.layer == 0
+                && window.is_on_screen
+                && window.on_current_space != Some(false)
+                && window.bounds.width > 1.0
+                && window.bounds.height > 1.0
+                && !window.app_name.trim().is_empty()
+        })
+        .collect::<Vec<_>>();
+    // `WindowInfo::z_index` normalizes WindowServer's front-to-back order so
+    // larger values are closer to the front. Keep this aligned with
+    // `windows::resolve_main_window_id_in` and its ordering contract.
+    candidates.sort_by_key(|window| std::cmp::Reverse(window.z_index));
+
+    let mut checked_pids = HashSet::new();
+    candidates.into_iter().find_map(|window| {
+        if !checked_pids.insert(window.pid) || is_auxiliary(window.pid) {
+            return None;
+        }
+        Some(window.pid)
+    })
+}
+
+fn foreground_candidate_pids(
+    snapshot: &[PipFrame],
+    workspace_frontmost_pid: Option<i32>,
+    visual_frontmost_pid: Option<i32>,
+) -> HashSet<i64> {
+    // A background-delivered modal can be visibly above every other app while
+    // NSWorkspace continues to report the user's terminal as active. Suppress
+    // both matching owners rather than letting the visual result replace the
+    // active application. WindowServer exposes one global ordering across
+    // displays, so the visual member remains a best-effort multi-display hint;
+    // the authoritative NSWorkspace member is always retained alongside it.
+    [workspace_frontmost_pid, visual_frontmost_pid]
+        .into_iter()
+        .filter_map(|pid| snapshot_candidate_pid(snapshot, pid))
+        .collect()
+}
+
+fn foreground_visibility_watcher_needed(snapshot: &[PipFrame]) -> bool {
+    !snapshot.is_empty()
 }
 
 fn update_foreground_visibility_state(
     state: &mut ForegroundVisibilityState,
-    observed_pid: Option<i64>,
-) -> Option<i64> {
-    state.suppressed_pid = observed_pid;
-    observed_pid
+    observed_pids: HashSet<i64>,
+) -> bool {
+    let changed = state.suppressed_pids != observed_pids;
+    state.suppressed_pids = observed_pids;
+    changed
 }
 
-fn refresh_live_candidates() -> (Vec<PipFrame>, bool) {
-    let live_targets = crate::windows::all_windows()
-        .into_iter()
-        .map(|window| (i64::from(window.pid), u64::from(window.window_id)))
-        .collect::<HashSet<_>>();
+fn live_targets_from_window_enumeration(
+    enumeration: &crate::windows::WindowEnumeration,
+) -> Option<HashSet<(i64, u64)>> {
+    enumeration.succeeded.then(|| {
+        enumeration
+            .windows
+            .iter()
+            .map(|window| (i64::from(window.pid), u64::from(window.window_id)))
+            .collect()
+    })
+}
+
+fn refresh_live_candidates(live_targets: &HashSet<(i64, u64)>) -> (Vec<PipFrame>, bool) {
     let (snapshot, removed_pids) = {
         let mut model = VIEW_MODEL.lock().unwrap();
         let Some(model) = model.as_mut() else {
@@ -402,16 +463,12 @@ fn foreground_visibility_check_is_due(now_ms: u64, previous_ms: u64) -> bool {
             >= FOREGROUND_VISIBILITY_CHECK_INTERVAL.as_millis() as u64
 }
 
-fn candidate_refresh_requires_render(
-    previous_suppressed_pid: Option<i64>,
-    suppressed_pid: Option<i64>,
-    candidates_changed: bool,
-) -> bool {
-    previous_suppressed_pid != suppressed_pid || candidates_changed
+fn candidate_refresh_requires_render(suppression_changed: bool, candidates_changed: bool) -> bool {
+    suppression_changed || candidates_changed
 }
 
 unsafe fn refresh_foreground_visibility_if_due() {
-    let now_ms = wall_clock_ms();
+    let now_ms = monotonic_ms();
     let previous_ms = LAST_FOREGROUND_CHECK_MS.load(Ordering::Acquire);
     if !foreground_visibility_check_is_due(now_ms, previous_ms)
         || LAST_FOREGROUND_CHECK_MS
@@ -421,14 +478,32 @@ unsafe fn refresh_foreground_visibility_if_due() {
         return;
     }
 
-    let (snapshot, candidates_changed) = refresh_live_candidates();
-    let observed = foreground_candidate_pid(&snapshot, crate::apps::frontmost_pid());
+    // One raw WindowServer snapshot drives both liveness and visual-frontmost
+    // selection. A failed enumeration is not authoritative absence: retain all
+    // cards and retry on the next tick rather than deleting the session state.
+    let enumeration = crate::windows::all_windows_including_accessory_layers_with_snapshot();
+    let Some(live_targets) = live_targets_from_window_enumeration(&enumeration) else {
+        return;
+    };
+    let (snapshot, candidates_changed) = refresh_live_candidates(&live_targets);
+    let local_pid = i32::try_from(std::process::id()).ok();
+    let visual_frontmost_pid = local_pid.and_then(|local_pid| {
+        visually_frontmost_pid_in(
+            &enumeration.windows,
+            local_pid,
+            crate::apps::is_auxiliary_application,
+        )
+    });
+    let suppressed = foreground_candidate_pids(
+        &snapshot,
+        crate::apps::frontmost_pid(),
+        visual_frontmost_pid,
+    );
     let mut state = FOREGROUND_VISIBILITY_STATE.lock().unwrap();
-    let previous = state.suppressed_pid;
-    let suppressed = update_foreground_visibility_state(&mut state, observed);
+    let suppression_changed = update_foreground_visibility_state(&mut state, suppressed.clone());
     drop(state);
-    if candidate_refresh_requires_render(previous, suppressed, candidates_changed) {
-        render_snapshot_with_suppressed_window(&snapshot, suppressed);
+    if candidate_refresh_requires_render(suppression_changed, candidates_changed) {
+        render_snapshot_with_suppressed_windows(&snapshot, &suppressed);
     }
 }
 
@@ -449,11 +524,11 @@ fn schedule_foreground_visibility_refresh() {
     }
 }
 
-fn ensure_suppressed_foreground_watcher(pid: i64) {
-    let mut watcher = SUPPRESSED_FOREGROUND_WATCHER.lock().unwrap();
+fn ensure_foreground_visibility_watcher() {
+    let mut watcher = FOREGROUND_VISIBILITY_WATCHER.lock().unwrap();
     if watcher
         .as_ref()
-        .is_some_and(|current| current.pid == pid && !current.cancelled.load(Ordering::Acquire))
+        .is_some_and(|current| !current.cancelled.load(Ordering::Acquire))
     {
         return;
     }
@@ -462,14 +537,13 @@ fn ensure_suppressed_foreground_watcher(pid: i64) {
     }
 
     let cancelled = Arc::new(AtomicBool::new(false));
-    *watcher = Some(SuppressedForegroundWatcher {
-        pid,
+    *watcher = Some(ForegroundVisibilityWatcher {
         cancelled: Arc::clone(&cancelled),
     });
     drop(watcher);
 
     if let Err(error) = std::thread::Builder::new()
-        .name(format!("cua-pip-foreground-{pid}"))
+        .name("cua-pip-foreground".to_owned())
         .spawn(move || {
             while !cancelled.load(Ordering::Acquire) {
                 std::thread::sleep(FOREGROUND_VISIBILITY_CHECK_INTERVAL);
@@ -479,27 +553,32 @@ fn ensure_suppressed_foreground_watcher(pid: i64) {
             }
         })
     {
-        SUPPRESSED_FOREGROUND_WATCHER.lock().unwrap().take();
-        tracing::warn!(target: "pip", %error, "failed to spawn suppressed PiP watcher");
+        FOREGROUND_VISIBILITY_WATCHER.lock().unwrap().take();
+        tracing::warn!(target: "pip", %error, "failed to spawn PiP foreground watcher");
     }
 }
 
-fn stop_suppressed_foreground_watcher() {
-    if let Some(watcher) = SUPPRESSED_FOREGROUND_WATCHER.lock().unwrap().take() {
+fn stop_foreground_visibility_watcher() {
+    if let Some(watcher) = FOREGROUND_VISIBILITY_WATCHER.lock().unwrap().take() {
         watcher.cancelled.store(true, Ordering::Release);
     }
 }
 
-fn reconcile_live_capture(snapshot: &[PipFrame], suppressed_pid: Option<i64>) {
-    if let Some(pid) = suppressed_pid {
-        ensure_suppressed_foreground_watcher(pid);
-        stop_live_capture_for(pid);
+fn reconcile_live_capture(snapshot: &[PipFrame], suppressed_pids: &HashSet<i64>) {
+    if foreground_visibility_watcher_needed(snapshot) {
+        // Same-app modal changes do not emit an application-activation
+        // notification, so visibility must be reconciled while cards exist,
+        // not only after one has already been suppressed.
+        ensure_foreground_visibility_watcher();
     } else {
-        stop_suppressed_foreground_watcher();
+        stop_foreground_visibility_watcher();
+    }
+    for pid in suppressed_pids {
+        stop_live_capture_for(*pid);
     }
 
     for frame in snapshot {
-        if frame_needs_live_capture(frame, suppressed_pid) {
+        if frame_needs_live_capture(frame, suppressed_pids) {
             ensure_live_capture(frame.target.pid, frame.target.window_id);
         }
     }
@@ -515,11 +594,8 @@ fn capture_dimensions(width: f64, height: f64) -> (u32, u32) {
     )
 }
 
-fn wall_clock_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+fn monotonic_ms() -> u64 {
+    FOREGROUND_CLOCK_ORIGIN.elapsed().as_millis().max(1) as u64
 }
 
 fn ensure_live_capture(pid: i64, window_id: u64) {
@@ -549,8 +625,6 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
                 frame_pending: Arc::clone(&frame_pending),
             },
         );
-
-    start_live_visibility_watchdog(pid, Arc::clone(&cancelled));
 
     if let Err(error) = std::thread::Builder::new()
         .name(format!("cua-pip-{pid}"))
@@ -597,20 +671,6 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
         })
     {
         tracing::warn!(target: "pip", pid, window_id, %error, "failed to spawn PiP capture worker");
-    }
-}
-
-fn start_live_visibility_watchdog(pid: i64, cancelled: Arc<AtomicBool>) {
-    if let Err(error) = std::thread::Builder::new()
-        .name(format!("cua-pip-visibility-{pid}"))
-        .spawn(move || {
-            while !cancelled.load(Ordering::Acquire) {
-                schedule_foreground_visibility_refresh();
-                std::thread::sleep(FOREGROUND_VISIBILITY_CHECK_INTERVAL);
-            }
-        })
-    {
-        tracing::warn!(target: "pip", pid, %error, "failed to spawn PiP visibility watchdog");
     }
 }
 
@@ -752,7 +812,6 @@ unsafe extern "C" fn push_live_frame_cb(ctx: *mut c_void) {
 
     let frame: LiveFrame = *Box::from_raw(ctx as *mut LiveFrame);
     frame.frame_pending.store(false, Ordering::Release);
-    refresh_foreground_visibility_if_due();
     if HIDDEN_APPS.lock().unwrap().contains(&frame.pid)
         || !VIEW_MODEL
             .lock()
@@ -2102,24 +2161,40 @@ unsafe fn render_card(
 }
 
 unsafe fn render_snapshot(snapshot: &[PipFrame]) {
-    let observed = foreground_candidate_pid(snapshot, crate::apps::frontmost_pid());
-    let suppressed = update_foreground_visibility_state(
+    let enumeration = crate::windows::all_windows_including_accessory_layers_with_snapshot();
+    let visual_frontmost_pid = enumeration
+        .succeeded
+        .then(|| {
+            i32::try_from(std::process::id())
+                .ok()
+                .and_then(|local_pid| {
+                    visually_frontmost_pid_in(
+                        &enumeration.windows,
+                        local_pid,
+                        crate::apps::is_auxiliary_application,
+                    )
+                })
+        })
+        .flatten();
+    let suppressed =
+        foreground_candidate_pids(snapshot, crate::apps::frontmost_pid(), visual_frontmost_pid);
+    update_foreground_visibility_state(
         &mut FOREGROUND_VISIBILITY_STATE.lock().unwrap(),
-        observed,
+        suppressed.clone(),
     );
-    render_snapshot_with_suppressed_window(snapshot, suppressed);
+    render_snapshot_with_suppressed_windows(snapshot, &suppressed);
 }
 
-unsafe fn render_snapshot_with_suppressed_window(
+unsafe fn render_snapshot_with_suppressed_windows(
     snapshot: &[PipFrame],
-    suppressed_pid: Option<i64>,
+    suppressed_pids: &HashSet<i64>,
 ) {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
 
     let visible_snapshot = snapshot
         .iter()
-        .filter(|frame| !frame_is_suppressed(frame, suppressed_pid))
+        .filter(|frame| !frame_is_suppressed(frame, suppressed_pids))
         .collect::<Vec<_>>();
 
     let (window, canvas, delegate) = {
@@ -2167,7 +2242,7 @@ unsafe fn render_snapshot_with_suppressed_window(
     } else {
         let _: () = msg_send![window, orderFrontRegardless];
     }
-    reconcile_live_capture(snapshot, suppressed_pid);
+    reconcile_live_capture(snapshot, suppressed_pids);
 }
 
 pub struct MacosPipBackendFactory;
@@ -2246,15 +2321,11 @@ unsafe extern "C" fn init_cb(ctx: *mut c_void) {
     // receive mouseDown first instead of moving the whole panel.
     let _: () = msg_send![window, setMovableByWindowBackground: false];
     let _: () = msg_send![window, setFloatingPanel: false];
-    // Match Codex's ordinary window level instead of pinning the preview above
-    // every application. The opt-in override is only for local UI demos where
-    // the headless daemon has no foreground app capable of owning the panel.
-    let window_level = if std::env::var_os("CUA_PIP_DEMO_FLOATING").is_some() {
-        3i64
-    } else {
-        0i64
-    };
-    let _: () = msg_send![window, setLevel: window_level];
+    // PiP must remain visible above whichever *background* app the user is
+    // currently controlling. Foreground-owner suppression keeps the active or
+    // visually-frontmost app's own card out of the stack, so floating the
+    // container does not duplicate that app on top of itself.
+    let _: () = msg_send![window, setLevel: PIP_WINDOW_LEVEL];
     let _: () = msg_send![window, setCollectionBehavior: 0x108u64];
     let _: () = msg_send![window, setReleasedWhenClosed: false];
     let _: () = msg_send![window, setHidesOnDeactivate: false];
@@ -2316,7 +2387,7 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
     use objc2::runtime::AnyObject;
 
     hide_custom_cursor();
-    stop_suppressed_foreground_watcher();
+    stop_foreground_visibility_watcher();
     CARD_HANDLES.lock().unwrap().clear();
     CARD_VIEW_PIDS.lock().unwrap().clear();
     RESIZE_VIEW_DIRECTIONS.lock().unwrap().clear();
@@ -2415,6 +2486,32 @@ mod tests {
         }
     }
 
+    fn visible_window(
+        window_id: u32,
+        pid: i32,
+        app_name: &str,
+        z_index: usize,
+    ) -> crate::windows::WindowInfo {
+        crate::windows::WindowInfo {
+            window_id,
+            pid,
+            app_name: app_name.to_owned(),
+            title: format!("{app_name} window"),
+            bounds: crate::windows::WindowBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            layer: 0,
+            z_index,
+            is_on_screen: true,
+            current_space_id: Some(1),
+            on_current_space: Some(true),
+            space_ids: Some(vec![1]),
+        }
+    }
+
     #[test]
     fn capture_dimensions_preserve_aspect_ratio_and_bound_size() {
         assert_eq!(capture_dimensions(640.0, 400.0), (640, 400));
@@ -2473,29 +2570,107 @@ mod tests {
     #[test]
     fn frontmost_app_is_a_candidate_regardless_of_which_window_is_focused() {
         let snapshot = vec![frame(10, 100), frame(20, 200)];
-        assert_eq!(foreground_candidate_pid(&snapshot, Some(100)), Some(100));
-        assert_eq!(foreground_candidate_pid(&snapshot, Some(200)), Some(200));
-        assert_eq!(foreground_candidate_pid(&snapshot, Some(300)), None);
-        assert_eq!(foreground_candidate_pid(&snapshot, None), None);
+        assert_eq!(
+            foreground_candidate_pids(&snapshot, Some(100), None),
+            HashSet::from([100])
+        );
+        assert_eq!(
+            foreground_candidate_pids(&snapshot, Some(200), None),
+            HashSet::from([200])
+        );
+        assert!(foreground_candidate_pids(&snapshot, Some(300), None).is_empty());
+        assert!(foreground_candidate_pids(&snapshot, None, None).is_empty());
+    }
+
+    #[test]
+    fn active_and_visual_frontmost_apps_are_both_suppressed() {
+        let snapshot = vec![frame(10, 100), frame(20, 200)];
+        assert_eq!(
+            foreground_candidate_pids(&snapshot, Some(200), Some(100)),
+            HashSet::from([100, 200])
+        );
+    }
+
+    #[test]
+    fn visual_frontmost_selection_skips_the_pip_process_and_auxiliary_overlays() {
+        let windows = vec![
+            visible_window(1, 999, "Cua Driver Local", 100),
+            visible_window(2, 300, "CursorUIViewService", 90),
+            visible_window(3, 100, "Blender", 80),
+            visible_window(4, 200, "Terminal", 70),
+        ];
+        assert_eq!(
+            visually_frontmost_pid_in(&windows, 999, |pid| pid == 300),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn visual_frontmost_selection_rejects_off_space_and_zero_sized_windows() {
+        let mut off_space = visible_window(1, 100, "Off Space", 100);
+        off_space.on_current_space = Some(false);
+        let mut empty = visible_window(2, 200, "Empty", 90);
+        empty.bounds.width = 0.0;
+        let usable = visible_window(3, 300, "Usable", 80);
+        assert_eq!(
+            visually_frontmost_pid_in(&[off_space, empty, usable], 999, |_| false),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn foreground_visibility_watcher_runs_for_unsuppressed_cards() {
+        assert!(foreground_visibility_watcher_needed(&[frame(10, 100)]));
+        assert!(!foreground_visibility_watcher_needed(&[]));
+    }
+
+    #[test]
+    fn failed_window_enumeration_is_not_authoritative_absence() {
+        let failed = crate::windows::WindowEnumeration {
+            windows: Vec::new(),
+            current_space_id: None,
+            succeeded: false,
+        };
+        let successful_empty = crate::windows::WindowEnumeration {
+            windows: Vec::new(),
+            current_space_id: Some(1),
+            succeeded: true,
+        };
+
+        assert!(live_targets_from_window_enumeration(&failed).is_none());
+        assert_eq!(
+            live_targets_from_window_enumeration(&successful_empty),
+            Some(HashSet::new())
+        );
     }
 
     #[test]
     fn suppression_hides_every_window_of_the_frontmost_app() {
-        assert!(frame_is_suppressed(&frame(10, 100), Some(100)));
-        assert!(frame_is_suppressed(&frame(20, 100), Some(100)));
-        assert!(!frame_is_suppressed(&frame(10, 200), Some(100)));
-        assert!(!frame_needs_live_capture(&frame(10, 100), Some(100)));
-        assert!(frame_needs_live_capture(&frame(10, 200), Some(100)));
+        let suppressed = HashSet::from([100]);
+        assert!(frame_is_suppressed(&frame(10, 100), &suppressed));
+        assert!(frame_is_suppressed(&frame(20, 100), &suppressed));
+        assert!(!frame_is_suppressed(&frame(10, 200), &suppressed));
+        assert!(!frame_needs_live_capture(&frame(10, 100), &suppressed));
+        assert!(frame_needs_live_capture(&frame(10, 200), &suppressed));
     }
 
     #[test]
     fn foreground_card_hides_and_reappears_on_the_same_transition() {
         let mut state = ForegroundVisibilityState::default();
-        assert_eq!(
-            update_foreground_visibility_state(&mut state, Some(100)),
-            Some(100)
-        );
-        assert_eq!(update_foreground_visibility_state(&mut state, None), None);
+        assert!(update_foreground_visibility_state(
+            &mut state,
+            HashSet::from([100])
+        ));
+        assert_eq!(state.suppressed_pids, HashSet::from([100]));
+        assert!(!update_foreground_visibility_state(
+            &mut state,
+            HashSet::from([100])
+        ));
+        assert!(update_foreground_visibility_state(
+            &mut state,
+            HashSet::new()
+        ));
+        assert!(state.suppressed_pids.is_empty());
     }
 
     #[test]
@@ -2507,13 +2682,9 @@ mod tests {
 
     #[test]
     fn stale_card_removal_rerenders_even_when_foreground_is_unchanged() {
-        assert!(candidate_refresh_requires_render(None, None, true));
-        assert!(candidate_refresh_requires_render(
-            Some(100),
-            Some(100),
-            true
-        ));
-        assert!(!candidate_refresh_requires_render(None, None, false));
+        assert!(candidate_refresh_requires_render(false, true));
+        assert!(candidate_refresh_requires_render(true, false));
+        assert!(!candidate_refresh_requires_render(false, false));
     }
 
     #[test]

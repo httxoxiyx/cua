@@ -143,6 +143,10 @@ impl Tool for SetValueTool {
             }
         };
 
+        if let Err(refusal) = super::guard_same_pid_transient_target(pid, Some(window_id)).await {
+            return refusal;
+        }
+
         // Retain out of the cache so a concurrent get_window_state can't free
         // the element mid-action (use-after-free → daemon crash). Guard lives
         // to the end of this method, past the AX write below.

@@ -73,6 +73,14 @@ fn map_delivery_outcome(result: anyhow::Result<bool>) -> PressKeyDeliveryOutcome
     }
 }
 
+fn display_key_chord(key: &str, modifiers: &[String]) -> String {
+    if modifiers.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{}+{key}", modifiers.join("+"))
+    }
+}
+
 fn validate_post_target(pid: i32) -> anyhow::Result<()> {
     if pid <= 0 {
         anyhow::bail!("target pid {pid} is invalid");
@@ -320,7 +328,7 @@ impl Tool for PressKeyTool {
         } else {
             key_raw.clone()
         };
-        let display_key = key_raw.clone();
+        let display_key = display_key_chord(&key_raw, &modifiers);
         // delivery_mode gates the raise: background (default) never fronts the
         // window (auth-envelope post, even with window_id); foreground is the
         // explicit NSMenu-activation rung. Matches click/type_text/hotkey.
@@ -340,6 +348,14 @@ impl Tool for PressKeyTool {
             return ToolResult::error(
                 "Pass either element_index (ax) or x,y (px) to press_key, not both.",
             );
+        }
+
+        // Revalidate before either background gating or foreground activation.
+        // A same-process modal can appear after observation, so a retained host
+        // target must redirect before any key transition is sent.
+        if let Err(refusal) = super::guard_same_pid_transient_target(requested_pid, window_id).await
+        {
+            return refusal;
         }
 
         let foreground_target = if fg {
@@ -588,6 +604,12 @@ mod tests {
         ));
         let failed = map_delivery_outcome(Err(anyhow::anyhow!("post rejected")));
         assert!(matches!(failed, PressKeyDeliveryOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn receipt_displays_explicit_modifier_chord() {
+        assert_eq!(display_key_chord("f4", &["shift".to_string()]), "shift+f4");
+        assert_eq!(display_key_chord("return", &[]), "return");
     }
 
     #[test]

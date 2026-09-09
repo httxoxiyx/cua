@@ -314,6 +314,9 @@ impl Tool for InvokeMenuTool {
         {
             return refusal("invoke_menu: window_id does not belong to pid".into());
         }
+        if let Err(refusal) = super::guard_same_pid_transient_target(pid, Some(window_id)).await {
+            return refusal;
+        }
 
         let outcome = tokio::task::spawn_blocking(move || {
             let prior_frontmost = crate::apps::frontmost_pid();

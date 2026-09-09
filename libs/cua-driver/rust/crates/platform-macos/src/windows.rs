@@ -33,6 +33,10 @@ pub struct WindowInfo {
 pub(crate) struct WindowEnumeration {
     pub(crate) windows: Vec<WindowInfo>,
     pub(crate) current_space_id: Option<u64>,
+    /// Whether WindowServer returned a real snapshot. A failed enumeration is
+    /// not equivalent to a successful empty desktop and must not be used to
+    /// delete cached targets.
+    pub(crate) succeeded: bool,
 }
 
 // ── CGWindow option flags ─────────────────────────────────────────────────────
@@ -126,7 +130,15 @@ pub(crate) fn visible_automation_windows_with_space_snapshot() -> WindowEnumerat
 /// `get_window_state` tell "no such window" apart from "exists, but is not a
 /// layer-0 window" (issue #2237).
 pub(crate) fn all_windows_including_accessory_layers() -> Vec<WindowInfo> {
-    enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer).windows
+    all_windows_including_accessory_layers_with_snapshot().windows
+}
+
+/// Raw all-layer WindowServer snapshot with success status and no per-window
+/// Space queries. PiP uses this for frequent liveness/front-order polling: its
+/// visual branch already requires `is_on_screen`, while liveness must retain
+/// minimized/off-Space targets.
+pub(crate) fn all_windows_including_accessory_layers_with_snapshot() -> WindowEnumeration {
+    enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer)
 }
 
 /// Which CGWindow layers an enumeration admits.
@@ -161,6 +173,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
         return WindowEnumeration {
             windows: vec![],
             current_space_id,
+            succeeded: false,
         };
     }
 
@@ -288,6 +301,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
             return WindowEnumeration {
                 windows: results,
                 current_space_id,
+                succeeded: true,
             };
         };
         for window in &mut results {
@@ -302,6 +316,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
     WindowEnumeration {
         windows: results,
         current_space_id,
+        succeeded: true,
     }
 }
 
