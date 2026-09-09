@@ -56,6 +56,7 @@ impl Tool for ZoomTool {
             Err(e) => return e,
         };
         let pid = args.opt_i64("pid").map(|v| v as i32);
+        let delegation_route = crate::ax::app_context::delegation_route_from_args(&args);
         let x1 = match args.require_f64("x1") {
             Ok(v) => v,
             Err(e) => return e,
@@ -77,6 +78,34 @@ impl Tool for ZoomTool {
             return ToolResult::error("x2 must be > x1 and y2 must be > y1");
         }
 
+        let window =
+            match tokio::task::spawn_blocking(move || crate::windows::window_info_by_id(window_id))
+                .await
+            {
+                Ok(Some(window)) => window,
+                _ => return ToolResult::error(
+                    "The requested zoom window is no longer available. Re-observe the application.",
+                ),
+            };
+        if pid.is_some_and(|pid| pid != window.pid) {
+            return super::explicit_window_owner_mismatch_refusal();
+        }
+        let pre_capture_pid = window.pid;
+        let pre_capture_is_helper = crate::ax::app_context::hide_open_save_panel_from_inventory(
+            window.pid,
+            &window.app_name,
+        );
+        if pre_capture_is_helper {
+            let Some(route) = delegation_route.as_ref() else {
+                return super::app_context_delegation_direct_target_refusal();
+            };
+            if !delegation_authorizes_window(route, window.pid, window_id)
+                || !crate::ax::app_context::delegation_route_is_live(route)
+            {
+                return super::app_context_delegation_stale_refusal();
+            }
+        }
+
         let state = self.state.clone();
         let result = tokio::task::spawn_blocking(move || {
             let png_bytes = crate::capture::screenshot_window_bytes(window_id)?;
@@ -86,6 +115,37 @@ impl Tool for ZoomTool {
 
         match result {
             Ok(Ok(crop)) => {
+                // A CGWindowID can be recycled while capture is in flight.
+                // Re-check exact ownership and delegated host association
+                // before publishing pixels or a zoom coordinate transform.
+                let post_window = tokio::task::spawn_blocking(move || {
+                    crate::windows::window_info_by_id(window_id)
+                })
+                .await;
+                let post_window = match post_window {
+                    Ok(Some(window)) if window.pid == pre_capture_pid => window,
+                    _ => return super::explicit_window_owner_mismatch_refusal(),
+                };
+                let post_is_helper = crate::ax::app_context::hide_open_save_panel_from_inventory(
+                    post_window.pid,
+                    &post_window.app_name,
+                );
+                if !zoom_post_capture_target_matches(
+                    pre_capture_pid,
+                    pre_capture_is_helper,
+                    post_window.pid,
+                    post_is_helper,
+                ) {
+                    return super::explicit_window_owner_mismatch_refusal();
+                }
+                if pre_capture_is_helper
+                    && !delegation_route.as_ref().is_some_and(|route| {
+                        delegation_authorizes_window(route, post_window.pid, window_id)
+                            && crate::ax::app_context::delegation_route_is_live(route)
+                    })
+                {
+                    return super::app_context_delegation_stale_refusal();
+                }
                 // Store zoom context so from_zoom clicks can translate back.
                 if let Some(p) = pid {
                     state.zoom_registry.set(
@@ -122,5 +182,57 @@ impl Tool for ZoomTool {
             Ok(Err(e)) => ToolResult::error(format!("Zoom failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
+    }
+}
+
+fn delegation_authorizes_window(
+    route: &crate::ax::app_context::AppContextDelegationRoute,
+    pid: i32,
+    window_id: u32,
+) -> bool {
+    route.delegation.target == crate::ax::app_context::AppContextTarget { pid, window_id }
+}
+
+fn zoom_post_capture_target_matches(
+    pre_pid: i32,
+    pre_is_helper: bool,
+    post_pid: i32,
+    post_is_helper: bool,
+) -> bool {
+    pre_pid == post_pid && pre_is_helper == post_is_helper
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delegated_zoom_is_bound_to_exact_helper_target() {
+        let route = crate::ax::app_context::AppContextDelegationRoute {
+            session: crate::transient_ui::TransientSessionKey::Anonymous,
+            expected_host_identity: crate::ax::app_context::ExpectedAppIdentity {
+                bundle_id: Some("com.example.host".into()),
+                app_name: Some("Host".into()),
+            },
+            delegation: crate::ax::app_context::AppContextDelegation {
+                host_pid: 42,
+                target: crate::ax::app_context::AppContextTarget {
+                    pid: 900,
+                    window_id: 77,
+                },
+                panel_kind: crate::ax::app_context::OpenSavePanelKind::Open,
+            },
+            generation: 1,
+        };
+        assert!(delegation_authorizes_window(&route, 900, 77));
+        assert!(!delegation_authorizes_window(&route, 901, 77));
+        assert!(!delegation_authorizes_window(&route, 900, 78));
+    }
+
+    #[test]
+    fn zoom_rejects_window_id_reuse_or_helper_classification_change() {
+        assert!(zoom_post_capture_target_matches(900, true, 900, true));
+        assert!(!zoom_post_capture_target_matches(900, true, 901, true));
+        assert!(!zoom_post_capture_target_matches(900, false, 900, true));
     }
 }

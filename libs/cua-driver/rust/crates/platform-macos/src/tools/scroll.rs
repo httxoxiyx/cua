@@ -168,6 +168,7 @@ impl Tool for ScrollTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let app_context_route = crate::ax::app_context::delegation_route_from_args(&args);
         // delivery_mode: foreground briefly fronts the window before the
         // pixel-wheel dispatch (the explicit last resort for surfaces that drop
         // background CGEvents). Only the pixel-wheel path honors it; the
@@ -188,26 +189,31 @@ impl Tool for ScrollTool {
         let amount = args.u64_or("amount", 3) as usize;
         // Surface 6: element_token / element_index precedence.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg_u64 = args.opt_u64("window_id");
+        let window_id_arg = match args.opt_u32("window_id") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
+            window_id_arg_u64,
             "scroll",
         ) {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg),
+        let (element_index, window_id, snapshot_id) = match resolved {
+            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg, None),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: wid,
                 element_index: idx,
+                snapshot_id,
                 via_token: _,
-            } => (Some(idx), wid),
+            } => (Some(idx), wid, Some(snapshot_id)),
         };
         if let Err(refusal) = super::guard_same_pid_transient_target(pid, window_id).await {
             return refusal;
@@ -226,22 +232,41 @@ impl Tool for ScrollTool {
         // Retain out of the cache so a concurrent get_window_state can't free
         // the element before the suppressed focus below dereferences it
         // (use-after-free → daemon crash). Guard lives to method end.
-        let pre_focus_guard = if let (Some(idx), Some(wid)) = (element_index, window_id) {
-            self.state.element_cache.get_element_retained(pid, wid, idx)
+        let pre_focus_guard = if let (Some(idx), Some(wid), Some(snapshot_id)) =
+            (element_index, window_id, snapshot_id)
+        {
+            self.state
+                .element_cache
+                .get_element_retained_for_snapshot(pid, wid, snapshot_id, idx)
         } else {
             None
         };
         let pre_focus_ptr: Option<usize> = pre_focus_guard.as_ref().map(|g| g.as_ptr());
+        if let Some(element_ptr) = pre_focus_ptr {
+            if unsafe {
+                super::ensure_app_context_element_window(
+                    app_context_route.as_ref(),
+                    element_ptr as AXUIElementRef,
+                )
+            }
+            .is_err()
+            {
+                return super::app_context_delegation_stale_refusal();
+            }
+        }
 
         // An element target was explicitly requested (element_index/element_token)
         // but couldn't be retained from the cache — the snapshot is stale. Fail
         // loudly instead of silently falling through to the keystroke/page
         // scroller below, which would scroll the wrong thing.
-        if let Some(idx) = element_index {
+        if element_index.is_some() {
             if pre_focus_guard.is_none() {
-                return ToolResult::error(format!(
-                    "Element index {idx} not found. Call get_window_state first."
-                ));
+                return cua_driver_core::element_token::stale_element_cache_result(
+                    "scroll",
+                    pid,
+                    window_id.expect("element targets carry window identity"),
+                    snapshot_id.expect("element targets carry snapshot identity"),
+                );
             }
         }
         let mut _mutation_lease: Option<super::BackgroundMutationLease> = None;
@@ -277,23 +302,35 @@ impl Tool for ScrollTool {
                         }
                     }
                 }
-                let native_element_guard = self
-                    .state
-                    .element_cache
-                    .get_element_retained(pid, wid, index);
+                let native_element_guard =
+                    self.state.element_cache.get_element_retained_for_snapshot(
+                        pid,
+                        wid,
+                        snapshot_id.expect("element index carries snapshot id"),
+                        index,
+                    );
                 let direction_for_ax = direction.clone();
                 let by_for_ax = by.clone();
                 let foreground = delivery_mode.is_foreground();
+                let ax_app_context_route = app_context_route.clone();
                 let ax_result =
                     tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, bool)> {
+                        super::ensure_app_context_delegation_live(ax_app_context_route.as_ref())?;
                         let Some(element_guard) = native_element_guard else {
                             return Ok((false, false));
                         };
+                        unsafe {
+                            super::ensure_app_context_element_window(
+                                ax_app_context_route.as_ref(),
+                                element_guard.as_ptr() as AXUIElementRef,
+                            )?;
+                        }
                         if foreground {
                             let mut delivered = false;
-                            let fronted = crate::input::skylight::with_foreground_assist(
+                            let fronted = crate::input::skylight::with_foreground_assist_delegated(
                                 pid as libc::pid_t,
                                 wid,
+                                ax_app_context_route,
                                 || {
                                     delivered = unsafe {
                                         scroll_native_text_area(
@@ -417,7 +454,23 @@ impl Tool for ScrollTool {
             // coordinates and window bounds are logical top-left points, so no
             // Retina scaling is needed here.
             let wid = window_id;
+            let reveal_app_context_route = app_context_route.clone();
             let target_task = tokio::task::spawn_blocking(move || {
+                if super::ensure_app_context_delegation_live(reveal_app_context_route.as_ref())
+                    .is_err()
+                {
+                    return Err(super::app_context_delegation_stale_refusal());
+                }
+                if unsafe {
+                    super::ensure_app_context_element_window(
+                        reveal_app_context_route.as_ref(),
+                        element_ptr as AXUIElementRef,
+                    )
+                }
+                .is_err()
+                {
+                    return Err(super::app_context_delegation_stale_refusal());
+                }
                 // Web content can be present in AX while its frame is below
                 // the outer page viewport. Ask the accessibility hierarchy to
                 // reveal the target before taking the screen-space center;
@@ -568,6 +621,7 @@ impl Tool for ScrollTool {
                 wid,
             } = target;
             let amount_ticks = amount;
+            let wheel_app_context_route = app_context_route.clone();
             let result = focus_guard::with_focus_suppressed(
                 // The observation snapshot owns the canonical target-only
                 // lease; foreground delivery owns its activation.
@@ -576,6 +630,9 @@ impl Tool for ScrollTool {
                 "scroll.CGScrollWheel",
                 || async move {
                     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        super::ensure_app_context_delegation_live(
+                            wheel_app_context_route.as_ref(),
+                        )?;
                         let do_it = move || -> anyhow::Result<()> {
                             crate::input::mouse::scroll_wheel_at_xy(
                                 pid,
@@ -591,9 +648,10 @@ impl Tool for ScrollTool {
                         // Foreground rung: brief front → wheel → restore prior frontmost.
                         match (fg, wid) {
                             (true, Some(w)) => {
-                                crate::input::skylight::with_foreground_assist(
+                                crate::input::skylight::with_foreground_assist_delegated(
                                     pid as libc::pid_t,
                                     w,
+                                    wheel_app_context_route,
                                     do_it,
                                 )?;
                                 Ok(())
@@ -676,7 +734,12 @@ impl Tool for ScrollTool {
         // any reflex activation it triggers is covered by the snapshot's
         // target-only lease without interfering with unrelated user activity.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot_targeted(prior_front, pid);
+        let foreground = delivery_mode.is_foreground();
+        let snapshot = if foreground {
+            WindowChangeDetector::snapshot_without_suppression(prior_front)
+        } else {
+            WindowChangeDetector::snapshot_targeted(prior_front, pid)
+        };
 
         let result = focus_guard::with_focus_suppressed(
             // The observation snapshot owns the canonical target-only lease.
@@ -684,22 +747,68 @@ impl Tool for ScrollTool {
             prior_front,
             "scroll.CGEvent",
             || async move {
+                let pre_focus_app_context_route = app_context_route.clone();
                 // Pre-focus the element while the snapshot lease is active so
                 // its side-effects remain covered.
                 if let Some(element_ptr) = pre_focus_ptr {
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let focus_result = tokio::task::spawn_blocking(move || {
+                        super::ensure_app_context_delegation_live(
+                            pre_focus_app_context_route.as_ref(),
+                        )?;
+                        unsafe {
+                            super::ensure_app_context_element_window(
+                                pre_focus_app_context_route.as_ref(),
+                                element_ptr as AXUIElementRef,
+                            )?;
+                        }
                         crate::input::ax_actions::focus_element(element_ptr)
                     })
                     .await;
+                    if let Ok(Err(error)) = focus_result {
+                        return Ok(Err(error));
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 }
 
                 tokio::task::spawn_blocking(move || {
-                    for _ in 0..amount {
-                        crate::input::keyboard::press_key(pid, &key, &[])?;
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
+                    if let Some(element_ptr) = pre_focus_ptr {
+                        unsafe {
+                            super::ensure_app_context_element_window(
+                                app_context_route.as_ref(),
+                                element_ptr as AXUIElementRef,
+                            )?;
+                        }
                     }
-                    Ok::<(), anyhow::Error>(())
+                    let send_keys = || {
+                        for _ in 0..amount {
+                            if foreground {
+                                crate::input::keyboard::press_key_global(&key, &[])?;
+                            } else {
+                                crate::input::keyboard::press_key(pid, &key, &[])?;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    };
+                    if foreground {
+                        let wid = window_id.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "delivery_mode=foreground requires window_id for scroll"
+                            )
+                        })?;
+                        crate::input::skylight::with_foreground_keyboard_target_activation_routed(
+                            pid as libc::pid_t,
+                            wid,
+                            None,
+                            pre_focus_ptr.is_some(),
+                            None,
+                            app_context_route,
+                            send_keys,
+                        )
+                    } else {
+                        send_keys()
+                    }
                 })
                 .await
             },
@@ -711,10 +820,18 @@ impl Tool for ScrollTool {
         match result {
             Ok(Ok(())) => ToolResult::text(format!(
                 "✅ Sent {direction} scroll by {by} × {amount} via keystroke \
-                 (background; not driver-verified — confirm via screenshot).{}",
+                 ({}; not driver-verified — confirm via screenshot).{}",
+                if foreground {
+                    "foreground"
+                } else {
+                    "background"
+                },
                 changes.result_suffix()
             ))
-            .with_structured(serde_json::json!({ "path": "key_events", "verified": false })),
+            .with_structured(serde_json::json!({
+                "path": if foreground { "key_events_fg" } else { "key_events" },
+                "verified": false
+            })),
             Ok(Err(e)) => ToolResult::error(format!("Scroll failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }

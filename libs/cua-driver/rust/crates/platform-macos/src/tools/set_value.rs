@@ -99,6 +99,7 @@ impl Tool for SetValueTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let app_context_route = crate::ax::app_context::delegation_route_from_args(&args);
         let value = match args.require_str("value") {
             Ok(v) => v,
             Err(e) => return e,
@@ -108,7 +109,7 @@ impl Tool for SetValueTool {
         // is now schema-required so the resolver can centralize the
         // "missing addressing" error message.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg = args.opt_u64("window_id");
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
@@ -121,7 +122,7 @@ impl Tool for SetValueTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id) = match resolved {
+        let (element_index, window_id, snapshot_id) = match resolved {
             cua_driver_core::element_token::ResolvedElement::None => {
                 return ToolResult::error(
                     "set_value requires element_index (+ window_id) or element_token to \
@@ -131,8 +132,9 @@ impl Tool for SetValueTool {
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: Some(wid),
                 element_index: idx,
+                snapshot_id,
                 via_token: _,
-            } => (idx, wid),
+            } => (idx, wid, snapshot_id),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: None, ..
             } => {
@@ -150,20 +152,33 @@ impl Tool for SetValueTool {
         // Retain out of the cache so a concurrent get_window_state can't free
         // the element mid-action (use-after-free → daemon crash). Guard lives
         // to the end of this method, past the AX write below.
-        let element_guard =
-            match self
-                .state
-                .element_cache
-                .get_element_retained(pid, window_id, element_index)
-            {
-                Some(e) => e,
-                None => {
-                    return ToolResult::error(format!(
-                        "Element index {element_index} not found. Call get_window_state first."
-                    ))
-                }
-            };
+        let element_guard = match self.state.element_cache.get_element_retained_for_snapshot(
+            pid,
+            window_id,
+            snapshot_id,
+            element_index,
+        ) {
+            Some(e) => e,
+            None => {
+                return cua_driver_core::element_token::stale_element_cache_result(
+                    "set_value",
+                    pid,
+                    window_id,
+                    snapshot_id,
+                )
+            }
+        };
         let element_ptr = element_guard.as_ptr();
+        if unsafe {
+            super::ensure_app_context_element_window(
+                app_context_route.as_ref(),
+                element_ptr as AXUIElementRef,
+            )
+        }
+        .is_err()
+        {
+            return super::app_context_delegation_stale_refusal();
+        }
 
         // set_value is an always-background semantic AX mutation. Re-prove
         // that the retained element still belongs to the requested exact
@@ -225,6 +240,13 @@ impl Tool for SetValueTool {
             "set_value.AXValue",
             || async move {
                 tokio::task::spawn_blocking(move || {
+                    super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
+                    unsafe {
+                        super::ensure_app_context_element_window(
+                            app_context_route.as_ref(),
+                            element_ptr as AXUIElementRef,
+                        )?;
+                    }
                     set_value_blocking(element_ptr, element_index, pid, &value)
                 })
                 .await

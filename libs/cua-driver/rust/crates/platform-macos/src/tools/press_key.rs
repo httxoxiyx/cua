@@ -290,6 +290,7 @@ impl Tool for PressKeyTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let app_context_route = crate::ax::app_context::delegation_route_from_args(&args);
         let key_raw = match args.require_str("key") {
             Ok(v) => v,
             Err(e) => return e,
@@ -297,26 +298,31 @@ impl Tool for PressKeyTool {
         let mut modifiers: Vec<String> = args.str_array("modifiers");
         // Surface 6: element_token / element_index precedence resolution.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg_u64 = args.opt_u64("window_id");
+        let window_id_arg = match args.opt_u32("window_id") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             requested_pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
+            window_id_arg_u64,
             "press_key",
         ) {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg),
+        let (element_index, window_id, snapshot_id) = match resolved {
+            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg, None),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: wid,
                 element_index: idx,
+                snapshot_id,
                 via_token: _,
-            } => (Some(idx), wid),
+            } => (Some(idx), wid, Some(snapshot_id)),
         };
 
         // Remap "+" / "plus" → "=" + Shift (same physical key on US layout).
@@ -366,6 +372,7 @@ impl Tool for PressKeyTool {
                 requested_pid,
                 window_id,
                 element_index.is_some() || px.is_some() || py.is_some(),
+                app_context_route.clone(),
             )
             .await
             {
@@ -377,11 +384,13 @@ impl Tool for PressKeyTool {
                 pid: requested_pid,
                 window_id,
                 transient_route: None,
+                app_context_route: app_context_route.clone(),
             }
         };
         let pid = foreground_target.pid;
         let window_id = foreground_target.window_id;
         let transient_route = foreground_target.transient_route;
+        let app_context_route = foreground_target.app_context_route;
 
         if let Err(error) = validate_post_target(pid) {
             return delivery_failed(error);
@@ -393,19 +402,41 @@ impl Tool for PressKeyTool {
         // Retain out of the cache so a concurrent get_window_state can't free
         // the element before the suppressed focus below dereferences it
         // (use-after-free → daemon crash). Guard lives to method end.
-        let pre_focus_guard = if let (Some(idx), Some(wid)) = (element_index, window_id) {
-            match self.state.element_cache.get_element_retained(pid, wid, idx) {
+        let pre_focus_guard = if let (Some(idx), Some(wid), Some(snapshot_id)) =
+            (element_index, window_id, snapshot_id)
+        {
+            match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                wid,
+                snapshot_id,
+                idx,
+            ) {
                 Some(guard) => Some(guard),
                 None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found. Call get_window_state first."
-                    ));
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "press_key",
+                        pid,
+                        wid,
+                        snapshot_id,
+                    );
                 }
             }
         } else {
             None
         };
         let pre_focus_ptr: Option<usize> = pre_focus_guard.as_ref().map(|g| g.as_ptr());
+        if let Some(element_ptr) = pre_focus_ptr {
+            if unsafe {
+                super::ensure_app_context_element_window(
+                    app_context_route.as_ref(),
+                    element_ptr as AXUIElementRef,
+                )
+            }
+            .is_err()
+            {
+                return super::app_context_delegation_stale_refusal();
+            }
+        }
 
         // ── Exact-target background gate (macOS background input v1) ──
         // A window-addressed background key is process-scoped transport: it
@@ -453,6 +484,7 @@ impl Tool for PressKeyTool {
                 args.opt_str("_session_id"),
                 from_zoom,
                 _mutation_lease.as_ref(),
+                app_context_route.as_ref(),
             )
             .await
             {
@@ -487,17 +519,39 @@ impl Tool for PressKeyTool {
             prior_front,
             "press_key.CGEvent",
             || async move {
+                let pre_focus_app_context_route = app_context_route.clone();
                 // Pre-focus the element while the snapshot lease is active so
                 // its side-effects remain covered.
                 if let Some(element_ptr) = pre_focus_ptr {
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let focus_result = tokio::task::spawn_blocking(move || {
+                        super::ensure_app_context_delegation_live(
+                            pre_focus_app_context_route.as_ref(),
+                        )?;
+                        unsafe {
+                            super::ensure_app_context_element_window(
+                                pre_focus_app_context_route.as_ref(),
+                                element_ptr as AXUIElementRef,
+                            )?;
+                        }
                         crate::input::ax_actions::focus_element(element_ptr)
                     })
                     .await;
+                    if let Ok(Err(error)) = focus_result {
+                        return Ok(Err(error));
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 }
 
                 tokio::task::spawn_blocking(move || {
+                    super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
+                    if let Some(element_ptr) = pre_focus_ptr {
+                        unsafe {
+                            super::ensure_app_context_element_window(
+                                app_context_route.as_ref(),
+                                element_ptr as AXUIElementRef,
+                            )?;
+                        }
+                    }
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     // Foreground rung: keep the exact target frontmost through a genuine
                     // physical HID key down/up pair, then restore. PID-routed events without the
@@ -530,6 +584,7 @@ impl Tool for PressKeyTool {
                                 remembered_cursor,
                                 coordinate_focus || pre_focus_ptr.is_some(),
                                 transient_route,
+                                app_context_route,
                                 key_action,
                             )
                         });

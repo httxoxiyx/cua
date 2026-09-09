@@ -27,6 +27,7 @@ pub struct DragTool {
     pub state: Arc<ToolState>,
 }
 
+#[cfg(test)]
 fn prior_pid_to_restore_after_foreground_action(
     prior_front: Option<i32>,
     current_front: Option<i32>,
@@ -192,6 +193,7 @@ impl Tool for DragTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let app_context_route = crate::ax::app_context::delegation_route_from_args(&args);
         // delivery_mode: foreground briefly fronts the window before the
         // press-drag-release gesture (the explicit last resort for surfaces
         // that drop background CGEvents), via the same skylight assist click
@@ -337,16 +339,14 @@ impl Tool for DragTool {
             "drag.CGEvent",
             || async move {
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
                     let do_it = move || -> anyhow::Result<()> {
                         let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                         if fg {
                             // HID delivery is global, so foreground mode must
                             // establish a real active application before the
-                            // gesture begins. The SkyLight flash can be
-                            // unavailable for Electron child windows; the
-                            // documented Cocoa activation is the fallback.
-                            apps::activate_pid(pid);
-                            std::thread::sleep(std::time::Duration::from_millis(40));
+                            // gesture begins. Activation is owned by the exact-
+                            // window guard around this complete gesture.
                             let observed_cursor = cursor_for_drag.clone();
                             return crate::input::mouse::drag_at_xy_foreground_observed(
                                 from_sx,
@@ -390,20 +390,13 @@ impl Tool for DragTool {
                     // Foreground rung: activate for the complete HID gesture,
                     // then restore the prior app after pointer capture settles.
                     match (fg, window_id) {
-                        (true, Some(_wid)) => {
-                            let result = do_it();
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            if let Some(previous_pid) =
-                                prior_pid_to_restore_after_foreground_action(
-                                    prior_front,
-                                    apps::frontmost_pid(),
-                                    pid,
-                                )
-                            {
-                                apps::activate_pid(previous_pid);
-                            }
-                            result?;
-                            Ok(())
+                        (true, Some(wid)) => {
+                            crate::input::skylight::with_foreground_hid_activation_delegated(
+                                pid as libc::pid_t,
+                                wid,
+                                app_context_route,
+                                do_it,
+                            )
                         }
                         _ => do_it(),
                     }

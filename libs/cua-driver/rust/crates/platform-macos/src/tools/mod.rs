@@ -38,10 +38,12 @@ mod set_config;
 mod type_text_chars;
 mod zoom;
 
+use async_trait::async_trait;
 use cua_driver_core::{
-    tool::{Tool, ToolRegistry},
+    tool::{ProtectedResourceOwnership, Tool, ToolDef, ToolRegistry},
     window_target::{PidOnlyWindowTargetGuard, WindowTargetCandidate, WindowTargetCandidates},
 };
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -163,13 +165,376 @@ mod pid_window_target_tests {
 #[cfg(test)]
 mod background_input_regression_tests;
 
+#[cfg(test)]
+mod app_context_delegation_refusal_tests {
+    use super::*;
+
+    fn assert_sanitized(result: cua_driver_core::protocol::ToolResult, expected_code: &str) {
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured refusal");
+        assert_eq!(structured["code"], expected_code);
+        let object = structured.as_object().expect("refusal object");
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, ["code", "effect", "retryable", "suggestion"]);
+        let serialized = serde_json::to_string(&structured).unwrap();
+        for forbidden in ["pid", "window_id", "host_pid", "target_pid"] {
+            assert!(
+                !object.contains_key(forbidden),
+                "refusal leaked key {forbidden}: {serialized}"
+            );
+        }
+        assert!(!serialized.contains("/System/"));
+    }
+
+    #[test]
+    fn stale_refusal_does_not_leak_internal_target_identity() {
+        assert_sanitized(
+            app_context_delegation_stale_refusal(),
+            "app_context_delegation_stale",
+        );
+    }
+
+    #[test]
+    fn unobserved_direct_helper_refusal_does_not_leak_internal_target_identity() {
+        assert_sanitized(
+            app_context_delegation_direct_target_refusal(),
+            "app_context_auxiliary_direct_target_unsupported",
+        );
+    }
+
+    #[test]
+    fn policy_and_unsupported_action_refusals_are_sanitized() {
+        assert_sanitized(
+            app_context_delegation_policy_refusal(),
+            "app_context_delegation_reauthorization_required",
+        );
+        assert_sanitized(
+            app_context_delegation_unsupported_action_refusal(),
+            "app_context_delegation_action_unsupported",
+        );
+        assert_sanitized(
+            explicit_window_owner_mismatch_refusal(),
+            "window_owner_pid_mismatch",
+        );
+    }
+
+    #[test]
+    fn explicit_actions_accept_only_the_exact_window_owner() {
+        assert!(explicit_window_owner_is_safe(
+            &crate::windows::WindowOwner::SamePid
+        ));
+        assert!(!explicit_window_owner_is_safe(
+            &crate::windows::WindowOwner::ForeignPid {
+                owner_pid: 99,
+                owner_app_name: "Open and Save Panel Service".into(),
+            }
+        ));
+        assert!(!explicit_window_owner_is_safe(
+            &crate::windows::WindowOwner::Unknown
+        ));
+    }
+}
+
+struct AppContextDelegationGuard {
+    inner: Box<dyn Tool>,
+    registry: Arc<crate::ax::app_context::AppContextDelegationRegistry>,
+    policy: AppContextDelegationPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppContextDelegationPolicy {
+    AllowPanelInput,
+    RejectPanelTarget,
+}
+
+impl AppContextDelegationGuard {
+    fn new(
+        inner: Box<dyn Tool>,
+        registry: Arc<crate::ax::app_context::AppContextDelegationRegistry>,
+        policy: AppContextDelegationPolicy,
+    ) -> Self {
+        Self {
+            inner,
+            registry,
+            policy,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for AppContextDelegationGuard {
+    fn def(&self) -> &ToolDef {
+        self.inner.def()
+    }
+
+    async fn protected_resource_ownership(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> ProtectedResourceOwnership {
+        self.inner
+            .protected_resource_ownership(adapter_id, args)
+            .await
+    }
+
+    async fn protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        self.inner.protected_resource_scope(adapter_id, args).await
+    }
+
+    async fn validate_protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+        approved_scope: &Value,
+    ) -> Result<(), String> {
+        self.inner
+            .validate_protected_resource_scope(adapter_id, args, approved_scope)
+            .await
+    }
+
+    async fn invoke(&self, mut args: Value) -> cua_driver_core::protocol::ToolResult {
+        // This is a driver-internal capability, never caller authority.  Strip
+        // any public lookalike before resolving the session registry.
+        crate::ax::app_context::clear_delegation_arg(&mut args);
+        let Some(pid) = args.get("pid").and_then(Value::as_i64) else {
+            return self.inner.invoke(args).await;
+        };
+        let Ok(pid) = i32::try_from(pid) else {
+            return self.inner.invoke(args).await;
+        };
+        let session = crate::transient_ui::TransientSessionKey::from_args(&args);
+        let explicit_window_id = args
+            .get("window_id")
+            .and_then(Value::as_u64)
+            .and_then(|window_id| u32::try_from(window_id).ok());
+        let token_window_id = args
+            .get("element_token")
+            .and_then(Value::as_str)
+            .and_then(|token| {
+                cua_driver_core::element_token::global()
+                    .resolve(pid, token)
+                    .ok()
+            })
+            .map(|(window_id, _)| window_id);
+        // Match `resolve_element_args`: a valid opaque token is the stronger
+        // snapshot-bound target and wins over a disagreeing legacy window_id.
+        let target = token_window_id
+            .or(explicit_window_id)
+            .map(|window_id| crate::ax::app_context::AppContextTarget { pid, window_id });
+
+        if let Some(target) = target {
+            // A caller-supplied host pid must not be paired with a foreign
+            // helper window id. Several foreground backends intentionally
+            // recover the physical owner from the window id, so allowing that
+            // mismatch here would bypass the app-context capability entirely.
+            let owner = tokio::task::spawn_blocking(move || {
+                crate::windows::resolve_window_owner(target.pid, target.window_id)
+            })
+            .await;
+            match owner {
+                Ok(owner) if explicit_window_owner_is_safe(&owner) => {}
+                Ok(_) => return explicit_window_owner_mismatch_refusal(),
+                Err(error) => {
+                    tracing::warn!(?error, "could not validate explicit window ownership");
+                    return explicit_window_owner_mismatch_refusal();
+                }
+            }
+            // Keep this read lease until the physical action finishes. A
+            // concurrent app-context refresh/session teardown needs the write
+            // side before it can revoke or replace this generation.
+            let registry = self.registry.clone();
+            let session_for_lookup = session.clone();
+            let resolution = tokio::task::spawn_blocking(move || {
+                let lease = registry.acquire_action_lease(&session_for_lookup, target);
+                let resolution = registry.resolve_live(&session_for_lookup, target);
+                (lease, resolution)
+            })
+            .await;
+            match resolution {
+                Ok((
+                    Some(action_lease),
+                    crate::ax::app_context::DelegationRouteResolution::Live(route),
+                )) => {
+                    if !cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite()
+                    {
+                        return app_context_delegation_policy_refusal();
+                    }
+                    if self.policy == AppContextDelegationPolicy::RejectPanelTarget {
+                        return app_context_delegation_unsupported_action_refusal();
+                    }
+                    crate::ax::app_context::inject_delegation_arg(&mut args, &route);
+                    let result = self.inner.invoke(args).await;
+                    drop(action_lease);
+                    return result;
+                }
+                Ok((None, crate::ax::app_context::DelegationRouteResolution::Live(_))) => {
+                    return app_context_delegation_stale_refusal()
+                }
+                Ok((_, crate::ax::app_context::DelegationRouteResolution::Stale(_))) => {
+                    return app_context_delegation_stale_refusal()
+                }
+                Ok((_, crate::ax::app_context::DelegationRouteResolution::None)) => {}
+                Err(error) => {
+                    tracing::warn!(?error, "could not revalidate app-context delegation");
+                    return cua_driver_core::protocol::ToolResult::error(
+                        "The observed macOS Open/Save panel could not be revalidated. Re-observe the host app; no input was sent.",
+                    )
+                    .with_structured(serde_json::json!({
+                        "code": "app_context_delegation_resolution_failed",
+                        "effect": "refused",
+                        "retryable": true,
+                        "suggestion": "Call get_app_state for the original host application."
+                    }));
+                }
+            }
+        }
+
+        // A matching live route above is the only authority to consume this
+        // otherwise non-public helper target. Direct/unobserved helper calls
+        // fail closed even when the caller discovered the pid independently.
+        let looks_like_helper = tokio::task::spawn_blocking(move || {
+            crate::ax::app_context::looks_like_open_save_panel_process(pid)
+        })
+        .await
+        .unwrap_or(true);
+        if looks_like_helper {
+            return app_context_delegation_direct_target_refusal();
+        }
+        self.inner.invoke(args).await
+    }
+}
+
+fn app_context_delegation_unsupported_action_refusal() -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "The observed macOS Open/Save panel cannot be used as a persistent foreground target. Re-observe the host app and use a panel control action instead; no action was sent.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "app_context_delegation_action_unsupported",
+        "effect": "refused",
+        "retryable": true,
+        "suggestion": "Call get_app_state for the original host application."
+    }))
+}
+
+fn explicit_window_owner_mismatch_refusal() -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "The requested window is not owned by the requested application. Re-observe the application; no action was sent.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "window_owner_pid_mismatch",
+        "effect": "refused",
+        "retryable": true,
+        "suggestion": "Call get_app_state for the original application."
+    }))
+}
+
+fn explicit_window_owner_is_safe(owner: &crate::windows::WindowOwner) -> bool {
+    matches!(owner, crate::windows::WindowOwner::SamePid)
+}
+
+/// Final, side-effect-adjacent validation for a delegated panel action.
+/// Observation/action registry leases freeze the capability generation, while
+/// this fresh native proof catches a panel that closed or changed externally.
+pub(crate) fn ensure_app_context_delegation_live(
+    route: Option<&crate::ax::app_context::AppContextDelegationRoute>,
+) -> anyhow::Result<()> {
+    if route.is_some_and(|route| !crate::ax::app_context::delegation_route_is_live(route)) {
+        anyhow::bail!(
+            "app_context_delegation_stale: re-observe the original host application; no input was sent"
+        );
+    }
+    Ok(())
+}
+
+/// A delegated helper cache is scoped to one exact panel window. Even though
+/// the strict walker excludes sibling top-level sheets, re-check ancestry on
+/// the retained AX object immediately before an element action so a stale or
+/// malicious cache entry cannot address another panel hosted by the shared
+/// AppKit helper process.
+pub(crate) unsafe fn ensure_app_context_element_window(
+    route: Option<&crate::ax::app_context::AppContextDelegationRoute>,
+    element: crate::ax::bindings::AXUIElementRef,
+) -> anyhow::Result<()> {
+    let Some(route) = route else {
+        return Ok(());
+    };
+    if !crate::ax::app_context::delegation_route_matches_element_window(
+        route,
+        crate::ax::exact_target::element_window_id(element),
+    ) {
+        anyhow::bail!(
+            "app_context_delegation_stale: observed element no longer belongs to the delegated panel; re-observe the original host application"
+        );
+    }
+    Ok(())
+}
+
+fn app_context_delegation_stale_refusal() -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "The observed macOS Open/Save panel closed or changed before input. Re-observe the host app; no input was sent.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "app_context_delegation_stale",
+        "effect": "refused",
+        "retryable": true,
+        "suggestion": "Call get_app_state for the original host application."
+    }))
+}
+
+fn app_context_delegation_direct_target_refusal() -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "The macOS Open/Save Panel service is not a public application target. Observe the original host application with app_context before input; no action was sent.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "app_context_auxiliary_direct_target_unsupported",
+        "effect": "refused",
+        "retryable": true,
+        "suggestion": "Call get_app_state for the original host application."
+    }))
+}
+
+fn app_context_delegation_policy_refusal() -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "A trusted Open/Save panel was selected by its host app, but bounded or manifest authorization cannot inherit that host grant. No input was sent.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "app_context_delegation_reauthorization_required",
+        "effect": "refused",
+        "retryable": false,
+        "suggestion": "Use standard or unrestricted authorization, then call get_app_state for the host application."
+    }))
+}
+
 fn pid_window_guarded<T: Tool + 'static>(
     tool: T,
     candidates: &WindowTargetCandidates,
+    delegation_registry: &Arc<crate::ax::app_context::AppContextDelegationRegistry>,
+    delegation_policy: AppContextDelegationPolicy,
 ) -> Box<dyn Tool> {
-    Box::new(PidOnlyWindowTargetGuard::new(
+    Box::new(AppContextDelegationGuard::new(
+        Box::new(PidOnlyWindowTargetGuard::new(
+            Box::new(tool),
+            candidates.clone(),
+        )),
+        delegation_registry.clone(),
+        delegation_policy,
+    ))
+}
+
+fn app_context_guarded<T: Tool + 'static>(
+    tool: T,
+    delegation_registry: &Arc<crate::ax::app_context::AppContextDelegationRegistry>,
+    delegation_policy: AppContextDelegationPolicy,
+) -> Box<dyn Tool> {
+    Box::new(AppContextDelegationGuard::new(
         Box::new(tool),
-        candidates.clone(),
+        delegation_registry.clone(),
+        delegation_policy,
     ))
 }
 
@@ -387,6 +752,7 @@ pub(crate) async fn focus_by_pixel(
     session_id: Option<String>,
     from_zoom: bool,
     mutation_lease: Option<&BackgroundMutationLease>,
+    app_context_route: Option<&crate::ax::app_context::AppContextDelegationRoute>,
 ) -> Result<(), cua_driver_core::protocol::ToolResult> {
     use cua_driver_core::tool::Tool;
     let mut click_args = serde_json::json!({
@@ -415,6 +781,12 @@ pub(crate) async fn focus_by_pixel(
     if from_zoom {
         click_args["from_zoom"] = serde_json::json!(true);
     }
+    if let Some(route) = app_context_route {
+        crate::ax::app_context::inject_delegation_arg(&mut click_args, route);
+    }
+    // This helper only runs inside an already-guarded keyboard action. Reusing
+    // its route avoids recursively acquiring a registry read lease (which can
+    // deadlock behind a waiting observation writer).
     let click_tool = click::ClickTool::new(state.clone());
     let click = click_tool.invoke(click_args);
     let focus = if let Some(lease) = mutation_lease {
@@ -459,6 +831,9 @@ pub(crate) async fn focus_by_pixel(
     }
     if from_zoom {
         click_args["from_zoom"] = serde_json::json!(true);
+    }
+    if let Some(route) = app_context_route {
+        crate::ax::app_context::inject_delegation_arg(&mut click_args, route);
     }
     let focus = click::ClickTool::new(state.clone())
         .invoke(click_args)
@@ -783,6 +1158,12 @@ pub struct ToolState {
     /// the stable host pid/window while explicit foreground keyboard actions
     /// reach the transient that was actually shown to the model.
     pub(crate) transient_ui_registry: Arc<crate::transient_ui::TransientUiRegistry>,
+    /// A successful host-app observation may prove that AppKit delegated its
+    /// current Open/Save panel to Apple's XPC service. The registry keeps that
+    /// exact session-scoped host→panel relationship so actions can address the
+    /// panel's real pid/window without making the helper a public app target.
+    pub(crate) app_context_delegation_registry:
+        Arc<crate::ax::app_context::AppContextDelegationRegistry>,
     /// Global, disk-persisted config — the base layer and the only one the
     /// anonymous session / CLI writes.
     pub config: Arc<std::sync::RwLock<DriverConfig>>,
@@ -823,6 +1204,9 @@ impl ToolState {
             zoom_registry: Arc::new(ZoomRegistry::new()),
             resize_registry: Arc::new(ResizeRegistry::new()),
             transient_ui_registry: Arc::new(crate::transient_ui::TransientUiRegistry::new()),
+            app_context_delegation_registry: Arc::new(
+                crate::ax::app_context::AppContextDelegationRegistry::new(),
+            ),
             // Load persisted config from ~/.cua-driver/config.json so that
             // `cua-driver config set` changes carry over into MCP sessions.
             config: Arc::new(std::sync::RwLock::new(load_driver_config())),
@@ -835,11 +1219,12 @@ impl ToolState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ForegroundKeyboardTarget {
     pub(crate) pid: i32,
     pub(crate) window_id: Option<u32>,
     pub(crate) transient_route: Option<crate::transient_ui::TransientRoute>,
+    pub(crate) app_context_route: Option<crate::ax::app_context::AppContextDelegationRoute>,
 }
 
 /// Resolve the exact keyboard target for an explicit foreground action.
@@ -854,7 +1239,22 @@ pub(crate) async fn resolve_foreground_keyboard_target(
     pid: i32,
     window_id: Option<u32>,
     has_explicit_element_or_point: bool,
+    app_context_route: Option<crate::ax::app_context::AppContextDelegationRoute>,
 ) -> Result<ForegroundKeyboardTarget, cua_driver_core::protocol::ToolResult> {
+    if let Some(route) = app_context_route {
+        let exact_target = window_id.is_some_and(|window_id| {
+            route.delegation.target == crate::ax::app_context::AppContextTarget { pid, window_id }
+        });
+        if !exact_target {
+            return Err(app_context_delegation_stale_refusal());
+        }
+        return Ok(ForegroundKeyboardTarget {
+            pid,
+            window_id,
+            transient_route: None,
+            app_context_route: Some(route),
+        });
+    }
     if tokio::task::spawn_blocking(move || {
         crate::transient_ui::is_trusted_transient_helper_process(pid)
     })
@@ -876,6 +1276,7 @@ pub(crate) async fn resolve_foreground_keyboard_target(
                 pid,
                 window_id,
                 transient_route: None,
+                app_context_route: None,
             }),
             Err(error) => Err(cua_driver_core::protocol::ToolResult::error(format!(
                 "Could not check for transient UI before foreground keyboard delivery: {error}"
@@ -945,6 +1346,7 @@ fn foreground_keyboard_target_from_evidence(
                 pid,
                 window_id: Some(window_id),
                 transient_route: None,
+                app_context_route: None,
             })
         }
         crate::transient_ui::RouteResolution::Live(route) => {
@@ -974,6 +1376,7 @@ fn foreground_keyboard_target_from_evidence(
                 pid: route.target.pid,
                 window_id: Some(route.target.window_id),
                 transient_route: Some(route),
+                app_context_route: None,
             })
         }
         crate::transient_ui::RouteResolution::Stale(route) => Err(
@@ -1358,10 +1761,12 @@ pub fn register_all(
         let session_config = state.session_config.clone();
         let cursor_registry = state.cursor_registry.clone();
         let transient_ui_registry = state.transient_ui_registry.clone();
+        let app_context_delegation_registry = state.app_context_delegation_registry.clone();
         let registration =
             cua_driver_core::session::register_scoped_session_end_hook(move |session_id| {
                 session_config.clear(session_id);
                 transient_ui_registry.clear_session(session_id);
+                app_context_delegation_registry.clear_session(session_id);
                 // Per-session agent cursor: the session_id is the cursor key when
                 // the caller gave no explicit cursor_id, so dropping it here both
                 // prunes the metadata registry and stops the overlay painting that
@@ -1393,49 +1798,81 @@ pub fn register_all(
         )),
     ));
     registry.register(Box::new(launch_app::LaunchAppTool));
-    registry.register(Box::new(kill_app::KillAppTool));
+    registry.register(app_context_guarded(
+        kill_app::KillAppTool,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::RejectPanelTarget,
+    ));
     let pid_window_candidates: WindowTargetCandidates = Arc::new(pid_window_target_candidates);
     registry.register(pid_window_guarded(
         bring_to_front::BringToFrontTool,
         &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::RejectPanelTarget,
     ));
-    registry.register(Box::new(set_window_frame::SetWindowFrameTool));
-    registry.register(Box::new(invoke_menu::InvokeMenuTool));
+    registry.register(app_context_guarded(
+        set_window_frame::SetWindowFrameTool,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::RejectPanelTarget,
+    ));
+    registry.register(app_context_guarded(
+        invoke_menu::InvokeMenuTool,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::RejectPanelTarget,
+    ));
     registry.register(pid_window_guarded(
         click::ClickTool::new(state.clone()),
         &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::AllowPanelInput,
     ));
     registry.register(pid_window_guarded(
         double_click::DoubleClickTool::new(state.clone()),
         &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::AllowPanelInput,
     ));
     registry.register(pid_window_guarded(
         right_click::RightClickTool::new(state.clone()),
         &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::AllowPanelInput,
     ));
     registry.register(pid_window_guarded(
         drag::DragTool::new(state.clone()),
         &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::AllowPanelInput,
     ));
     registry.register(pid_window_guarded(
         type_text::TypeTextTool::new(state.clone()),
         &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::AllowPanelInput,
     ));
     registry.register(pid_window_guarded(
         press_key::PressKeyTool::new(state.clone()),
         &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::AllowPanelInput,
     ));
     registry.register(pid_window_guarded(
         hotkey::HotkeyTool::new(state.clone()),
         &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::AllowPanelInput,
     ));
     registry.register(pid_window_guarded(
         set_value::SetValueTool::new(state.clone()),
         &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::AllowPanelInput,
     ));
     registry.register(pid_window_guarded(
         scroll::ScrollTool::new(state.clone()),
         &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::AllowPanelInput,
     ));
     cua_driver_core::clipboard::register_clipboard_tools(
         registry,
@@ -1483,9 +1920,13 @@ pub fn register_all(
     registry.register(Box::new(
         get_accessibility_tree::GetAccessibilityTreeTool::new(state.clone()),
     ));
-    registry.register(Box::new(zoom::ZoomTool {
-        state: state.clone(),
-    }));
+    registry.register(app_context_guarded(
+        zoom::ZoomTool {
+            state: state.clone(),
+        },
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::AllowPanelInput,
+    ));
     // `type_text_chars` is intentionally NOT registered — Swift treats it as
     // a deprecated alias for `type_text` resolved at invoke time in
     // mcp-server's `ToolRegistry::invoke`. Keeping it out of the registry

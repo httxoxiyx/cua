@@ -56,6 +56,7 @@ struct NativeCardHandles {
 }
 
 struct LiveStreamEntry {
+    target_pid: i64,
     window_id: u64,
     stream: Option<SCStream>,
     cancelled: Arc<AtomicBool>,
@@ -63,16 +64,17 @@ struct LiveStreamEntry {
 }
 
 struct LiveFrame {
-    pid: i64,
+    app_pid: i64,
+    target_pid: i64,
     window_id: u64,
     image: LiveFrameImage,
     frame_pending: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ClickedTarget {
-    pid: i64,
-    window_id: u64,
+    target: pip_preview::PipTarget,
 }
 
 #[derive(Default)]
@@ -84,7 +86,42 @@ struct ForegroundVisibilityWatcher {
     cancelled: Arc<AtomicBool>,
 }
 
-#[derive(Clone, Copy)]
+struct ForegroundVisibilityRefresh {
+    suppressed_pids: HashSet<i64>,
+    render_required: bool,
+}
+
+#[derive(Clone)]
+struct DelegationFrameProof {
+    target_pid: i64,
+    window_id: u64,
+    epoch: u64,
+    publication_generation: u64,
+    session_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct PipPublicationReservation {
+    generation: u64,
+    session_id: Option<String>,
+    target_pid: i64,
+    window_id: u64,
+    target_epoch: u64,
+}
+
+struct VerifiedPipFrame {
+    frame: PipFrame,
+    publication_generation: u64,
+}
+
+#[derive(Default)]
+struct DelegationProofState {
+    target_epochs: HashMap<(i64, u64), u64>,
+    frame_proofs: HashMap<i64, DelegationFrameProof>,
+    latest_publications: HashMap<i64, PipPublicationReservation>,
+}
+
+#[derive(Clone)]
 struct CardGesture {
     target: Option<ClickedTarget>,
     front_pid: Option<i64>,
@@ -117,6 +154,9 @@ static FOREGROUND_VISIBILITY_STATE: LazyLock<Mutex<ForegroundVisibilityState>> =
 static FOREGROUND_VISIBILITY_WATCHER: Mutex<Option<ForegroundVisibilityWatcher>> = Mutex::new(None);
 static LIVE_STREAMS: LazyLock<Mutex<HashMap<i64, LiveStreamEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static DELEGATION_PROOF_STATE: LazyLock<Mutex<DelegationProofState>> =
+    LazyLock::new(|| Mutex::new(DelegationProofState::default()));
+static NEXT_PIP_PUBLICATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 const LIVE_CAPTURE_FPS: i32 = 12;
 const LIVE_CAPTURE_MAX_SIDE: f64 = 960.0;
@@ -183,37 +223,71 @@ pub struct MacosPipBackend;
 
 impl PipBackend for MacosPipBackend {
     fn push_frame(&self, mut frame: PipFrame) {
+        let app_pid = frame.target.app_key_pid();
         if frame.target.pid <= 0
             || frame.target.window_id == 0
-            || HIDDEN_APPS.lock().unwrap().contains(&frame.target.pid)
+            || !pip_target_session_is_live(&frame.target)
+            || HIDDEN_APPS.lock().unwrap().contains(&app_pid)
         {
             return;
         }
+        let publication_generation = reserve_pip_publication(&frame.target);
+        let target_for_failure = frame.target.clone();
+        if std::thread::Builder::new()
+            .name(format!("cua-pip-seed-{app_pid}"))
+            .spawn(move || {
+                if !pip_target_session_is_live(&frame.target)
+                    || !pip_publication_is_current(&frame.target, publication_generation)
+                    || !pip_delegation_is_live(&frame.target)
+                {
+                    cancel_pip_publication(&frame.target, publication_generation);
+                    return;
+                }
 
-        let Ok(pid) = i32::try_from(frame.target.pid) else {
-            return;
-        };
-        let Some(window) = crate::windows::all_windows().into_iter().find(|window| {
-            window.pid == pid && u64::from(window.window_id) == frame.target.window_id
-        }) else {
-            // An observation can race a close/relaunch. Never seed a card from
-            // a target WindowServer no longer reports.
-            return;
-        };
-        frame.target.app_name = window.app_name;
-        frame.target.window_title = (!window.title.trim().is_empty()).then_some(window.title);
-        if frame.target.app_name.trim().is_empty() {
-            frame.target.app_name = crate::apps::get_app_name_for_pid(pid)
-                .unwrap_or_else(|| format!("App {}", frame.target.pid));
+                let Ok(pid) = i32::try_from(frame.target.pid) else {
+                    cancel_pip_publication(&frame.target, publication_generation);
+                    return;
+                };
+                let Some(window) = crate::windows::all_windows().into_iter().find(|window| {
+                    window.pid == pid && u64::from(window.window_id) == frame.target.window_id
+                }) else {
+                    cancel_pip_publication(&frame.target, publication_generation);
+                    return;
+                };
+                frame.target.app_name = i32::try_from(app_pid)
+                    .ok()
+                    .and_then(crate::apps::get_app_name_for_pid)
+                    .unwrap_or(window.app_name);
+                frame.target.window_title =
+                    (!window.title.trim().is_empty()).then_some(window.title);
+                if frame.target.app_name.trim().is_empty() {
+                    frame.target.app_name = format!("App {app_pid}");
+                }
+                if !register_delegation_frame_proof(&frame.target, publication_generation) {
+                    cancel_pip_publication(&frame.target, publication_generation);
+                    return;
+                }
+
+                dispatch_to_main(
+                    VerifiedPipFrame {
+                        frame,
+                        publication_generation,
+                    },
+                    push_frame_cb,
+                );
+            })
+            .is_err()
+        {
+            cancel_pip_publication(&target_for_failure, publication_generation);
         }
-
-        dispatch_to_main(frame, push_frame_cb);
     }
 
     fn ensure_target(&self, target: pip_preview::PipTarget) {
+        let app_pid = target.app_key_pid();
         if target.pid <= 0
             || target.window_id == 0
-            || HIDDEN_APPS.lock().unwrap().contains(&target.pid)
+            || !pip_target_session_is_live(&target)
+            || HIDDEN_APPS.lock().unwrap().contains(&app_pid)
         {
             return;
         }
@@ -223,7 +297,7 @@ impl PipBackend for MacosPipBackend {
             pip_target_seed_policy(
                 model
                     .as_ref()
-                    .and_then(|model| model.frame_for_app(target.pid)),
+                    .and_then(|model| model.frame_for_app(app_pid)),
                 &target,
             )
         };
@@ -245,6 +319,7 @@ impl PipBackend for MacosPipBackend {
     }
 
     fn end_session(&self, session_id: &str) {
+        remove_session_delegation_frame_proofs(session_id);
         dispatch_to_main(session_id.to_owned(), end_session_cb);
     }
 
@@ -256,12 +331,269 @@ impl PipBackend for MacosPipBackend {
     fn shutdown(self: Box<Self>) {
         stop_foreground_visibility_watcher();
         stop_all_live_capture();
+        *DELEGATION_PROOF_STATE.lock().unwrap() = DelegationProofState::default();
         dispatch_to_main((), shutdown_cb);
     }
 }
 
 fn exact_target_matches(frame: &PipFrame, target: &pip_preview::PipTarget) -> bool {
-    frame.target.pid == target.pid && frame.target.window_id == target.window_id
+    frame.target.app_key_pid() == target.app_key_pid()
+        && frame.target.pid == target.pid
+        && frame.target.window_id == target.window_id
+}
+
+pub(crate) fn invalidate_app_context_target(target: crate::ax::app_context::AppContextTarget) {
+    let key = (i64::from(target.pid), u64::from(target.window_id));
+    let mut state = DELEGATION_PROOF_STATE.lock().unwrap();
+    let epoch = state.target_epochs.entry(key).or_default();
+    *epoch = epoch.wrapping_add(1).max(1);
+}
+
+#[cfg(test)]
+fn delegation_target_epoch(target: &pip_preview::PipTarget) -> u64 {
+    DELEGATION_PROOF_STATE
+        .lock()
+        .unwrap()
+        .target_epochs
+        .get(&(target.pid, target.window_id))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn reserve_pip_publication(target: &pip_preview::PipTarget) -> u64 {
+    let generation = NEXT_PIP_PUBLICATION_GENERATION.fetch_add(1, Ordering::AcqRel);
+    let mut state = DELEGATION_PROOF_STATE.lock().unwrap();
+    let target_epoch = state
+        .target_epochs
+        .get(&(target.pid, target.window_id))
+        .copied()
+        .unwrap_or(0);
+    state.latest_publications.insert(
+        target.app_key_pid(),
+        PipPublicationReservation {
+            generation,
+            session_id: target.session_id.clone(),
+            target_pid: target.pid,
+            window_id: target.window_id,
+            target_epoch,
+        },
+    );
+    generation
+}
+
+fn pip_publication_is_current(target: &pip_preview::PipTarget, generation: u64) -> bool {
+    let state = DELEGATION_PROOF_STATE.lock().unwrap();
+    let current_epoch = state
+        .target_epochs
+        .get(&(target.pid, target.window_id))
+        .copied()
+        .unwrap_or(0);
+    state
+        .latest_publications
+        .get(&target.app_key_pid())
+        .is_some_and(|reservation| {
+            reservation.generation == generation
+                && reservation.session_id == target.session_id
+                && reservation.target_pid == target.pid
+                && reservation.window_id == target.window_id
+                && (target.delegation.is_none() || reservation.target_epoch == current_epoch)
+        })
+}
+
+fn cancel_pip_publication(target: &pip_preview::PipTarget, generation: u64) {
+    let app_pid = target.app_key_pid();
+    let mut state = DELEGATION_PROOF_STATE.lock().unwrap();
+    if state
+        .latest_publications
+        .get(&app_pid)
+        .is_some_and(|reservation| reservation.generation == generation)
+    {
+        state.latest_publications.remove(&app_pid);
+        state.frame_proofs.remove(&app_pid);
+    }
+}
+
+fn register_delegation_frame_proof(
+    target: &pip_preview::PipTarget,
+    publication_generation: u64,
+) -> bool {
+    let app_pid = target.app_key_pid();
+    let Some(_) = target.delegation.as_ref() else {
+        let mut state = DELEGATION_PROOF_STATE.lock().unwrap();
+        let current = state
+            .latest_publications
+            .get(&app_pid)
+            .is_some_and(|reservation| {
+                reservation.generation == publication_generation
+                    && reservation.session_id == target.session_id
+                    && reservation.target_pid == target.pid
+                    && reservation.window_id == target.window_id
+            });
+        if current {
+            state.frame_proofs.remove(&app_pid);
+        }
+        return current;
+    };
+    if !pip_delegation_is_live(target) {
+        return false;
+    }
+    commit_delegation_frame_proof(target, publication_generation)
+}
+
+fn commit_delegation_frame_proof(
+    target: &pip_preview::PipTarget,
+    publication_generation: u64,
+) -> bool {
+    let app_pid = target.app_key_pid();
+    let mut state = DELEGATION_PROOF_STATE.lock().unwrap();
+    let current_epoch = state
+        .target_epochs
+        .get(&(target.pid, target.window_id))
+        .copied()
+        .unwrap_or(0);
+    let publication_current = state
+        .latest_publications
+        .get(&app_pid)
+        .is_some_and(|reservation| {
+            reservation.generation == publication_generation
+                && reservation.session_id == target.session_id
+                && reservation.target_pid == target.pid
+                && reservation.window_id == target.window_id
+                && reservation.target_epoch == current_epoch
+        });
+    if !publication_current {
+        return false;
+    }
+    state.frame_proofs.insert(
+        app_pid,
+        DelegationFrameProof {
+            target_pid: target.pid,
+            window_id: target.window_id,
+            epoch: current_epoch,
+            publication_generation,
+            session_id: target.session_id.clone(),
+        },
+    );
+    true
+}
+
+fn delegation_frame_proof_is_live(target: &pip_preview::PipTarget) -> bool {
+    if target.delegation.is_none() {
+        return true;
+    }
+    let state = DELEGATION_PROOF_STATE.lock().unwrap();
+    let current_epoch = state
+        .target_epochs
+        .get(&(target.pid, target.window_id))
+        .copied()
+        .unwrap_or(0);
+    let app_pid = target.app_key_pid();
+    let reservation = state.latest_publications.get(&app_pid);
+    state.frame_proofs.get(&app_pid).is_some_and(|proof| {
+        proof.target_pid == target.pid
+            && proof.window_id == target.window_id
+            && proof.epoch == current_epoch
+            && proof.session_id == target.session_id
+            && reservation.is_some_and(|reservation| {
+                reservation.generation == proof.publication_generation
+                    && reservation.session_id == proof.session_id
+                    && reservation.target_pid == proof.target_pid
+                    && reservation.window_id == proof.window_id
+                    && reservation.target_epoch == proof.epoch
+            })
+    })
+}
+
+fn remove_delegation_frame_proof(app_pid: i64) {
+    let mut state = DELEGATION_PROOF_STATE.lock().unwrap();
+    state.frame_proofs.remove(&app_pid);
+    state.latest_publications.remove(&app_pid);
+}
+
+fn remove_session_delegation_frame_proofs(session_id: &str) {
+    let mut state = DELEGATION_PROOF_STATE.lock().unwrap();
+    state
+        .frame_proofs
+        .retain(|_, proof| proof.session_id.as_deref() != Some(session_id));
+    state
+        .latest_publications
+        .retain(|_, reservation| reservation.session_id.as_deref() != Some(session_id));
+}
+
+fn pip_delegation_is_live(target: &pip_preview::PipTarget) -> bool {
+    if !pip_target_session_is_live(target) {
+        return false;
+    }
+    let Some(delegation) = target.delegation.as_ref() else {
+        return true;
+    };
+    if delegation.kind != "trusted_macos_open_save_panel"
+        || target.logical_pid != Some(delegation.host_pid)
+        || target.app_key_pid() != delegation.host_pid
+    {
+        return false;
+    }
+    let (Ok(host_pid), Ok(target_pid), Ok(target_window_id)) = (
+        i32::try_from(delegation.host_pid),
+        i32::try_from(target.pid),
+        u32::try_from(target.window_id),
+    ) else {
+        return false;
+    };
+    let panel_kind = match delegation.panel_kind.as_str() {
+        "open" => crate::ax::app_context::OpenSavePanelKind::Open,
+        "save" => crate::ax::app_context::OpenSavePanelKind::Save,
+        _ => return false,
+    };
+    let expected = crate::ax::app_context::ExpectedAppIdentity {
+        bundle_id: delegation.expected_bundle_id.clone(),
+        app_name: delegation.expected_app_name.clone(),
+    };
+    if expected.bundle_id.is_none() && expected.app_name.is_none() {
+        return false;
+    }
+    crate::ax::app_context::resolve_app_context(host_pid, &expected)
+        .ok()
+        .is_some_and(|resolved| {
+            pip_delegation_matches_resolved(
+                target,
+                host_pid,
+                target_pid,
+                target_window_id,
+                panel_kind,
+                &resolved,
+            )
+        })
+}
+
+fn pip_target_session_is_live(target: &pip_preview::PipTarget) -> bool {
+    target
+        .session_id
+        .as_deref()
+        .is_none_or(|session_id| !cua_driver_core::session::is_session_ended(session_id))
+}
+
+fn pip_delegation_matches_resolved(
+    target: &pip_preview::PipTarget,
+    host_pid: i32,
+    target_pid: i32,
+    target_window_id: u32,
+    panel_kind: crate::ax::app_context::OpenSavePanelKind,
+    resolved: &crate::ax::app_context::ResolvedAppContext,
+) -> bool {
+    target.app_key_pid() == i64::from(host_pid)
+        && target.pid == i64::from(target_pid)
+        && target.window_id == u64::from(target_window_id)
+        && resolved.target
+            == crate::ax::app_context::AppContextTarget {
+                pid: target_pid,
+                window_id: target_window_id,
+            }
+        && resolved.delegation.as_ref().is_some_and(|current| {
+            current.host_pid == host_pid
+                && current.target == resolved.target
+                && current.panel_kind == panel_kind
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,12 +625,17 @@ unsafe extern "C" fn set_input_passthrough_cb(ctx: *mut c_void) {
 }
 
 unsafe extern "C" fn push_frame_cb(ctx: *mut c_void) {
-    let frame: PipFrame = *Box::from_raw(ctx as *mut PipFrame);
-    if HIDDEN_APPS.lock().unwrap().contains(&frame.target.pid) {
+    let verified: VerifiedPipFrame = *Box::from_raw(ctx as *mut VerifiedPipFrame);
+    let frame = verified.frame;
+    let pid = frame.target.app_key_pid();
+    if !pip_target_session_is_live(&frame.target)
+        || !pip_publication_is_current(&frame.target, verified.publication_generation)
+        || !delegation_frame_proof_is_live(&frame.target)
+        || HIDDEN_APPS.lock().unwrap().contains(&pid)
+    {
         return;
     }
 
-    let pid = frame.target.pid;
     let outcome = {
         let mut model = VIEW_MODEL.lock().unwrap();
         let model = model.get_or_insert_with(|| PipViewModel::new(MAX_VISIBLE_PIP_CARDS));
@@ -306,6 +643,7 @@ unsafe extern "C" fn push_frame_cb(ctx: *mut c_void) {
     };
 
     if let Some(evicted_pid) = outcome.evicted_pid {
+        remove_delegation_frame_proof(evicted_pid);
         stop_live_capture_for(evicted_pid);
     }
     if outcome.window_changed {
@@ -331,6 +669,7 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         (snapshot, removed_pids)
     };
     for pid in removed_pids {
+        remove_delegation_frame_proof(pid);
         stop_live_capture_for(pid);
     }
     render_snapshot(&snapshot);
@@ -346,7 +685,7 @@ fn current_snapshot() -> Vec<PipFrame> {
 }
 
 fn frame_is_suppressed(frame: &PipFrame, suppressed_pids: &HashSet<i64>) -> bool {
-    suppressed_pids.contains(&frame.target.pid)
+    suppressed_pids.contains(&frame.target.app_key_pid())
 }
 
 fn frame_needs_live_capture(frame: &PipFrame, suppressed_pids: &HashSet<i64>) -> bool {
@@ -357,15 +696,16 @@ fn snapshot_candidate_pid(snapshot: &[PipFrame], pid: Option<i32>) -> Option<i64
     let pid = i64::from(pid?);
     snapshot
         .iter()
-        .any(|frame| frame.target.pid == pid)
+        .any(|frame| frame.target.app_key_pid() == pid)
         .then_some(pid)
 }
 
-fn visually_frontmost_pid_in(
+fn visually_frontmost_app_key_in(
+    snapshot: &[PipFrame],
     windows: &[crate::windows::WindowInfo],
     local_pid: i32,
     mut is_auxiliary: impl FnMut(i32) -> bool,
-) -> Option<i32> {
+) -> Option<i64> {
     let mut candidates = windows
         .iter()
         .filter(|window| {
@@ -385,18 +725,32 @@ fn visually_frontmost_pid_in(
     candidates.sort_by_key(|window| std::cmp::Reverse(window.z_index));
 
     let mut checked_pids = HashSet::new();
-    candidates.into_iter().find_map(|window| {
-        if !checked_pids.insert(window.pid) || is_auxiliary(window.pid) {
-            return None;
+    for window in candidates {
+        // A delegated Open/Save panel is an auxiliary process, but when its
+        // exact physical window is visually frontmost the corresponding
+        // logical host card must disappear. Match the complete tuple because
+        // the service can host panels for multiple applications.
+        if let Some(frame) = snapshot.iter().find(|frame| {
+            frame.target.pid == i64::from(window.pid)
+                && frame.target.window_id == u64::from(window.window_id)
+        }) {
+            return Some(frame.target.app_key_pid());
         }
-        Some(window.pid)
-    })
+        if !checked_pids.insert(window.pid) || is_auxiliary(window.pid) {
+            continue;
+        }
+        // The first non-auxiliary visible window is authoritative even when
+        // it has no PiP card; do not look through another foreground app and
+        // accidentally suppress a lower card.
+        return snapshot_candidate_pid(snapshot, Some(window.pid));
+    }
+    None
 }
 
 fn foreground_candidate_pids(
     snapshot: &[PipFrame],
     workspace_frontmost_pid: Option<i32>,
-    visual_frontmost_pid: Option<i32>,
+    visual_frontmost_app_key: Option<i64>,
 ) -> HashSet<i64> {
     // A background-delivered modal can be visibly above every other app while
     // NSWorkspace continues to report the user's terminal as active. Suppress
@@ -404,10 +758,18 @@ fn foreground_candidate_pids(
     // active application. WindowServer exposes one global ordering across
     // displays, so the visual member remains a best-effort multi-display hint;
     // the authoritative NSWorkspace member is always retained alongside it.
-    [workspace_frontmost_pid, visual_frontmost_pid]
+    let mut suppressed = workspace_frontmost_pid
+        .and_then(|pid| snapshot_candidate_pid(snapshot, Some(pid)))
         .into_iter()
-        .filter_map(|pid| snapshot_candidate_pid(snapshot, pid))
-        .collect()
+        .collect::<HashSet<_>>();
+    if let Some(app_key) = visual_frontmost_app_key.filter(|app_key| {
+        snapshot
+            .iter()
+            .any(|frame| frame.target.app_key_pid() == *app_key)
+    }) {
+        suppressed.insert(app_key);
+    }
+    suppressed
 }
 
 fn foreground_visibility_watcher_needed(snapshot: &[PipFrame]) -> bool {
@@ -436,13 +798,45 @@ fn live_targets_from_window_enumeration(
 }
 
 fn refresh_live_candidates(live_targets: &HashSet<(i64, u64)>) -> (Vec<PipFrame>, bool) {
+    let candidates = VIEW_MODEL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|model| {
+            model
+                .ordered_frames()
+                .into_iter()
+                .map(|frame| frame.target.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // Native host→panel validation can involve AX and code-signature work.
+    // Perform it without holding the view-model mutex so frame publication and
+    // AppKit rendering are never serialized behind that proof.
+    let checked = candidates
+        .into_iter()
+        .map(|target| {
+            let key = (target.app_key_pid(), target.pid, target.window_id);
+            let live = live_targets.contains(&(target.pid, target.window_id))
+                && pip_delegation_is_live(&target)
+                && delegation_frame_proof_is_live(&target);
+            (key, live)
+        })
+        .collect::<HashMap<_, _>>();
     let (snapshot, removed_pids) = {
         let mut model = VIEW_MODEL.lock().unwrap();
         let Some(model) = model.as_mut() else {
             return (Vec::new(), false);
         };
-        let removed_pids = model
-            .retain_live_targets(|target| live_targets.contains(&(target.pid, target.window_id)));
+        let removed_pids = model.retain_live_targets(|target| {
+            checked
+                .get(&(target.app_key_pid(), target.pid, target.window_id))
+                .copied()
+                // A newer frame appeared after the validation snapshot. Keep
+                // it for the next verifier tick rather than applying stale
+                // evidence from the superseded target.
+                .unwrap_or(true)
+        });
         let snapshot = model
             .ordered_frames()
             .into_iter()
@@ -452,6 +846,7 @@ fn refresh_live_candidates(live_targets: &HashSet<(i64, u64)>) -> (Vec<PipFrame>
     };
     let changed = !removed_pids.is_empty();
     for pid in removed_pids {
+        remove_delegation_frame_proof(pid);
         stop_live_capture_for(pid);
     }
     (snapshot, changed)
@@ -467,7 +862,7 @@ fn candidate_refresh_requires_render(suppression_changed: bool, candidates_chang
     suppression_changed || candidates_changed
 }
 
-unsafe fn refresh_foreground_visibility_if_due() {
+fn compute_foreground_visibility_refresh() -> Option<ForegroundVisibilityRefresh> {
     let now_ms = monotonic_ms();
     let previous_ms = LAST_FOREGROUND_CHECK_MS.load(Ordering::Acquire);
     if !foreground_visibility_check_is_due(now_ms, previous_ms)
@@ -475,7 +870,7 @@ unsafe fn refresh_foreground_visibility_if_due() {
             .compare_exchange(previous_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
     {
-        return;
+        return None;
     }
 
     // One raw WindowServer snapshot drives both liveness and visual-frontmost
@@ -483,12 +878,13 @@ unsafe fn refresh_foreground_visibility_if_due() {
     // cards and retry on the next tick rather than deleting the session state.
     let enumeration = crate::windows::all_windows_including_accessory_layers_with_snapshot();
     let Some(live_targets) = live_targets_from_window_enumeration(&enumeration) else {
-        return;
+        return None;
     };
     let (snapshot, candidates_changed) = refresh_live_candidates(&live_targets);
     let local_pid = i32::try_from(std::process::id()).ok();
-    let visual_frontmost_pid = local_pid.and_then(|local_pid| {
-        visually_frontmost_pid_in(
+    let visual_frontmost_app_key = local_pid.and_then(|local_pid| {
+        visually_frontmost_app_key_in(
+            &snapshot,
             &enumeration.windows,
             local_pid,
             crate::apps::is_auxiliary_application,
@@ -497,20 +893,21 @@ unsafe fn refresh_foreground_visibility_if_due() {
     let suppressed = foreground_candidate_pids(
         &snapshot,
         crate::apps::frontmost_pid(),
-        visual_frontmost_pid,
+        visual_frontmost_app_key,
     );
     let mut state = FOREGROUND_VISIBILITY_STATE.lock().unwrap();
     let suppression_changed = update_foreground_visibility_state(&mut state, suppressed.clone());
     drop(state);
-    if candidate_refresh_requires_render(suppression_changed, candidates_changed) {
-        render_snapshot_with_suppressed_windows(&snapshot, &suppressed);
-    }
+    Some(ForegroundVisibilityRefresh {
+        suppressed_pids: suppressed,
+        render_required: candidate_refresh_requires_render(suppression_changed, candidates_changed),
+    })
 }
 
 unsafe extern "C" fn refresh_foreground_visibility_cb(ctx: *mut c_void) {
-    drop(Box::from_raw(ctx as *mut ()));
-    if HANDLES.lock().unwrap().is_some() {
-        refresh_foreground_visibility_if_due();
+    let refresh = *Box::from_raw(ctx as *mut ForegroundVisibilityRefresh);
+    if refresh.render_required && HANDLES.lock().unwrap().is_some() {
+        render_snapshot_with_suppressed_windows(&current_snapshot(), &refresh.suppressed_pids);
     }
     FOREGROUND_REFRESH_PENDING.store(false, Ordering::Release);
 }
@@ -520,7 +917,19 @@ fn schedule_foreground_visibility_refresh() {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        dispatch_to_main((), refresh_foreground_visibility_cb);
+        if std::thread::Builder::new()
+            .name("cua-pip-verify".to_owned())
+            .spawn(|| {
+                if let Some(refresh) = compute_foreground_visibility_refresh() {
+                    dispatch_to_main(refresh, refresh_foreground_visibility_cb);
+                } else {
+                    FOREGROUND_REFRESH_PENDING.store(false, Ordering::Release);
+                }
+            })
+            .is_err()
+        {
+            FOREGROUND_REFRESH_PENDING.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -579,7 +988,11 @@ fn reconcile_live_capture(snapshot: &[PipFrame], suppressed_pids: &HashSet<i64>)
 
     for frame in snapshot {
         if frame_needs_live_capture(frame, suppressed_pids) {
-            ensure_live_capture(frame.target.pid, frame.target.window_id);
+            ensure_live_capture(
+                frame.target.app_key_pid(),
+                frame.target.pid,
+                frame.target.window_id,
+            );
         }
     }
 }
@@ -598,27 +1011,30 @@ fn monotonic_ms() -> u64 {
     FOREGROUND_CLOCK_ORIGIN.elapsed().as_millis().max(1) as u64
 }
 
-fn ensure_live_capture(pid: i64, window_id: u64) {
+fn ensure_live_capture(app_pid: i64, target_pid: i64, window_id: u64) {
     {
         let streams = LIVE_STREAMS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if streams.get(&pid).is_some_and(|entry| {
-            entry.window_id == window_id && !entry.cancelled.load(Ordering::Acquire)
+        if streams.get(&app_pid).is_some_and(|entry| {
+            entry.target_pid == target_pid
+                && entry.window_id == window_id
+                && !entry.cancelled.load(Ordering::Acquire)
         }) {
             return;
         }
     }
 
-    stop_live_capture_for(pid);
+    stop_live_capture_for(app_pid);
     let cancelled = Arc::new(AtomicBool::new(false));
     let frame_pending = Arc::new(AtomicBool::new(false));
     LIVE_STREAMS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(
-            pid,
+            app_pid,
             LiveStreamEntry {
+                target_pid,
                 window_id,
                 stream: None,
                 cancelled: Arc::clone(&cancelled),
@@ -627,10 +1043,11 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
         );
 
     if let Err(error) = std::thread::Builder::new()
-        .name(format!("cua-pip-{pid}"))
+        .name(format!("cua-pip-{app_pid}"))
         .spawn(move || {
             match build_live_capture(
-                pid,
+                app_pid,
+                target_pid,
                 window_id,
                 Arc::clone(&cancelled),
                 Arc::clone(&frame_pending),
@@ -639,8 +1056,9 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
                     let mut streams = LIVE_STREAMS
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let current = streams.get_mut(&pid).filter(|entry| {
-                        entry.window_id == window_id
+                    let current = streams.get_mut(&app_pid).filter(|entry| {
+                        entry.target_pid == target_pid
+                            && entry.window_id == window_id
                             && Arc::ptr_eq(&entry.cancelled, &cancelled)
                             && !cancelled.load(Ordering::Acquire)
                     });
@@ -648,7 +1066,8 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
                         entry.stream = Some(stream);
                         tracing::info!(
                             target: "pip",
-                            pid,
+                            app_pid,
+                            target_pid,
                             window_id,
                             fps = LIVE_CAPTURE_FPS,
                             "live app PiP capture started"
@@ -661,7 +1080,8 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
                 Err(error) => {
                     tracing::warn!(
                         target: "pip",
-                        pid,
+                        app_pid,
+                        target_pid,
                         window_id,
                         %error,
                         "SCStream unavailable; exact-window polling is keeping PiP live"
@@ -670,18 +1090,21 @@ fn ensure_live_capture(pid: i64, window_id: u64) {
             }
         })
     {
-        tracing::warn!(target: "pip", pid, window_id, %error, "failed to spawn PiP capture worker");
+        tracing::warn!(target: "pip", app_pid, target_pid, window_id, %error, "failed to spawn PiP capture worker");
     }
 }
 
 fn build_live_capture(
-    pid: i64,
+    app_pid: i64,
+    target_pid: i64,
     window_id: u64,
     cancelled: Arc<AtomicBool>,
     frame_pending: Arc<AtomicBool>,
 ) -> anyhow::Result<SCStream> {
     let native_window_id = u32::try_from(window_id)
         .map_err(|_| anyhow::anyhow!("window id {window_id} does not fit a CGWindowID"))?;
+    let native_target_pid = i32::try_from(target_pid)
+        .map_err(|_| anyhow::anyhow!("target pid is outside the native process-id range"))?;
     let deadline = Instant::now() + LIVE_CAPTURE_WINDOW_LOOKUP_TIMEOUT;
     let target_window = loop {
         if cancelled.load(Ordering::Acquire) {
@@ -692,11 +1115,16 @@ fn build_live_capture(
             .with_on_screen_windows_only(false)
             .get()
             .map_err(|error| anyhow::anyhow!("SCShareableContent lookup failed: {error}"))?;
-        if let Some(window) = content
-            .windows()
-            .into_iter()
-            .find(|window| window.window_id() == native_window_id)
-        {
+        if let Some(window) = content.windows().into_iter().find(|window| {
+            screen_capture_window_matches_target(
+                window.window_id(),
+                window
+                    .owning_application()
+                    .map(|application| application.process_id()),
+                native_window_id,
+                native_target_pid,
+            )
+        }) {
             break window;
         }
         if Instant::now() >= deadline {
@@ -742,17 +1170,19 @@ fn build_live_capture(
                     Ok(image) => {
                         dispatch_to_main(
                             LiveFrame {
-                                pid,
+                                app_pid,
+                                target_pid,
                                 window_id,
                                 image: LiveFrameImage::CgImage(image),
                                 frame_pending: Arc::clone(&frame_pending),
+                                cancelled: Arc::clone(&cancelled),
                             },
                             push_live_frame_cb,
                         )
                     }
                     Err(error) => {
                         frame_pending.store(false, Ordering::Release);
-                        tracing::debug!(target: "pip", pid, window_id, error, "live PiP frame had no image");
+                        tracing::debug!(target: "pip", app_pid, target_pid, window_id, error, "live PiP frame had no image");
                     }
                 }
             },
@@ -763,6 +1193,24 @@ fn build_live_capture(
         .start_capture()
         .map_err(|error| anyhow::anyhow!("SCStream::start_capture failed: {error}"))?;
     Ok(stream)
+}
+
+fn screen_capture_window_matches_target(
+    window_id: u32,
+    owner_pid: Option<i32>,
+    expected_window_id: u32,
+    expected_pid: i32,
+) -> bool {
+    window_id == expected_window_id && owner_pid == Some(expected_pid)
+}
+
+fn physical_target_is_live(target_pid: i64, window_id: u64) -> bool {
+    let (Ok(target_pid), Ok(window_id)) = (i32::try_from(target_pid), u32::try_from(window_id))
+    else {
+        return false;
+    };
+    crate::windows::window_info_by_id(window_id)
+        .is_some_and(|window| window.pid == target_pid && window.window_id == window_id)
 }
 
 fn stop_live_capture_for(pid: i64) {
@@ -812,20 +1260,30 @@ unsafe extern "C" fn push_live_frame_cb(ctx: *mut c_void) {
 
     let frame: LiveFrame = *Box::from_raw(ctx as *mut LiveFrame);
     frame.frame_pending.store(false, Ordering::Release);
-    if HIDDEN_APPS.lock().unwrap().contains(&frame.pid)
-        || !VIEW_MODEL
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|model| model.frame_for_app(frame.pid))
-            .is_some_and(|model_frame| model_frame.target.window_id == frame.window_id)
+    if frame.cancelled.load(Ordering::Acquire) {
+        return;
+    }
+    let model_target = VIEW_MODEL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|model| model.frame_for_app(frame.app_pid))
+        .map(|model_frame| model_frame.target.clone());
+    let Some(model_target) = model_target else {
+        return;
+    };
+    if HIDDEN_APPS.lock().unwrap().contains(&frame.app_pid)
+        || !pip_target_session_is_live(&model_target)
+        || !delegation_frame_proof_is_live(&model_target)
+        || model_target.pid != frame.target_pid
+        || model_target.window_id != frame.window_id
     {
         return;
     }
     let image_view = CARD_HANDLES
         .lock()
         .unwrap()
-        .get(&frame.pid)
+        .get(&frame.app_pid)
         .map(|handles| handles.image_view)
         .unwrap_or(0) as *mut AnyObject;
     if image_view.is_null() {
@@ -950,11 +1408,12 @@ fn set_hovered_app(pid: Option<i64>) {
         *hovered = pid;
     }
 
-    let front_pid = VIEW_MODEL
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|model| model.ordered_frames().last().map(|frame| frame.target.pid));
+    let front_pid = VIEW_MODEL.lock().unwrap().as_ref().and_then(|model| {
+        model
+            .ordered_frames()
+            .last()
+            .map(|frame| frame.target.app_key_pid())
+    });
     let handles = CARD_HANDLES.lock().unwrap().clone();
     for (card_pid, card_handles) in handles {
         let controls = card_handles.controls as *mut AnyObject;
@@ -1019,15 +1478,22 @@ unsafe fn hovered_pid_at_event(
 fn activate_target_window(target: ClickedTarget) {
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 
-    let (Ok(pid), Ok(window_id)) = (
-        libc::pid_t::try_from(target.pid),
-        u32::try_from(target.window_id),
+    if !pip_target_session_is_live(&target.target)
+        || !delegation_frame_proof_is_live(&target.target)
+        || !physical_target_is_live(target.target.pid, target.target.window_id)
+        || !pip_delegation_is_live(&target.target)
+    {
+        return;
+    }
+    let (Ok(app_pid), Ok(target_pid), Ok(window_id)) = (
+        libc::pid_t::try_from(target.target.app_key_pid()),
+        libc::pid_t::try_from(target.target.pid),
+        u32::try_from(target.target.window_id),
     ) else {
         return;
     };
-    let _ = crate::input::skylight::set_front_process_persistently(pid, window_id);
-    let _ = crate::input::skylight::make_exact_window_key(pid, window_id);
-    if let Some(app) = unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) }
+    if let Some(app) =
+        unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(app_pid) }
     {
         unsafe {
             app.activateWithOptions(
@@ -1035,6 +1501,26 @@ fn activate_target_window(target: ClickedTarget) {
             );
         }
     }
+    // Host activation can synchronously close or replace a modal panel. Never
+    // carry the pre-activation proof across that side effect.
+    if !physical_target_is_live(target.target.pid, target.target.window_id)
+        || !pip_delegation_is_live(&target.target)
+        || !delegation_frame_proof_is_live(&target.target)
+    {
+        return;
+    }
+    if app_pid == target_pid {
+        let _ = crate::input::skylight::set_front_process_persistently(target_pid, window_id);
+    }
+    // Keep the final proof adjacent to the exact-window activation. This also
+    // covers same-process windows that may close during app activation.
+    if !physical_target_is_live(target.target.pid, target.target.window_id)
+        || !pip_delegation_is_live(&target.target)
+        || !delegation_frame_proof_is_live(&target.target)
+    {
+        return;
+    }
+    let _ = crate::input::skylight::make_exact_window_key(target_pid, window_id);
 }
 
 fn pointer_gesture_is_click(
@@ -1056,7 +1542,7 @@ unsafe extern "C" fn promote_clicked_app_cb(ctx: *mut c_void) {
         let Some(model) = model.as_mut() else {
             return;
         };
-        model.promote_app(target.pid).then(|| {
+        model.promote_app(target.target.app_key_pid()).then(|| {
             model
                 .ordered_frames()
                 .into_iter()
@@ -1163,11 +1649,12 @@ unsafe fn refresh_cursor_at_content_point(
             .get(&(candidate as usize))
             .copied()
         {
-            let front_pid = VIEW_MODEL
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|model| model.ordered_frames().last().map(|frame| frame.target.pid));
+            let front_pid = VIEW_MODEL.lock().unwrap().as_ref().and_then(|model| {
+                model
+                    .ordered_frames()
+                    .last()
+                    .map(|frame| frame.target.app_key_pid())
+            });
             let cursor: *mut AnyObject = if Some(pid) == front_pid {
                 msg_send![objc2::class!(NSCursor), pointingHandCursor]
             } else {
@@ -1356,11 +1843,13 @@ extern "C" fn card_mouse_down(
                 (
                     pid.and_then(|pid| {
                         model.frame_for_app(pid).map(|frame| ClickedTarget {
-                            pid,
-                            window_id: frame.target.window_id,
+                            target: frame.target.clone(),
                         })
                     }),
-                    model.ordered_frames().last().map(|frame| frame.target.pid),
+                    model
+                        .ordered_frames()
+                        .last()
+                        .map(|frame| frame.target.app_key_pid()),
                 )
             })
             .unwrap_or((None, None));
@@ -1450,7 +1939,7 @@ extern "C" fn card_mouse_up(
             );
         if clicked {
             if let Some(target) = gesture.target {
-                if Some(target.pid) == gesture.front_pid {
+                if Some(target.target.app_key_pid()) == gesture.front_pid {
                     activate_target_window(target);
                 } else {
                     dispatch_to_main(target, promote_clicked_app_cb);
@@ -1495,10 +1984,10 @@ extern "C" fn workspace_did_activate(
     _notification: *mut objc2::runtime::AnyObject,
 ) {
     // App activation is the authoritative transition for application-level
-    // suppression. Refresh synchronously on AppKit's main thread so the newly
-    // frontmost app cannot remain in the PiP stack for another timer tick.
+    // suppression. Schedule immediately, but keep WindowServer/AX/signature
+    // validation off AppKit's main thread.
     LAST_FOREGROUND_CHECK_MS.store(0, Ordering::Release);
-    unsafe { refresh_foreground_visibility_if_due() };
+    schedule_foreground_visibility_refresh();
 }
 
 unsafe fn pip_delegate_instance() -> *mut objc2::runtime::AnyObject {
@@ -2034,7 +2523,7 @@ unsafe fn render_card(
     CARD_VIEW_PIDS
         .lock()
         .unwrap()
-        .insert(card as usize, frame.target.pid);
+        .insert(card as usize, frame.target.app_key_pid());
     let _: () = msg_send![card, setWantsLayer: true];
     let card_layer: *mut AnyObject = msg_send![card, layer];
     let shadow = color(0.0, 0.0, 0.0, 0.72);
@@ -2102,7 +2591,7 @@ unsafe fn render_card(
     CARD_VIEW_PIDS
         .lock()
         .unwrap()
-        .insert(drag_surface as usize, frame.target.pid);
+        .insert(drag_surface as usize, frame.target.app_key_pid());
     let _: () = msg_send![drag_surface, setAutoresizingMask: 18u64];
     let _: () = msg_send![clip, addSubview: drag_surface];
     install_tracking_area(drag_surface);
@@ -2162,13 +2651,14 @@ unsafe fn render_card(
 
 unsafe fn render_snapshot(snapshot: &[PipFrame]) {
     let enumeration = crate::windows::all_windows_including_accessory_layers_with_snapshot();
-    let visual_frontmost_pid = enumeration
+    let visual_frontmost_app_key = enumeration
         .succeeded
         .then(|| {
             i32::try_from(std::process::id())
                 .ok()
                 .and_then(|local_pid| {
-                    visually_frontmost_pid_in(
+                    visually_frontmost_app_key_in(
+                        snapshot,
                         &enumeration.windows,
                         local_pid,
                         crate::apps::is_auxiliary_application,
@@ -2176,8 +2666,11 @@ unsafe fn render_snapshot(snapshot: &[PipFrame]) {
                 })
         })
         .flatten();
-    let suppressed =
-        foreground_candidate_pids(snapshot, crate::apps::frontmost_pid(), visual_frontmost_pid);
+    let suppressed = foreground_candidate_pids(
+        snapshot,
+        crate::apps::frontmost_pid(),
+        visual_frontmost_app_key,
+    );
     update_foreground_visibility_state(
         &mut FOREGROUND_VISIBILITY_STATE.lock().unwrap(),
         suppressed.clone(),
@@ -2225,7 +2718,7 @@ unsafe fn render_snapshot_with_suppressed_windows(
         CARD_HANDLES
             .lock()
             .unwrap()
-            .insert(frame.target.pid, handles);
+            .insert(frame.target.app_key_pid(), handles);
     }
     install_resize_hit_views(canvas, bounds, &layout);
     let _: () = msg_send![window, invalidateCursorRectsForView: canvas];
@@ -2475,6 +2968,8 @@ mod tests {
     fn frame(window_id: u64, pid: i64) -> PipFrame {
         PipFrame {
             target: pip_preview::PipTarget {
+                logical_pid: None,
+                delegation: None,
                 pid,
                 window_id,
                 session_id: Some("session-a".to_owned()),
@@ -2483,6 +2978,52 @@ mod tests {
             },
             png_bytes: Vec::new(),
             timestamp_ms: 0,
+        }
+    }
+
+    fn delegated_frame(window_id: u64, host_pid: i64, helper_pid: i64) -> PipFrame {
+        let mut frame = frame(window_id, helper_pid);
+        frame.target.logical_pid = Some(host_pid);
+        frame.target.delegation = Some(pip_preview::PipDelegation {
+            kind: "trusted_macos_open_save_panel".to_owned(),
+            host_pid,
+            panel_kind: "open".to_owned(),
+            expected_bundle_id: Some("com.example.host".to_owned()),
+            expected_app_name: Some(format!("Host {host_pid}")),
+        });
+        frame
+    }
+
+    fn resolved_delegated_context(
+        host_pid: i32,
+        helper_pid: i32,
+        window_id: u32,
+        panel_kind: crate::ax::app_context::OpenSavePanelKind,
+    ) -> crate::ax::app_context::ResolvedAppContext {
+        let target = crate::ax::app_context::AppContextTarget {
+            pid: helper_pid,
+            window_id,
+        };
+        crate::ax::app_context::ResolvedAppContext {
+            identity: crate::ax::app_context::RunningAppIdentity {
+                bundle_id: Some("com.example.host".to_owned()),
+                app_name: Some(format!("Host {host_pid}")),
+            },
+            snapshot: crate::ax::app_context::AppContextSnapshot {
+                focused: crate::ax::app_context::AxWindowEvidence::Resolved(window_id),
+                main: crate::ax::app_context::AxWindowEvidence::NotQueried,
+                windows: crate::ax::app_context::AxWindowsEvidence::NotQueried,
+            },
+            selection: crate::ax::app_context::AppContextSelection {
+                window_id,
+                reason: crate::ax::app_context::AppContextSelectionReason::FocusedWindow,
+            },
+            target,
+            delegation: Some(crate::ax::app_context::AppContextDelegation {
+                host_pid,
+                target,
+                panel_kind,
+            }),
         }
     }
 
@@ -2519,8 +3060,100 @@ mod tests {
     }
 
     #[test]
+    fn screen_capture_window_requires_exact_id_and_owner() {
+        assert!(screen_capture_window_matches_target(77, Some(900), 77, 900));
+        assert!(!screen_capture_window_matches_target(
+            77,
+            Some(901),
+            77,
+            900
+        ));
+        assert!(!screen_capture_window_matches_target(
+            78,
+            Some(900),
+            77,
+            900
+        ));
+        assert!(!screen_capture_window_matches_target(77, None, 77, 900));
+    }
+
+    #[test]
+    fn ended_session_cannot_publish_or_reactivate_a_pip_target() {
+        let session_id = format!("pip-ended-session-{}", std::process::id());
+        let mut target = frame(77, 42).target;
+        target.session_id = Some(session_id.clone());
+        assert!(pip_target_session_is_live(&target));
+        cua_driver_core::session::end_session(&session_id);
+        assert!(!pip_target_session_is_live(&target));
+        assert!(!pip_delegation_is_live(&target));
+    }
+
+    #[test]
+    fn delegated_live_frame_proof_is_synchronously_revoked_on_target_rebind() {
+        let target = delegated_frame(98_771, 98_742, 98_900).target;
+        let epoch = delegation_target_epoch(&target);
+        let publication_generation = reserve_pip_publication(&target);
+        DELEGATION_PROOF_STATE.lock().unwrap().frame_proofs.insert(
+            target.app_key_pid(),
+            DelegationFrameProof {
+                target_pid: target.pid,
+                window_id: target.window_id,
+                epoch,
+                publication_generation,
+                session_id: target.session_id.clone(),
+            },
+        );
+        assert!(delegation_frame_proof_is_live(&target));
+        invalidate_app_context_target(crate::ax::app_context::AppContextTarget {
+            pid: i32::try_from(target.pid).unwrap(),
+            window_id: u32::try_from(target.window_id).unwrap(),
+        });
+        assert!(!delegation_frame_proof_is_live(&target));
+        remove_delegation_frame_proof(target.app_key_pid());
+    }
+
+    #[test]
+    fn invalidation_after_reservation_prevents_stale_proof_registration() {
+        let target = delegated_frame(98_773, 98_744, 98_901).target;
+        let publication_generation = reserve_pip_publication(&target);
+        assert!(pip_publication_is_current(&target, publication_generation));
+
+        invalidate_app_context_target(crate::ax::app_context::AppContextTarget {
+            pid: i32::try_from(target.pid).unwrap(),
+            window_id: u32::try_from(target.window_id).unwrap(),
+        });
+
+        assert!(!pip_publication_is_current(&target, publication_generation));
+        assert!(!commit_delegation_frame_proof(
+            &target,
+            publication_generation
+        ));
+        assert!(!delegation_frame_proof_is_live(&target));
+        cancel_pip_publication(&target, publication_generation);
+    }
+
+    #[test]
+    fn old_publication_cannot_reappear_after_session_id_reuse() {
+        let session_id = format!("pip-reused-session-{}", std::process::id());
+        let mut target = frame(98_772, 98_743).target;
+        target.session_id = Some(session_id.clone());
+        let old_generation = reserve_pip_publication(&target);
+        assert!(pip_publication_is_current(&target, old_generation));
+        remove_session_delegation_frame_proofs(&session_id);
+        assert!(!pip_publication_is_current(&target, old_generation));
+
+        let new_generation = reserve_pip_publication(&target);
+        assert_ne!(old_generation, new_generation);
+        assert!(!pip_publication_is_current(&target, old_generation));
+        assert!(pip_publication_is_current(&target, new_generation));
+        remove_session_delegation_frame_proofs(&session_id);
+    }
+
+    #[test]
     fn missing_or_changed_target_waits_for_an_observation_seed() {
         let target = pip_preview::PipTarget {
+            logical_pid: None,
+            delegation: None,
             pid: 100,
             window_id: 10,
             session_id: None,
@@ -2548,6 +3181,8 @@ mod tests {
         assert!(!exact_target_matches(
             &frame,
             &pip_preview::PipTarget {
+                logical_pid: None,
+                delegation: None,
                 pid: 100,
                 window_id: 11,
                 session_id: None,
@@ -2558,12 +3193,55 @@ mod tests {
         assert!(!exact_target_matches(
             &frame,
             &pip_preview::PipTarget {
+                logical_pid: None,
+                delegation: None,
                 pid: 101,
                 window_id: 10,
                 session_id: None,
                 app_name: String::new(),
                 window_title: None,
             }
+        ));
+    }
+
+    #[test]
+    fn delegated_pip_proof_is_bound_to_host_target_and_panel_kind() {
+        let frame = delegated_frame(77, 42, 900);
+        let open = resolved_delegated_context(
+            42,
+            900,
+            77,
+            crate::ax::app_context::OpenSavePanelKind::Open,
+        );
+        assert!(pip_delegation_matches_resolved(
+            &frame.target,
+            42,
+            900,
+            77,
+            crate::ax::app_context::OpenSavePanelKind::Open,
+            &open,
+        ));
+        let rebound = resolved_delegated_context(
+            43,
+            900,
+            77,
+            crate::ax::app_context::OpenSavePanelKind::Open,
+        );
+        assert!(!pip_delegation_matches_resolved(
+            &frame.target,
+            42,
+            900,
+            77,
+            crate::ax::app_context::OpenSavePanelKind::Open,
+            &rebound,
+        ));
+        assert!(!pip_delegation_matches_resolved(
+            &frame.target,
+            42,
+            900,
+            77,
+            crate::ax::app_context::OpenSavePanelKind::Save,
+            &open,
         ));
     }
 
@@ -2592,6 +3270,15 @@ mod tests {
     }
 
     #[test]
+    fn delegated_panel_is_suppressed_by_its_logical_host_not_shared_helper() {
+        let snapshot = vec![delegated_frame(77, 42, 900)];
+        let suppressed = foreground_candidate_pids(&snapshot, Some(42), None);
+        assert_eq!(suppressed, HashSet::from([42]));
+        assert!(frame_is_suppressed(&snapshot[0], &suppressed));
+        assert!(!frame_is_suppressed(&snapshot[0], &HashSet::from([900])));
+    }
+
+    #[test]
     fn visual_frontmost_selection_skips_the_pip_process_and_auxiliary_overlays() {
         let windows = vec![
             visible_window(1, 999, "Cua Driver Local", 100),
@@ -2600,7 +3287,7 @@ mod tests {
             visible_window(4, 200, "Terminal", 70),
         ];
         assert_eq!(
-            visually_frontmost_pid_in(&windows, 999, |pid| pid == 300),
+            visually_frontmost_app_key_in(&[frame(3, 100)], &windows, 999, |pid| pid == 300),
             Some(100)
         );
     }
@@ -2613,9 +3300,37 @@ mod tests {
         empty.bounds.width = 0.0;
         let usable = visible_window(3, 300, "Usable", 80);
         assert_eq!(
-            visually_frontmost_pid_in(&[off_space, empty, usable], 999, |_| false),
+            visually_frontmost_app_key_in(
+                &[frame(3, 300)],
+                &[off_space, empty, usable],
+                999,
+                |_| false
+            ),
             Some(300)
         );
+    }
+
+    #[test]
+    fn exact_frontmost_delegated_panel_suppresses_its_logical_host_card() {
+        let snapshot = vec![delegated_frame(77, 42, 900)];
+        let windows = vec![
+            visible_window(77, 900, "Open and Save Panel Service", 100),
+            visible_window(2, 500, "Terminal", 90),
+        ];
+        let visual = visually_frontmost_app_key_in(&snapshot, &windows, 999, |pid| pid == 900);
+        assert_eq!(visual, Some(42));
+        assert_eq!(
+            foreground_candidate_pids(&snapshot, Some(500), visual),
+            HashSet::from([42])
+        );
+    }
+
+    #[test]
+    fn sibling_panel_from_shared_helper_does_not_suppress_the_wrong_host() {
+        let snapshot = vec![delegated_frame(77, 42, 900), delegated_frame(78, 43, 900)];
+        let windows = vec![visible_window(78, 900, "Open and Save Panel Service", 100)];
+        let visual = visually_frontmost_app_key_in(&snapshot, &windows, 999, |pid| pid == 900);
+        assert_eq!(visual, Some(43));
     }
 
     #[test]

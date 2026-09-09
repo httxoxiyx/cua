@@ -44,7 +44,12 @@ use std::sync::Mutex;
 /// stack and pass `&K` in for lookups without forcing callers to
 /// hand out owned keys on every read.
 pub struct ElementCacheCore<K: Eq + Hash, S> {
-    inner: Mutex<HashMap<K, S>>,
+    inner: Mutex<HashMap<K, VersionedSnapshot<S>>>,
+}
+
+struct VersionedSnapshot<S> {
+    snapshot_id: Option<u32>,
+    value: S,
 }
 
 impl<K: Eq + Hash, S> ElementCacheCore<K, S> {
@@ -59,15 +64,42 @@ impl<K: Eq + Hash, S> ElementCacheCore<K, S> {
     /// on every retained AXUIElementRef, for Windows it fires COM
     /// `Release`, for Linux it's a no-op (just frees the `Vec<u64>`).
     pub fn insert(&self, key: K, snapshot: S) {
+        self.insert_for_snapshot(key, None, snapshot);
+    }
+
+    /// Replace the cached value and bind it to the observation snapshot that
+    /// produced it. Element actions must use [`Self::with_snapshot_id`] so an
+    /// already-resolved token cannot silently read a newer same-window cache.
+    pub fn insert_for_snapshot(&self, key: K, snapshot_id: Option<u32>, snapshot: S) {
         let mut inner = self.inner.lock().unwrap();
-        inner.insert(key, snapshot);
+        inner.insert(
+            key,
+            VersionedSnapshot {
+                snapshot_id,
+                value: snapshot,
+            },
+        );
     }
 
     /// Run `f` against the snapshot for `key` while the lock is
     /// held. Returns `None` if there is no entry.
     pub fn with_snapshot<R>(&self, key: &K, f: impl FnOnce(&S) -> R) -> Option<R> {
         let inner = self.inner.lock().unwrap();
-        inner.get(key).map(f)
+        inner.get(key).map(|snapshot| f(&snapshot.value))
+    }
+
+    /// Run `f` only when the current cache entry was produced by exactly
+    /// `snapshot_id`. The generation comparison and projection happen under
+    /// the same lock as replacement, closing the resolve-then-replace race.
+    pub fn with_snapshot_id<R>(
+        &self,
+        key: &K,
+        snapshot_id: u32,
+        f: impl FnOnce(&S) -> R,
+    ) -> Option<R> {
+        let inner = self.inner.lock().unwrap();
+        let snapshot = inner.get(key)?;
+        (snapshot.snapshot_id == Some(snapshot_id)).then(|| f(&snapshot.value))
     }
 
     /// Drop the snapshot for `key` if present.
@@ -199,5 +231,55 @@ mod tests {
     #[test]
     fn default_impl_matches_new() {
         let _cache: ElementCacheCore<TestKey, TestSnapshot> = ElementCacheCore::default();
+    }
+
+    #[test]
+    fn stale_snapshot_generation_cannot_read_replacement_at_same_index() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let cache = Arc::new(ElementCacheCore::<TestKey, TestSnapshot>::new());
+        let key = TestKey {
+            pid: 42,
+            window_id: 7,
+        };
+        cache.insert_for_snapshot(key, Some(100), TestSnapshot { elements: vec![10] });
+
+        // Model the real click path: token resolution has completed, then the
+        // action pauses for async routing/modal checks while another state
+        // observation replaces the same (pid, window) cache.
+        let resolved = Arc::new(Barrier::new(2));
+        let replaced = Arc::new(Barrier::new(2));
+        let action_cache = Arc::clone(&cache);
+        let action_resolved = Arc::clone(&resolved);
+        let action_replaced = Arc::clone(&replaced);
+        let action = thread::spawn(move || {
+            let resolved_snapshot_id = 100;
+            action_resolved.wait();
+            action_replaced.wait();
+            action_cache
+                .with_snapshot_id(&key, resolved_snapshot_id, |snapshot| snapshot.elements[0])
+        });
+
+        resolved.wait();
+        cache.insert_for_snapshot(key, Some(101), TestSnapshot { elements: vec![99] });
+        replaced.wait();
+
+        assert_eq!(
+            cache.with_snapshot(&key, |snapshot| snapshot.elements[0]),
+            Some(99),
+            "the legacy generation-unbound lookup reproduces the old same-index alias"
+        );
+
+        assert_eq!(
+            action.join().unwrap(),
+            None,
+            "an old resolved token must not alias index 0 in the replacement snapshot"
+        );
+        assert_eq!(
+            cache.with_snapshot_id(&key, 101, |snapshot| snapshot.elements[0]),
+            Some(99),
+            "the replacement remains available to its own generation"
+        );
     }
 }

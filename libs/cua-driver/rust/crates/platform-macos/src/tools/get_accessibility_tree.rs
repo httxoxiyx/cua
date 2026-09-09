@@ -33,7 +33,9 @@ fn def() -> &'static ToolDef {
              on-screen visible windows with their bounds, z-order, and owner pid.\n\n\
              For the full AX subtree of a single window (with interactive element indices \
              you can click by), use `get_window_state` instead — that's the heavy per-window \
-             tool. This one is a fast discovery read that needs no TCC grants."
+             tool. Private trusted system helpers such as the AppKit Open/Save panel service \
+             are omitted and must be observed through their original host app. This one is a \
+             fast discovery read that needs no TCC grants."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -56,8 +58,24 @@ impl Tool for GetAccessibilityTreeTool {
     async fn invoke(&self, _args: Value) -> ToolResult {
         let _ = &self.state; // state not needed for this tool
 
-        let apps = crate::apps::list_running_apps();
-        let windows = crate::windows::visible_automation_windows();
+        let apps = crate::apps::list_running_apps()
+            .into_iter()
+            .filter(|app| {
+                !crate::ax::app_context::hide_open_save_panel_from_inventory(app.pid, &app.name)
+            })
+            .collect::<Vec<_>>();
+        let mut helper_pids = std::collections::HashMap::new();
+        let windows = super::list_windows::filter_private_helper_windows(
+            crate::windows::visible_automation_windows(),
+            |window| {
+                *helper_pids.entry(window.pid).or_insert_with(|| {
+                    crate::ax::app_context::hide_open_save_panel_from_inventory(
+                        window.pid,
+                        &window.app_name,
+                    )
+                })
+            },
+        );
 
         let mut lines = vec![format!(
             "{} running app(s), {} visible window(s)",

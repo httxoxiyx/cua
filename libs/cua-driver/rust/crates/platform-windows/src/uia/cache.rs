@@ -150,18 +150,25 @@ impl ElementCache {
 
     /// Update the snapshot for (pid, hwnd) with the actionable elements
     /// from a UIA walk. Mirrors `update_msaa` for the MSAA path.
-    pub fn update(&self, pid: u32, hwnd: u64, nodes: &[UiaNode]) {
-        self.update_with_kind(pid, hwnd, nodes, SnapshotKind::Uia);
+    pub fn update(&self, pid: u32, hwnd: u64, snapshot_id: Option<u32>, nodes: &[UiaNode]) {
+        self.update_with_kind(pid, hwnd, snapshot_id, nodes, SnapshotKind::Uia);
     }
 
     /// Same as `update` but tags the snapshot as MSAA so Drop releases the
     /// pointers as `IAccessible` and the click tool routes through the
     /// MSAA dispatch path.
-    pub fn update_msaa(&self, pid: u32, hwnd: u64, nodes: &[UiaNode]) {
-        self.update_with_kind(pid, hwnd, nodes, SnapshotKind::Msaa);
+    pub fn update_msaa(&self, pid: u32, hwnd: u64, snapshot_id: Option<u32>, nodes: &[UiaNode]) {
+        self.update_with_kind(pid, hwnd, snapshot_id, nodes, SnapshotKind::Msaa);
     }
 
-    fn update_with_kind(&self, pid: u32, hwnd: u64, nodes: &[UiaNode], kind: SnapshotKind) {
+    fn update_with_kind(
+        &self,
+        pid: u32,
+        hwnd: u64,
+        snapshot_id: Option<u32>,
+        nodes: &[UiaNode],
+        kind: SnapshotKind,
+    ) {
         let actionable: Vec<&UiaNode> =
             nodes.iter().filter(|n| n.element_index.is_some()).collect();
         let elements: Vec<usize> = actionable.iter().map(|n| n.element_ptr).collect();
@@ -171,8 +178,9 @@ impl ElementCache {
             .collect();
         let rects: Vec<Option<(i32, i32, i32, i32)>> = actionable.iter().map(|n| n.rect).collect();
         let msaa_roles: Vec<Option<i32>> = actionable.iter().map(|n| n.msaa_role).collect();
-        self.core.insert(
+        self.core.insert_for_snapshot(
             CacheKey { pid, hwnd },
+            snapshot_id,
             CachedSnapshot {
                 kind,
                 elements,
@@ -231,6 +239,41 @@ impl ElementCache {
             .flatten()
     }
 
+    /// Snapshot-bound variant used by model-visible element actions.
+    pub fn get_element_retained_for_snapshot(
+        &self,
+        pid: u32,
+        hwnd: u64,
+        snapshot_id: u32,
+        element_index: usize,
+    ) -> Option<RetainedElement> {
+        self.core
+            .with_snapshot_id(&CacheKey { pid, hwnd }, snapshot_id, |s| {
+                let ptr = s.elements.get(element_index).copied()?;
+                if ptr != 0 {
+                    unsafe {
+                        match s.kind {
+                            SnapshotKind::Uia => {
+                                let iface: IUIAutomationElement =
+                                    IUIAutomationElement::from_raw(ptr as *mut _);
+                                let dup = iface.clone();
+                                std::mem::forget(iface);
+                                std::mem::forget(dup);
+                            }
+                            SnapshotKind::Msaa => {
+                                let iface: IAccessible = IAccessible::from_raw(ptr as *mut _);
+                                let dup = iface.clone();
+                                std::mem::forget(iface);
+                                std::mem::forget(dup);
+                            }
+                        }
+                    }
+                }
+                Some(RetainedElement { ptr, kind: s.kind })
+            })
+            .flatten()
+    }
+
     pub fn get_element_center(
         &self,
         pid: u32,
@@ -239,6 +282,20 @@ impl ElementCache {
     ) -> Option<(i32, i32)> {
         self.core
             .with_snapshot(&CacheKey { pid, hwnd }, |s| {
+                s.centers.get(element_index).copied()
+            })
+            .flatten()
+    }
+
+    pub fn get_element_center_for_snapshot(
+        &self,
+        pid: u32,
+        hwnd: u64,
+        snapshot_id: u32,
+        element_index: usize,
+    ) -> Option<(i32, i32)> {
+        self.core
+            .with_snapshot_id(&CacheKey { pid, hwnd }, snapshot_id, |s| {
                 s.centers.get(element_index).copied()
             })
             .flatten()
@@ -262,6 +319,29 @@ impl ElementCache {
         result.map_err(|e| anyhow::anyhow!("UIA SetFocus failed: {e}"))
     }
 
+    pub fn focus_element_for_snapshot(
+        &self,
+        pid: u32,
+        hwnd: u64,
+        snapshot_id: u32,
+        element_index: usize,
+    ) -> anyhow::Result<()> {
+        let retained = self
+            .get_element_retained_for_snapshot(pid, hwnd, snapshot_id, element_index)
+            .ok_or_else(|| {
+                anyhow::anyhow!("element [{element_index}] is not in this UIA snapshot")
+            })?;
+        if !retained.is_uia() {
+            anyhow::bail!("element [{element_index}] is an MSAA element, not a UIA element");
+        }
+        let ptr = retained.as_ptr();
+        let element: IUIAutomationElement =
+            unsafe { IUIAutomationElement::from_raw(ptr as *mut _) };
+        let result = unsafe { element.SetFocus() };
+        std::mem::forget(element);
+        result.map_err(|e| anyhow::anyhow!("UIA SetFocus failed: {e}"))
+    }
+
     pub fn element_has_keyboard_focus(
         &self,
         pid: u32,
@@ -269,6 +349,27 @@ impl ElementCache {
         element_index: usize,
     ) -> Option<bool> {
         let retained = self.get_element_retained(pid, hwnd, element_index)?;
+        if !retained.is_uia() {
+            return None;
+        }
+        let element: IUIAutomationElement =
+            unsafe { IUIAutomationElement::from_raw(retained.as_ptr() as *mut _) };
+        let focused = unsafe { element.CurrentHasKeyboardFocus() }
+            .ok()
+            .map(|value| value.as_bool());
+        std::mem::forget(element);
+        focused
+    }
+
+    pub fn element_has_keyboard_focus_for_snapshot(
+        &self,
+        pid: u32,
+        hwnd: u64,
+        snapshot_id: u32,
+        element_index: usize,
+    ) -> Option<bool> {
+        let retained =
+            self.get_element_retained_for_snapshot(pid, hwnd, snapshot_id, element_index)?;
         if !retained.is_uia() {
             return None;
         }
@@ -297,6 +398,20 @@ impl ElementCache {
             .flatten()
     }
 
+    pub fn get_element_rect_for_snapshot(
+        &self,
+        pid: u32,
+        hwnd: u64,
+        snapshot_id: u32,
+        element_index: usize,
+    ) -> Option<(i32, i32, i32, i32)> {
+        self.core
+            .with_snapshot_id(&CacheKey { pid, hwnd }, snapshot_id, |s| {
+                s.rects.get(element_index).copied().flatten()
+            })
+            .flatten()
+    }
+
     /// Kind + MSAA role for the element. `(Msaa, Some(0x38))` identifies a
     /// MSAA BUTTONDROPDOWN; click tool routes `action:"expand"` to
     /// right-edge SendInput for these.
@@ -308,6 +423,21 @@ impl ElementCache {
     ) -> Option<(SnapshotKind, Option<i32>)> {
         self.core
             .with_snapshot(&CacheKey { pid, hwnd }, |s| {
+                let role = s.msaa_roles.get(element_index).copied().flatten();
+                Some((s.kind, role))
+            })
+            .flatten()
+    }
+
+    pub fn get_element_kind_and_role_for_snapshot(
+        &self,
+        pid: u32,
+        hwnd: u64,
+        snapshot_id: u32,
+        element_index: usize,
+    ) -> Option<(SnapshotKind, Option<i32>)> {
+        self.core
+            .with_snapshot_id(&CacheKey { pid, hwnd }, snapshot_id, |s| {
                 let role = s.msaa_roles.get(element_index).copied().flatten();
                 Some((s.kind, role))
             })

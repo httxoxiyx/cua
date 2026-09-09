@@ -862,6 +862,118 @@ pub fn with_foreground_assist(
     Ok(true)
 }
 
+/// Foreground an app-owned native Open/Save panel whose WindowServer surface
+/// lives in Apple's background-only panel service. The helper itself is not an
+/// activatable public application: activate the logical host, then require both
+/// the host AX proxy and helper AX application to identify the exact delegated
+/// panel before any global HID action runs.
+pub(crate) fn with_foreground_app_context_panel_activation(
+    route: crate::ax::app_context::AppContextDelegationRoute,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let set_front = set_front_process_fn()
+        .ok_or_else(|| anyhow::anyhow!("foreground app-context delivery is unavailable"))?;
+    let get_pid_psn = get_process_for_pid_fn()
+        .ok_or_else(|| anyhow::anyhow!("host process identity is unavailable"))?;
+
+    let mut previous_psn = [0u8; 8];
+    let previous_known = get_front_process_fn()
+        .map(|get_front| unsafe { get_front(previous_psn.as_mut_ptr() as *mut c_void) } == 0)
+        .unwrap_or(false);
+    let mut host_psn = [0u8; 8];
+    if unsafe {
+        get_pid_psn(
+            route.delegation.host_pid,
+            host_psn.as_mut_ptr() as *mut c_void,
+        )
+    } != 0
+    {
+        anyhow::bail!("could not resolve the Open/Save panel host process");
+    }
+    let mut helper_psn = [0u8; 8];
+    let helper_psn_known = unsafe {
+        get_pid_psn(
+            route.delegation.target.pid,
+            helper_psn.as_mut_ptr() as *mut c_void,
+        )
+    } == 0;
+
+    if unsafe { set_front(host_psn.as_ptr() as *const c_void, 0, 0x400) } != 0 {
+        anyhow::bail!("WindowServer rejected Open/Save panel host activation");
+    }
+
+    let deadline = std::time::Instant::now() + ACTIVATION_WAIT_TIMEOUT;
+    let ready = loop {
+        let exact_owner = matches!(
+            crate::windows::resolve_window_owner(
+                route.delegation.target.pid,
+                route.delegation.target.window_id,
+            ),
+            crate::windows::WindowOwner::SamePid
+        );
+        let host_points_to_panel =
+            crate::ax::bindings::focused_window_id_of_pid(route.delegation.host_pid)
+                == Some(route.delegation.target.window_id);
+        let helper_points_to_panel =
+            crate::ax::bindings::focused_window_id_of_pid(route.delegation.target.pid)
+                == Some(route.delegation.target.window_id);
+        if exact_owner
+            && host_points_to_panel
+            && helper_points_to_panel
+            && crate::ax::app_context::delegation_route_is_live(&route)
+        {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(ACTIVATION_POLL_INTERVAL);
+    };
+    if !ready {
+        if previous_known
+            && current_front_process_psn().is_some_and(|current| {
+                current == host_psn || (helper_psn_known && current == helper_psn)
+            })
+        {
+            unsafe { set_front(previous_psn.as_ptr() as *const c_void, 0, 0x400) };
+        }
+        anyhow::bail!("the exact Open/Save panel did not become focused after host activation");
+    }
+
+    let result = action();
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    if previous_known
+        && current_front_process_psn().is_some_and(|current| {
+            current == host_psn || (helper_psn_known && current == helper_psn)
+        })
+    {
+        unsafe { set_front(previous_psn.as_ptr() as *const c_void, 0, 0x400) };
+    }
+    result
+}
+
+pub(crate) fn with_foreground_assist_delegated(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
+    body: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    if let Some(route) = delegation {
+        if route.delegation.target
+            != (crate::ax::app_context::AppContextTarget {
+                pid: target_pid,
+                window_id: target_wid,
+            })
+        {
+            anyhow::bail!("delegated Open/Save panel target changed before activation");
+        }
+        with_foreground_app_context_panel_activation(route, body)?;
+        Ok(true)
+    } else {
+        with_foreground_assist(target_pid, target_wid, body)
+    }
+}
+
 /// Upper bound on how long [`with_foreground_assist`] waits for a requested
 /// activation to become observable. Chosen to cover a Catalyst app's activation
 /// plus key-window install; past this the caller proceeds anyway so a stubborn
@@ -913,15 +1025,36 @@ pub fn with_foreground_hid_activation(
     target_wid: u32,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    with_foreground_hid_activation_inner(target_pid, target_wid, None, action)
+    with_foreground_hid_activation_inner(target_pid, target_wid, None, None, action)
+}
+
+pub(crate) fn with_foreground_hid_activation_delegated(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_foreground_hid_activation_inner(target_pid, target_wid, None, delegation, action)
 }
 
 fn with_foreground_hid_activation_inner(
     target_pid: libc::pid_t,
     target_wid: u32,
     transient_route: Option<crate::transient_ui::TransientRoute>,
+    app_context_delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    if let Some(route) = app_context_delegation {
+        if route.delegation.target
+            != (crate::ax::app_context::AppContextTarget {
+                pid: target_pid,
+                window_id: target_wid,
+            })
+        {
+            anyhow::bail!("delegated Open/Save panel target changed before HID delivery");
+        }
+        return with_foreground_app_context_panel_activation(route, action);
+    }
     let transient_target = crate::transient_ui::WindowTarget {
         pid: target_pid,
         window_id: target_wid,
@@ -1046,6 +1179,7 @@ pub fn with_foreground_keyboard_target_activation(
         remembered_cursor,
         foreground_keyboard_focus_click_for_pid(target_pid, explicit_focus_already_established),
         None,
+        None,
         action,
     )
 }
@@ -1056,6 +1190,7 @@ pub(crate) fn with_foreground_keyboard_target_activation_routed(
     remembered_cursor: Option<(f64, f64)>,
     explicit_focus_already_established: bool,
     transient_route: Option<crate::transient_ui::TransientRoute>,
+    app_context_delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     with_foreground_keyboard_context_activation_inner(
@@ -1064,6 +1199,7 @@ pub(crate) fn with_foreground_keyboard_target_activation_routed(
         remembered_cursor,
         foreground_keyboard_focus_click_for_pid(target_pid, explicit_focus_already_established),
         transient_route,
+        app_context_delegation,
         action,
     )
 }
@@ -1089,6 +1225,7 @@ pub fn with_foreground_keyboard_context_activation(
         remembered_cursor,
         false,
         None,
+        None,
         action,
     )
 }
@@ -1098,6 +1235,7 @@ pub(crate) fn with_foreground_keyboard_context_activation_routed(
     target_wid: u32,
     remembered_cursor: Option<(f64, f64)>,
     transient_route: Option<crate::transient_ui::TransientRoute>,
+    app_context_delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     with_foreground_keyboard_context_activation_inner(
@@ -1106,6 +1244,7 @@ pub(crate) fn with_foreground_keyboard_context_activation_routed(
         remembered_cursor,
         false,
         transient_route,
+        app_context_delegation,
         action,
     )
 }
@@ -1125,6 +1264,7 @@ pub fn with_foreground_keyboard_focus_activation(
         remembered_cursor,
         true,
         None,
+        None,
         action,
     )
 }
@@ -1134,6 +1274,7 @@ pub(crate) fn with_foreground_keyboard_focus_activation_routed(
     target_wid: u32,
     remembered_cursor: Option<(f64, f64)>,
     transient_route: Option<crate::transient_ui::TransientRoute>,
+    app_context_delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     with_foreground_keyboard_context_activation_inner(
@@ -1142,6 +1283,7 @@ pub(crate) fn with_foreground_keyboard_focus_activation_routed(
         remembered_cursor,
         true,
         transient_route,
+        app_context_delegation,
         action,
     )
 }
@@ -1152,26 +1294,36 @@ fn with_foreground_keyboard_context_activation_inner(
     remembered_cursor: Option<(f64, f64)>,
     focus_click: bool,
     transient_route: Option<crate::transient_ui::TransientRoute>,
+    app_context_delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    with_foreground_hid_activation_inner(target_pid, target_wid, transient_route, || {
-        let bounds = crate::windows::window_bounds_by_id(target_wid).ok_or_else(|| {
-            anyhow::anyhow!("target window {target_wid} closed before foreground keyboard delivery")
-        })?;
-        let anchor = crate::input::mouse::foreground_keyboard_anchor(&bounds, remembered_cursor)
-            .ok_or_else(|| {
+    with_foreground_hid_activation_inner(
+        target_pid,
+        target_wid,
+        transient_route,
+        app_context_delegation,
+        || {
+            let bounds = crate::windows::window_bounds_by_id(target_wid).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "target window {target_wid} has no valid frame for foreground keyboard delivery"
+                    "target window {target_wid} closed before foreground keyboard delivery"
                 )
             })?;
-        if focus_click {
-            crate::input::mouse::with_foreground_keyboard_pointer_context_and_focus_click(
-                anchor, action,
-            )
-        } else {
-            crate::input::mouse::with_foreground_keyboard_pointer_context(anchor, action)
-        }
-    })
+            let anchor =
+                crate::input::mouse::foreground_keyboard_anchor(&bounds, remembered_cursor)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "target window {target_wid} has no valid frame for foreground keyboard delivery"
+                        )
+                    })?;
+            if focus_click {
+                crate::input::mouse::with_foreground_keyboard_pointer_context_and_focus_click(
+                    anchor, action,
+                )
+            } else {
+                crate::input::mouse::with_foreground_keyboard_pointer_context(anchor, action)
+            }
+        },
+    )
 }
 
 fn preserves_exact_existing_focus(

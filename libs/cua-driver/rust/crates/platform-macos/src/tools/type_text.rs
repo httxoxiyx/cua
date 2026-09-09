@@ -198,6 +198,7 @@ impl Tool for TypeTextTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let app_context_route = crate::ax::app_context::delegation_route_from_args(&args);
         let text_raw = match args.require_str("text") {
             Ok(v) => v,
             Err(e) => return e,
@@ -208,26 +209,31 @@ impl Tool for TypeTextTool {
             .into_owned();
         // Surface 6: element_token / element_index precedence resolution.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg_u64 = args.opt_u64("window_id");
+        let window_id_arg = match args.opt_u32("window_id") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             requested_pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
+            window_id_arg_u64,
             "type_text",
         ) {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg),
+        let (element_index, window_id, snapshot_id) = match resolved {
+            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg, None),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: wid,
                 element_index: idx,
+                snapshot_id,
                 via_token: _,
-            } => (Some(idx), wid),
+            } => (Some(idx), wid, Some(snapshot_id)),
         };
         let delay_ms = args.u64_or("delay_ms", 30);
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
@@ -259,6 +265,7 @@ impl Tool for TypeTextTool {
                 requested_pid,
                 window_id,
                 element_index.is_some() || px.is_some() || py.is_some(),
+                app_context_route.clone(),
             )
             .await
             {
@@ -270,11 +277,13 @@ impl Tool for TypeTextTool {
                 pid: requested_pid,
                 window_id,
                 transient_route: None,
+                app_context_route: app_context_route.clone(),
             }
         };
         let pid = foreground_target.pid;
         let window_id = foreground_target.window_id;
         let transient_route = foreground_target.transient_route;
+        let app_context_route = foreground_target.app_context_route;
         let remembered_cursor = if delivery_mode.is_foreground() {
             super::remembered_agent_cursor_position(&self.state, &args)
         } else {
@@ -298,18 +307,40 @@ impl Tool for TypeTextTool {
         // of the cache so a concurrent get_window_state can't free it before
         // the blocking type below dereferences it (use-after-free → daemon
         // crash). The guard lives to method end, past type_text_blocking.
-        let element_guard = if let (Some(idx), Some(wid)) = (element_index, window_id) {
-            match self.state.element_cache.get_element_retained(pid, wid, idx) {
+        let element_guard = if let (Some(idx), Some(wid), Some(snapshot_id)) =
+            (element_index, window_id, snapshot_id)
+        {
+            match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                wid,
+                snapshot_id,
+                idx,
+            ) {
                 Some(e) => Some((e, idx)),
                 None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found. Call get_window_state first."
-                    ))
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "type_text",
+                        pid,
+                        wid,
+                        snapshot_id,
+                    )
                 }
             }
         } else {
             None
         };
+        if let Some((element, _)) = element_guard.as_ref() {
+            if unsafe {
+                super::ensure_app_context_element_window(
+                    app_context_route.as_ref(),
+                    element.as_ptr() as AXUIElementRef,
+                )
+            }
+            .is_err()
+            {
+                return super::app_context_delegation_stale_refusal();
+            }
+        }
 
         // ── Exact-target background gate (macOS background input v1) ──
         // A window-addressed background insert must prove exact delivery
@@ -360,6 +391,7 @@ impl Tool for TypeTextTool {
                 args.opt_str("_session_id"),
                 from_zoom,
                 _mutation_lease.as_ref(),
+                app_context_route.as_ref(),
             )
             .await
             {
@@ -434,6 +466,7 @@ impl Tool for TypeTextTool {
                         blocking_policy,
                         remembered_cursor,
                         transient_route,
+                        app_context_route,
                     )
                 })
                 .await
@@ -1252,7 +1285,17 @@ fn type_text_blocking(
     keyboard_policy: BackgroundKeyboardPolicy,
     remembered_cursor: Option<(f64, f64)>,
     transient_route: Option<crate::transient_ui::TransientRoute>,
+    app_context_route: Option<crate::ax::app_context::AppContextDelegationRoute>,
 ) -> anyhow::Result<TypeTextDelivery> {
+    super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
+    if let Some((element_ptr, _)) = element_ptr_and_idx {
+        unsafe {
+            super::ensure_app_context_element_window(
+                app_context_route.as_ref(),
+                element_ptr as AXUIElementRef,
+            )?;
+        }
+    }
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
     // window-addressed request it must come from the exact target window,
@@ -1325,6 +1368,7 @@ fn type_text_blocking(
                     wid,
                     remembered_cursor,
                     transient_route,
+                    app_context_route,
                     || {
                         if foreground_settle_ms > 0 {
                             std::thread::sleep(std::time::Duration::from_millis(
@@ -1352,6 +1396,7 @@ fn type_text_blocking(
                         wid,
                         remembered_cursor,
                         transient_route,
+                        app_context_route.clone(),
                         type_action,
                     )?;
                 } else {
@@ -1360,6 +1405,7 @@ fn type_text_blocking(
                         wid,
                         remembered_cursor,
                         transient_route,
+                        app_context_route,
                         type_action,
                     )?;
                 }
@@ -1734,6 +1780,7 @@ mod tests {
             BackgroundKeyboardPolicy::Allowed,
             None,
             None,
+            None,
         );
         // We don't care whether r is Ok or Err — what matters is that
         // calling it with is_terminal_target=true is safe and never
@@ -1762,6 +1809,7 @@ mod tests {
             BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
             None,
             None,
+            None,
         );
         match r {
             Ok(TypeTextDelivery::Refused(returned)) => assert_eq!(returned, refusal),
@@ -1781,6 +1829,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
+            None,
             None,
             None,
         )

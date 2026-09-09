@@ -527,21 +527,47 @@ pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
 /// # Safety
 ///
 /// `element` must be valid, and the caller must release any returned element.
+pub(crate) unsafe fn try_copy_element_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<Option<AXUIElementRef>, AXError> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err == kAXErrorNoValue {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return Ok(None);
+    }
+    if err != kAXErrorSuccess {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return Err(err);
+    }
+    if value.is_null() {
+        return Ok(None);
+    }
+    if core_foundation::base::CFGetTypeID(value) != AXUIElementGetTypeID() {
+        CFRelease(value);
+        return Err(kAXErrorFailure);
+    }
+    Ok(Some(value as AXUIElementRef))
+}
+
+/// Copy an AX element-valued attribute, collapsing every unavailable/error
+/// state to `None` for existing callers that do not need diagnostic evidence.
+/// The returned element is retained and must be released by the caller.
+///
+/// # Safety
+///
+/// `element` must be valid, and the caller must release any returned element.
 pub unsafe fn copy_element_attr(
     element: AXUIElementRef,
     attr_name: &str,
 ) -> Option<AXUIElementRef> {
-    let attr = CFStr::new(attr_name);
-    let mut value: CFTypeRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if err != kAXErrorSuccess || value.is_null() {
-        return None;
-    }
-    if core_foundation::base::CFGetTypeID(value) != AXUIElementGetTypeID() {
-        CFRelease(value);
-        return None;
-    }
-    Some(value as AXUIElementRef)
+    try_copy_element_attr(element, attr_name).ok().flatten()
 }
 
 /// Perform an AX action using a string attribute name.

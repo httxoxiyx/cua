@@ -1,6 +1,30 @@
 //! Application-state snapshots used by trajectory recording on Linux.
 
 #[cfg(target_os = "linux")]
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
+
+#[cfg(target_os = "linux")]
+use crate::atspi::ElementCache;
+
+#[cfg(target_os = "linux")]
+static ELEMENT_CACHES: OnceLock<Mutex<HashMap<String, Weak<ElementCache>>>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+pub fn set_element_cache(cache: Arc<ElementCache>) {
+    let runtime_scope =
+        cua_driver_core::tool::current_dispatch_runtime_scope().unwrap_or_else(|| "legacy".into());
+    let mut caches = ELEMENT_CACHES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    caches.retain(|_, cache| cache.strong_count() > 0);
+    caches.insert(runtime_scope, Arc::downgrade(&cache));
+}
+
+#[cfg(target_os = "linux")]
 pub fn app_state_json_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return std::thread::spawn(move || app_state_json_for_blocking(window_id, pid))
@@ -71,27 +95,49 @@ pub fn screenshot_for_recording(window_id: Option<u64>, pid: Option<i64>) -> Opt
 }
 
 #[cfg(target_os = "linux")]
-pub fn element_window_local_xy(window_id: u64, pid: i64, element_index: u32) -> Option<(f64, f64)> {
+pub fn element_window_local_xy(
+    window_id: u64,
+    pid: i64,
+    snapshot_id: u32,
+    element_index: u32,
+) -> Option<(f64, f64)> {
+    let runtime_scope =
+        cua_driver_core::tool::current_dispatch_runtime_scope().unwrap_or_else(|| "legacy".into());
     if tokio::runtime::Handle::try_current().is_ok() {
         return std::thread::spawn(move || {
-            element_window_local_xy_blocking(window_id, pid, element_index)
+            element_window_local_xy_blocking(
+                window_id,
+                pid,
+                snapshot_id,
+                element_index,
+                &runtime_scope,
+            )
         })
         .join()
         .ok()
         .flatten();
     }
-    element_window_local_xy_blocking(window_id, pid, element_index)
+    element_window_local_xy_blocking(window_id, pid, snapshot_id, element_index, &runtime_scope)
 }
 
 #[cfg(target_os = "linux")]
 fn element_window_local_xy_blocking(
     window_id: u64,
     pid: i64,
+    snapshot_id: u32,
     element_index: u32,
+    runtime_scope: &str,
 ) -> Option<(f64, f64)> {
     let pid = u32::try_from(pid).ok()?;
-    let (screen_x, screen_y, width, height) =
-        crate::atspi::get_element_bounds(pid, element_index as usize).ok()?;
+    let cache = ELEMENT_CACHES
+        .get()?
+        .lock()
+        .unwrap()
+        .get(runtime_scope)?
+        .upgrade()?;
+    let (screen_x, screen_y, width, height) = cache
+        .get_element_for_snapshot(pid, window_id, snapshot_id, element_index as usize)?
+        .screen_bounds?;
     let window = resolve_window_for_recording(pid, Some(window_id))?;
     Some((
         f64::from(screen_x - window.x) + f64::from(width) / 2.0,
@@ -131,6 +177,7 @@ pub fn screenshot_for_recording(_window_id: Option<u64>, _pid: Option<i64>) -> O
 pub fn element_window_local_xy(
     _window_id: u64,
     _pid: i64,
+    _snapshot_id: u32,
     _element_index: u32,
 ) -> Option<(f64, f64)> {
     None

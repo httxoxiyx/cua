@@ -16,6 +16,18 @@ pub mod native;
 pub use cache::ElementCache;
 pub use native::ensure_listener_active;
 
+/// Stable address of one AT-SPI object from an observation snapshot.
+///
+/// Element indices are presentation-local ordinals. The D-Bus destination and
+/// object path are the actual native identity and therefore must be retained by
+/// the snapshot cache for later element actions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AtspiElementRef {
+    pub destination: String,
+    pub path: String,
+    pub in_web_content: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct AtspiNode {
     pub element_index: Option<usize>,
@@ -33,6 +45,9 @@ pub struct AtspiNode {
     /// For AT-SPI: element_key = element_index as u64.
     /// For X11 fallback: element_key = xid.
     pub element_key: u64,
+    /// Native object identity captured in the same walk as `element_index`.
+    /// X11 fallback nodes have no AT-SPI identity and leave this empty.
+    pub(crate) element_ref: Option<AtspiElementRef>,
     /// Depth in the markdown tree (0 = top-level window child).
     /// Defaults to 0 when not tracked (e.g. X11 fallback path).
     pub depth: usize,
@@ -163,13 +178,33 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
     native::perform_action(pid, idx)
 }
 
+pub(crate) fn perform_action_for_ref(
+    pid: u32,
+    element_ref: &AtspiElementRef,
+) -> Result<(String, bool)> {
+    native::perform_action_for_ref(pid, element_ref)
+}
+
 /// Give an indexed AT-SPI element keyboard focus without activating its window.
 pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
     native::focus_element(pid, idx)
 }
 
+pub(crate) fn focus_element_for_ref(pid: u32, element_ref: &AtspiElementRef) -> Result<bool> {
+    native::focus_element_for_ref(pid, element_ref)
+}
+
 pub fn scroll_element(pid: u32, idx: usize, direction: &str, amount: usize) -> Result<()> {
     native::scroll_element(pid, idx, direction, amount)
+}
+
+pub(crate) fn scroll_element_for_ref(
+    pid: u32,
+    element_ref: &AtspiElementRef,
+    direction: &str,
+    amount: usize,
+) -> Result<()> {
+    native::scroll_element_for_ref(pid, element_ref, direction, amount)
 }
 
 /// Enumerate top-level windows from the AT-SPI registry. The window-listing
@@ -217,11 +252,27 @@ pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
     native::type_into_editable_at(pid, idx, text)
 }
 
+pub(crate) fn type_into_editable_for_ref(
+    pid: u32,
+    element_ref: &AtspiElementRef,
+    text: &str,
+) -> Result<()> {
+    native::type_into_editable_for_ref(pid, element_ref, text)
+}
+
 /// Set the text value of element `idx` within pid's app tree via AT-SPI.
 /// Tries `EditableText.set_text_contents(value)` first, then
 /// `Value.set_current_value(float)`.
 pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
     native::set_value(pid, idx, value)
+}
+
+pub(crate) fn set_value_for_ref(
+    pid: u32,
+    element_ref: &AtspiElementRef,
+    value: &str,
+) -> Result<()> {
+    native::set_value_for_ref(pid, element_ref, value)
 }
 
 /// Insert `text` into a GUI app's editable field via AT-SPI EditableText —
@@ -296,6 +347,7 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
         },
         actions: vec!["activate".into()],
         element_key: xid,
+        element_ref: None,
         depth: 0,
         parent_element_index: None,
         in_web_content: false,

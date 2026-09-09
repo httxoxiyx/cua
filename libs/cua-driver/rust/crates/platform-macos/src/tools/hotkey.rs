@@ -220,6 +220,7 @@ impl Tool for HotkeyTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let app_context_route = crate::ax::app_context::delegation_route_from_args(&args);
 
         if args.get("keys").and_then(|v| v.as_array()).is_none() {
             return ToolResult::error("Missing required parameter: keys");
@@ -253,26 +254,31 @@ impl Tool for HotkeyTool {
         let key = non_modifiers.last().unwrap().clone();
         let key_display = raw_keys.join("+");
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg_u64 = args.opt_u64("window_id");
+        let window_id_arg = match args.opt_u32("window_id") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             requested_pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
+            window_id_arg_u64,
             "hotkey",
         ) {
             Ok(resolved) => resolved,
             Err(error) => return error,
         };
-        let (element_index, window_id) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg),
+        let (element_index, window_id, snapshot_id) = match resolved {
+            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg, None),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id,
                 element_index,
+                snapshot_id,
                 via_token: _,
-            } => (Some(element_index), window_id),
+            } => (Some(element_index), window_id, Some(snapshot_id)),
         };
         // delivery_mode gates whether we raise: background (default) never fronts
         // the window — passing window_id only targets the combo. foreground is the
@@ -312,6 +318,7 @@ impl Tool for HotkeyTool {
             requested_pid,
             window_id,
             element_index.is_some() || px.is_some() || py.is_some(),
+            app_context_route,
         )
         .await
         {
@@ -329,24 +336,43 @@ impl Tool for HotkeyTool {
         let pid = keyboard_target.pid;
         let window_id = keyboard_target.window_id;
         let transient_route = keyboard_target.transient_route;
+        let app_context_route = keyboard_target.app_context_route;
 
-        let element_guard = if let (Some(index), Some(window_id)) = (element_index, window_id) {
-            match self
-                .state
-                .element_cache
-                .get_element_retained(pid, window_id, index)
-            {
+        let element_guard = if let (Some(index), Some(window_id), Some(snapshot_id)) =
+            (element_index, window_id, snapshot_id)
+        {
+            match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                window_id,
+                snapshot_id,
+                index,
+            ) {
                 Some(guard) => Some(guard),
                 None => {
-                    return ToolResult::error(format!(
-                        "Element index {index} not found. Call get_window_state first."
-                    ));
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "hotkey",
+                        pid,
+                        window_id,
+                        snapshot_id,
+                    );
                 }
             }
         } else {
             None
         };
         let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
+        if let Some(element_ptr) = element_ptr {
+            if unsafe {
+                super::ensure_app_context_element_window(
+                    app_context_route.as_ref(),
+                    element_ptr as crate::ax::bindings::AXUIElementRef,
+                )
+            }
+            .is_err()
+            {
+                return super::app_context_delegation_stale_refusal();
+            }
+        }
 
         let screen_sharing_target = crate::input::keyboard::is_screen_sharing_pid(pid);
         if let Some(error) = screen_sharing_modifier_delivery_error(
@@ -446,6 +472,7 @@ impl Tool for HotkeyTool {
                     args.opt_str("_session_id"),
                     from_zoom,
                     _mutation_lease.as_ref(),
+                    app_context_route.as_ref(),
                 )
                 .await
                 {
@@ -478,6 +505,15 @@ impl Tool for HotkeyTool {
             "hotkey.CGEvent",
             || async move {
                 tokio::task::spawn_blocking(move || {
+                    super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
+                    if let Some(element_ptr) = element_ptr {
+                        unsafe {
+                            super::ensure_app_context_element_window(
+                                app_context_route.as_ref(),
+                                element_ptr as crate::ax::bindings::AXUIElementRef,
+                            )?;
+                        }
+                    }
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     match (fg, coordinate_focus, window_id, element_ptr) {
                         // Chrome's native omnibox and Chromium/Electron inputs
@@ -491,6 +527,7 @@ impl Tool for HotkeyTool {
                                 remembered_cursor,
                                 true,
                                 transient_route,
+                                app_context_route.clone(),
                                 || crate::input::keyboard::press_key_global(&key, &m),
                             )?;
                             Ok(())
@@ -506,6 +543,7 @@ impl Tool for HotkeyTool {
                                 remembered_cursor,
                                 true,
                                 transient_route,
+                                app_context_route.clone(),
                                 || {
                                     focus_hotkey_element(pid, ptr)?;
                                     crate::input::keyboard::press_key_global(&key, &m)
@@ -526,6 +564,7 @@ impl Tool for HotkeyTool {
                                 remembered_cursor,
                                 false,
                                 transient_route,
+                                app_context_route.clone(),
                                 || crate::input::keyboard::press_key_global(&key, &m),
                             )?;
                             Ok(())
@@ -543,6 +582,7 @@ impl Tool for HotkeyTool {
                                 remembered_cursor,
                                 false,
                                 transient_route,
+                                app_context_route,
                                 || crate::input::keyboard::press_key_global(&key, &m),
                             )?;
                             Ok(())

@@ -260,11 +260,29 @@ pub const MAX_VISIBLE_PIP_CARDS: usize = 5;
 
 /// The exact native target represented by one application card.
 ///
-/// Cards are keyed by `pid`, matching the user-facing "one card per app"
-/// model. `window_id` may advance when Computer Use moves to another root
-/// window owned by the same application.
+/// Cards are keyed by [`PipTarget::app_key_pid`], matching the user-facing
+/// "one card per app" model. `pid`/`window_id` remain the actual visual capture
+/// target and may point at a trusted delegated helper window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipDelegation {
+    pub kind: String,
+    pub host_pid: i64,
+    pub panel_kind: String,
+    pub expected_bundle_id: Option<String>,
+    pub expected_app_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipTarget {
+    /// Logical application owner used for one-card-per-app identity,
+    /// foreground suppression, and user-facing naming. A delegated native
+    /// helper window keeps its helper pid in `pid` for capture but sets this to
+    /// the host application's pid.
+    pub logical_pid: Option<i64>,
+    /// Revalidation material for a trusted delegated visual target. Platform
+    /// backends must re-prove this association before continuing capture or
+    /// activating the helper window.
+    pub delegation: Option<PipDelegation>,
     pub pid: i64,
     pub window_id: u64,
     /// Internal runtime session that most recently published this card.
@@ -272,6 +290,12 @@ pub struct PipTarget {
     pub session_id: Option<String>,
     pub app_name: String,
     pub window_title: Option<String>,
+}
+
+impl PipTarget {
+    pub fn app_key_pid(&self) -> i64 {
+        self.logical_pid.filter(|pid| *pid > 0).unwrap_or(self.pid)
+    }
 }
 
 /// A single exact-target seed/fallback frame reused from an observation.
@@ -315,12 +339,12 @@ impl PipViewModel {
     }
 
     pub fn upsert(&mut self, frame: PipFrame) -> PipUpsert {
-        let pid = frame.target.pid;
+        let pid = frame.target.app_key_pid();
         let is_new_app = !self.frames_by_pid.contains_key(&pid);
-        let window_changed = self
-            .frames_by_pid
-            .get(&pid)
-            .is_some_and(|previous| previous.target.window_id != frame.target.window_id);
+        let window_changed = self.frames_by_pid.get(&pid).is_some_and(|previous| {
+            previous.target.pid != frame.target.pid
+                || previous.target.window_id != frame.target.window_id
+        });
         self.frames_by_pid.insert(pid, frame);
         if is_new_app {
             self.publication_order.push(pid);
@@ -488,6 +512,8 @@ mod tests {
     fn frame(pid: i64, window_id: u64, timestamp_ms: u64) -> PipFrame {
         PipFrame {
             target: PipTarget {
+                logical_pid: None,
+                delegation: None,
                 pid,
                 window_id,
                 session_id: Some("session-a".to_owned()),
@@ -499,6 +525,18 @@ mod tests {
         }
     }
 
+    fn delegated_frame(
+        logical_pid: i64,
+        helper_pid: i64,
+        window_id: u64,
+        timestamp_ms: u64,
+    ) -> PipFrame {
+        let mut frame = frame(helper_pid, window_id, timestamp_ms);
+        frame.target.logical_pid = Some(logical_pid);
+        frame.target.app_name = format!("host-{logical_pid}");
+        frame
+    }
+
     #[test]
     fn one_card_per_app_tracks_the_latest_root_window() {
         let mut model = PipViewModel::new(5);
@@ -506,6 +544,16 @@ mod tests {
         assert_eq!(model.upsert(frame(42, 8, 20)).window_changed, true);
         assert_eq!(model.len(), 1);
         assert_eq!(model.frame_for_app(42).unwrap().target.window_id, 8);
+    }
+
+    #[test]
+    fn shared_helper_windows_are_keyed_by_their_logical_host_apps() {
+        let mut model = PipViewModel::new(5);
+        model.upsert(delegated_frame(42, 900, 70, 10));
+        model.upsert(delegated_frame(43, 900, 71, 20));
+        assert_eq!(model.len(), 2);
+        assert_eq!(model.frame_for_app(42).unwrap().target.window_id, 70);
+        assert_eq!(model.frame_for_app(43).unwrap().target.window_id, 71);
     }
 
     #[test]

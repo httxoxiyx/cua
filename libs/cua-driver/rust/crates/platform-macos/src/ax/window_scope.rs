@@ -14,7 +14,7 @@ use crate::windows::WindowOwner;
 /// What the requested `window_id` turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowScope {
-    /// A top-level AXWindow reported the requested CGWindowID.
+    /// A top-level AXWindow or mapped AXSheet reported the requested CGWindowID.
     Matched,
     /// WindowServer has no record of the requested CGWindowID — closed,
     /// stale, or fabricated.
@@ -53,8 +53,8 @@ pub struct TopLevelCandidate {
     /// report `AXStandardWindow` rather than a dialog subrole, but identify
     /// themselves as `open-panel` / `save-panel`.
     pub identifier: Option<String>,
-    /// `_AXUIElementGetWindow` result, when the SPI resolved one. Only read
-    /// for `AXWindow` roles.
+    /// `_AXUIElementGetWindow` result, when the SPI resolved one. Read for
+    /// top-level `AXWindow` and `AXSheet` roles.
     pub ax_window_id: Option<u32>,
 }
 
@@ -88,6 +88,10 @@ impl TopLevelCandidate {
                 .identifier
                 .as_deref()
                 .is_some_and(|id| matches!(id, "open-panel" | "save-panel"))
+    }
+
+    fn is_window_like(&self) -> bool {
+        self.role == "AXWindow" || (self.role == "AXSheet" && self.ax_window_id.is_some())
     }
 }
 
@@ -130,10 +134,40 @@ pub fn decide_window_scope<F>(
 where
     F: FnOnce() -> WindowOwner,
 {
+    decide_window_scope_with_inherited_top_level(candidates, requested, resolve_owner, true)
+}
+
+/// Strict exact-window projection used for a delegated Open/Save helper.
+///
+/// The AppKit panel service is shared across hosts. Its application AX root can
+/// therefore expose multiple top-level sheets/windows at once; inheriting a
+/// sibling into this snapshot would put another host's controls in the current
+/// element cache. Only candidates that themselves map to `requested` are
+/// walked in this mode.
+pub fn decide_window_scope_strict<F>(
+    candidates: &[TopLevelCandidate],
+    requested: u32,
+    resolve_owner: F,
+) -> ScopeDecision
+where
+    F: FnOnce() -> WindowOwner,
+{
+    decide_window_scope_with_inherited_top_level(candidates, requested, resolve_owner, false)
+}
+
+fn decide_window_scope_with_inherited_top_level<F>(
+    candidates: &[TopLevelCandidate],
+    requested: u32,
+    resolve_owner: F,
+    include_inherited_top_level: bool,
+) -> ScopeDecision
+where
+    F: FnOnce() -> WindowOwner,
+{
     let matched: Vec<usize> = candidates
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.role == "AXWindow" && c.ax_window_id == Some(requested))
+        .filter(|(_, c)| c.is_window_like() && c.ax_window_id == Some(requested))
         .map(|(i, _)| i)
         .collect();
 
@@ -160,16 +194,20 @@ where
     // menu navigation with no replacement path. Keeping other non-window
     // children is also what `browser/consent_ui.rs` relies on to reach a
     // top-level `AXSheet` consent prompt.
-    let dialog_scope = matched.iter().any(|&i| candidates[i].is_dialog_like());
-    let walk = candidates
-        .iter()
-        .enumerate()
-        .filter(|(i, c)| {
-            (c.role != "AXWindow" || matched.contains(i))
-                && !(dialog_scope && c.role == "AXMenuBar")
-        })
-        .map(|(i, _)| i)
-        .collect();
+    let walk = if include_inherited_top_level {
+        let dialog_scope = matched.iter().any(|&i| candidates[i].is_dialog_like());
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| {
+                (c.role != "AXWindow" || matched.contains(i))
+                    && !(dialog_scope && c.role == "AXMenuBar")
+            })
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        matched
+    };
     ScopeDecision {
         scope: WindowScope::Matched,
         walk,
@@ -287,9 +325,51 @@ mod tests {
         assert!(d.walk.is_empty());
     }
 
+    #[test]
+    fn mapped_sheet_can_be_the_exact_window_scope() {
+        let candidates = [
+            TopLevelCandidate::new("AXMenuBar", None),
+            TopLevelCandidate::new("AXWindow", Some(11)),
+            TopLevelCandidate::new("AXSheet", Some(22)),
+        ];
+        let d = decide_window_scope(&candidates, 22, never_called);
+        assert_eq!(d.scope, WindowScope::Matched);
+        assert_eq!(d.walk, vec![2], "a selected sheet excludes menu and parent");
+    }
+
+    #[test]
+    fn mapped_sibling_sheet_remains_inherited_for_exact_window_backcompat() {
+        let candidates = [
+            TopLevelCandidate::new("AXMenuBar", None),
+            TopLevelCandidate::new("AXWindow", Some(11)),
+            TopLevelCandidate::new("AXSheet", Some(22)),
+        ];
+        let d = decide_window_scope(&candidates, 11, never_called);
+        assert_eq!(d.scope, WindowScope::Matched);
+        assert_eq!(d.walk, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn strict_exact_window_excludes_menu_and_mapped_sibling_sheet() {
+        let candidates = [
+            TopLevelCandidate::new("AXMenuBar", None),
+            TopLevelCandidate::new("AXWindow", Some(11)),
+            TopLevelCandidate::new("AXSheet", Some(22)),
+            TopLevelCandidate::new("AXWindow", Some(33)),
+        ];
+        let d = decide_window_scope_strict(&candidates, 11, never_called);
+        assert_eq!(d.scope, WindowScope::Matched);
+        assert_eq!(d.walk, vec![1]);
+
+        let sheet = decide_window_scope_strict(&candidates, 22, never_called);
+        assert_eq!(sheet.scope, WindowScope::Matched);
+        assert_eq!(sheet.walk, vec![2]);
+    }
+
     /// A resolved window still carries its sibling sheets — `consent_ui.rs`
-    /// walks Chrome's other window ids expecting the consent `AXSheet` as a
-    /// top-level non-window child.
+    /// walks Chrome's other window ids expecting that shape as a top-level
+    /// non-window child. App-context can still select a mapped sheet directly,
+    /// but exact parent-window observations retain their historical projection.
     #[test]
     fn matched_window_keeps_sibling_sheets() {
         let candidates = [

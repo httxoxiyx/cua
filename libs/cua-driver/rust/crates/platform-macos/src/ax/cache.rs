@@ -89,14 +89,17 @@ impl ElementCache {
     }
 
     /// Replace the snapshot for (pid, window_id) with the nodes from a fresh walk.
-    pub fn update(&self, pid: i32, window_id: u32, nodes: &[AXNode]) {
+    pub fn update(&self, pid: i32, window_id: u32, snapshot_id: Option<u32>, nodes: &[AXNode]) {
         let elements: Vec<usize> = nodes
             .iter()
             .filter(|n| n.element_index.is_some())
             .map(|n| n.element_ptr)
             .collect();
-        self.core
-            .insert(CacheKey { pid, window_id }, CachedSnapshot { elements });
+        self.core.insert_for_snapshot(
+            CacheKey { pid, window_id },
+            snapshot_id,
+            CachedSnapshot { elements },
+        );
     }
 
     /// Look up + `CFRetain` the element for `element_index` in (pid, window_id),
@@ -118,6 +121,26 @@ impl ElementCache {
                 if ptr != 0 {
                     // Safety: still inside `with_snapshot`'s lock, so the
                     // snapshot (and thus this CFTypeRef) is alive right now.
+                    unsafe { CFRetain(ptr as AXUIElementRef as CFTypeRef) };
+                }
+                Some(RetainedElement(ptr))
+            })
+            .flatten()
+    }
+
+    /// Snapshot-bound variant used by every model-visible element action.
+    /// Generation matching and CFRetain happen under the cache lock.
+    pub fn get_element_retained_for_snapshot(
+        &self,
+        pid: i32,
+        window_id: u32,
+        snapshot_id: u32,
+        element_index: usize,
+    ) -> Option<RetainedElement> {
+        self.core
+            .with_snapshot_id(&CacheKey { pid, window_id }, snapshot_id, |s| {
+                let ptr = s.elements.get(element_index).copied()?;
+                if ptr != 0 {
                     unsafe { CFRetain(ptr as AXUIElementRef as CFTypeRef) };
                 }
                 Some(RetainedElement(ptr))
@@ -188,7 +211,7 @@ mod tests {
         // to the cache, and CachedSnapshot::drop releases that retain.
         unsafe { CFRetain(ptr as CFTypeRef) };
         let cache = ElementCache::new();
-        cache.update(1, 2, &[node_with_ptr(ptr)]);
+        cache.update(1, 2, Some(10), &[node_with_ptr(ptr)]);
         assert_eq!(
             unsafe { CFGetRetainCount(ptr as CFTypeRef) },
             base + 1,
@@ -197,7 +220,7 @@ mod tests {
 
         // Borrow the element out for an action.
         let guard = cache
-            .get_element_retained(1, 2, 0)
+            .get_element_retained_for_snapshot(1, 2, 10, 0)
             .expect("element is cached");
         assert_eq!(
             unsafe { CFGetRetainCount(ptr as CFTypeRef) },
@@ -207,7 +230,7 @@ mod tests {
 
         // Concurrent get_window_state replaces the snapshot → old one dropped →
         // CFRelease of the cache's retain. The guard's retain must remain.
-        cache.update(1, 2, &[]);
+        cache.update(1, 2, Some(11), &[]);
         assert_eq!(
             unsafe { CFGetRetainCount(ptr as CFTypeRef) },
             base + 1,
@@ -227,8 +250,105 @@ mod tests {
     #[test]
     fn missing_index_returns_none() {
         let cache = ElementCache::new();
-        assert!(cache.get_element_retained(1, 2, 0).is_none());
-        cache.update(1, 2, &[]);
-        assert!(cache.get_element_retained(1, 2, 5).is_none());
+        assert!(cache
+            .get_element_retained_for_snapshot(1, 2, 1, 0)
+            .is_none());
+        cache.update(1, 2, Some(1), &[]);
+        assert!(cache
+            .get_element_retained_for_snapshot(1, 2, 1, 5)
+            .is_none());
+    }
+
+    #[test]
+    fn old_generation_cannot_alias_replacement_index() {
+        let old = CFString::new("cua-driver-old-generation-element");
+        let new = CFString::new("cua-driver-new-generation-element");
+        let old_ptr = old.as_concrete_TypeRef() as usize;
+        let new_ptr = new.as_concrete_TypeRef() as usize;
+        unsafe {
+            CFRetain(old_ptr as CFTypeRef);
+            CFRetain(new_ptr as CFTypeRef);
+        }
+        let cache = ElementCache::new();
+        cache.update(1, 2, Some(100), &[node_with_ptr(old_ptr)]);
+        cache.update(1, 2, Some(101), &[node_with_ptr(new_ptr)]);
+
+        assert!(
+            cache
+                .get_element_retained_for_snapshot(1, 2, 100, 0)
+                .is_none(),
+            "a resolved old token must not read index 0 from the new snapshot"
+        );
+        assert_eq!(
+            cache
+                .get_element_retained_for_snapshot(1, 2, 101, 0)
+                .expect("new generation should resolve")
+                .as_ptr(),
+            new_ptr
+        );
+    }
+
+    #[test]
+    fn resolved_token_then_cache_replacement_refuses_as_stale() {
+        let pid = 0x6f00_0123_i32;
+        let window_id = 73_u32;
+        let old = CFString::new("cua-driver-resolved-token-old-element");
+        let new = CFString::new("cua-driver-resolved-token-new-element");
+        let old_ptr = old.as_concrete_TypeRef() as usize;
+        let new_ptr = new.as_concrete_TypeRef() as usize;
+        unsafe {
+            CFRetain(old_ptr as CFTypeRef);
+            CFRetain(new_ptr as CFTypeRef);
+        }
+        let cache = ElementCache::new();
+        let registry = cua_driver_core::element_token::global();
+        let old_snapshot = registry.register_snapshot(pid, window_id, 1);
+        cache.update(
+            pid,
+            window_id,
+            Some(old_snapshot),
+            &[node_with_ptr(old_ptr)],
+        );
+        let old_token = cua_driver_core::element_token::token_for(old_snapshot, 0);
+        let resolved = cua_driver_core::element_token::resolve_element_args(
+            pid,
+            None,
+            Some(&old_token),
+            None,
+            None,
+            "click",
+        )
+        .expect("old token resolves before the concurrent observation");
+        let resolved_snapshot = resolved
+            .snapshot_id()
+            .expect("element resolution carries its snapshot generation");
+
+        // Concurrent get_window_state commits a new generation with the same
+        // index before the paused click reaches the cache.
+        let new_snapshot = registry.register_snapshot(pid, window_id, 1);
+        cache.update(
+            pid,
+            window_id,
+            Some(new_snapshot),
+            &[node_with_ptr(new_ptr)],
+        );
+
+        assert!(
+            cache
+                .get_element_retained_for_snapshot(pid, window_id, resolved_snapshot, 0)
+                .is_none(),
+            "the old token must not resolve to the new element at index 0"
+        );
+        let refusal = cua_driver_core::element_token::stale_element_cache_result(
+            "click",
+            pid,
+            window_id,
+            resolved_snapshot,
+        );
+        assert_eq!(refusal.is_error, Some(true));
+        assert_eq!(
+            refusal.structured_content.as_ref().unwrap()["refusal"]["code"],
+            "stale_element_token"
+        );
     }
 }

@@ -133,6 +133,8 @@ async fn pid_only_keyboard_refuses_same_pid_multi_window_ambiguity_before_dispat
             calls: calls.clone(),
         },
         &candidates,
+        &Arc::new(crate::ax::app_context::AppContextDelegationRegistry::new()),
+        AppContextDelegationPolicy::AllowPanelInput,
     );
 
     let result = keyboard

@@ -21,7 +21,7 @@ use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{CoordType, Interface, State, StateSet};
 
-use super::AtspiNode;
+use super::{AtspiElementRef, AtspiNode};
 
 /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
 /// lazily-built trees like Chromium's) must not stall the whole walk.
@@ -256,6 +256,7 @@ struct Visited<'a> {
     /// tree; this is what lets a caller that named an exact native window prove
     /// which of those windows a node actually lives in.
     frame_ordinal: usize,
+    element_ref: AtspiElementRef,
     acc: AccessibleProxy<'a>,
 }
 
@@ -941,6 +942,11 @@ async fn collect_visited_bounded<'a>(
             in_web_doc,
             on_web_process_bus: is_web_process_bus(&oref.name),
             frame_ordinal,
+            element_ref: AtspiElementRef {
+                destination: oref.name.clone(),
+                path: oref.path.clone(),
+                in_web_content: in_web_doc,
+            },
             acc,
         });
     }
@@ -1026,6 +1032,7 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 description: None,
                 actions: v.actions.clone(),
                 element_key: idx as u64,
+                element_ref: Some(v.element_ref.clone()),
                 depth: v.depth,
                 parent_element_index,
                 in_web_content: v.in_web_doc,
@@ -1116,6 +1123,114 @@ fn is_indexable_capabilities(
             || has_selectable_state
             || pixel_addressable_control)
         && enabled == Some(true)
+}
+
+/// Rebuild one exact native object captured by an earlier observation without
+/// walking the application's current tree or interpreting a current ordinal.
+/// The object may have changed capabilities since the observation; require it
+/// to remain indexable before an action is allowed to continue.
+async fn visited_for_element_ref<'a>(
+    conn: &'a AccessibilityConnection,
+    element_ref: &AtspiElementRef,
+) -> Result<Visited<'a>> {
+    let raw = RawObjectRef {
+        name: element_ref.destination.clone(),
+        path: element_ref.path.clone(),
+    };
+    let acc = accessible_for(conn, &raw).await?;
+    let ifaces = call(acc.get_interfaces())
+        .await
+        .and_then(|result| result.ok())
+        .ok_or_else(|| anyhow!("snapshot AT-SPI object no longer exposes interfaces"))?;
+    let role = call(acc.get_role_name())
+        .await
+        .and_then(|result| result.ok())
+        .unwrap_or_default();
+    let name = call(acc.name())
+        .await
+        .and_then(|result| result.ok())
+        .unwrap_or_default();
+    let state = call(acc.get_state())
+        .await
+        .and_then(|result| result.ok())
+        .ok_or_else(|| anyhow!("snapshot AT-SPI object no longer exposes state"))?;
+    let has_action = ifaces.contains(Interface::Action);
+    let has_editable = ifaces.contains(Interface::EditableText);
+    let has_value = ifaces.contains(Interface::Value);
+    let has_component = ifaces.contains(Interface::Component);
+    let selectable = state.contains(State::Selectable);
+    let enabled = Some(is_enabled_state(&state));
+    let mut actions = Vec::new();
+    if has_action {
+        let proxies = acc
+            .proxies()
+            .await
+            .map_err(|error| anyhow!("interface proxies unavailable: {error}"))?;
+        let action = proxies
+            .action()
+            .await
+            .map_err(|error| anyhow!("Action unavailable: {error}"))?;
+        let count = call(action.n_actions())
+            .await
+            .and_then(|result| result.ok())
+            .unwrap_or(0);
+        for index in 0..count {
+            actions.push(
+                call(action.get_name(index))
+                    .await
+                    .and_then(|result| result.ok())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    if !is_indexable_capabilities(
+        &role,
+        has_action,
+        has_editable,
+        has_value,
+        selectable,
+        has_component,
+        enabled,
+    ) {
+        anyhow::bail!("snapshot AT-SPI object is no longer actionable");
+    }
+
+    let role_lower = role.to_ascii_lowercase();
+    let checked = role_lower
+        .contains("check")
+        .then(|| state.contains(State::Checked));
+    let selected = if role_lower.contains("check") {
+        checked
+    } else if role_lower.contains("radio")
+        || role_lower.contains("list item")
+        || role_lower.contains("menu item")
+        || matches!(role_lower.as_str(), "tab" | "page tab" | "tab item")
+    {
+        Some(state.contains(State::Selected) || state.contains(State::Checked))
+    } else {
+        None
+    };
+
+    Ok(Visited {
+        depth: 0,
+        role,
+        name,
+        value: None,
+        checked,
+        enabled,
+        selected,
+        selectable,
+        actions,
+        has_editable,
+        has_value,
+        has_component,
+        focused: state.contains(State::Focused),
+        in_web_doc: element_ref.in_web_content,
+        on_web_process_bus: is_web_process_bus(&element_ref.destination),
+        frame_ordinal: 0,
+        element_ref: element_ref.clone(),
+        acc,
+    })
 }
 
 // ── Public (sync) entry points ───────────────────────────────────────────────
@@ -1534,6 +1649,40 @@ pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
     )
 }
 
+/// Write to the exact AT-SPI object retained by an observation snapshot.
+pub(crate) fn type_into_editable_for_ref(
+    pid: u32,
+    element_ref: &AtspiElementRef,
+    text: &str,
+) -> Result<()> {
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let target = visited_for_element_ref(conn, element_ref).await?;
+            if write_into_editable_target(&target, text).await? {
+                return Ok(());
+            }
+
+            // GrabFocus may rebuild a toolkit accessibility proxy. Rebuild the
+            // same D-Bus destination/path and retry it; never substitute a
+            // current-tree ordinal or another editable.
+            let refreshed = visited_for_element_ref(conn, element_ref).await?;
+            if write_into_editable_target(&refreshed, text).await? {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "snapshot element is not writable through AT-SPI EditableText"
+                ))
+            }
+        },
+        || {
+            Err(anyhow!(
+                "AT-SPI editable write timed out for snapshot element in pid {pid}"
+            ))
+        },
+    )
+}
+
 pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
     bounded(
         async {
@@ -1857,6 +2006,31 @@ pub fn invoke_menu_path(pid: u32, path: &[String]) -> Result<()> {
     )
 }
 
+async fn perform_action_on_target(target: &Visited<'_>, label: &str) -> Result<(String, bool)> {
+    // Suspected no-op: actuating a passive display role or a node that
+    // advertises no action is the AT-SPI analogue of macOS' "element does not
+    // advertise this action".
+    let suspected_noop = target.actions.is_empty() || is_passive_role(&target.role);
+    let chosen = activation_index(&target.role, &target.actions)
+        .ok_or_else(|| anyhow!("{label} does not advertise a safe activation action"))?;
+    let ap = target
+        .acc
+        .proxies()
+        .await
+        .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?
+        .action()
+        .await
+        .map_err(|e| anyhow!("Action unavailable: {e}"))?;
+    let action = target.actions.get(chosen).cloned().unwrap_or_default();
+    ap.do_action(chosen as i32)
+        .await
+        .map_err(|e| anyhow!("doAction failed: {e}"))?;
+    // AT-SPI's doAction acknowledgement can precede the renderer's queued DOM
+    // mutation. Give it one short event-loop turn before returning success.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Ok((action, suspected_noop))
+}
+
 pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
     bounded(
         async {
@@ -1868,44 +2042,27 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
             let target = action_nodes.get(idx).ok_or_else(|| {
                 anyhow!("element {idx} not found (total: {})", action_nodes.len())
             })?;
+            perform_action_on_target(target, &format!("element {idx}")).await
+        },
+        || {
+            Err(anyhow!(
+                "perform_action timed out for pid {pid} (app unresponsive to AT-SPI)"
+            ))
+        },
+    )
+}
 
-            // Suspected no-op: actuating `do_action(0)` on a passive display role
-            // (a `label`/`static`/`image` indexed only for its Value interface) or a
-            // node that advertises no action at all is the AT-SPI analogue of macOS'
-            // "element does not advertise this action" — the call returns success but
-            // likely changes nothing. Reuses the same passive-role detector
-            // `select_click_target` leans on for the coordinate paths. The caller
-            // turns this into `effect: "suspected_noop"` + an escalation hint.
-            let suspected_noop = target.actions.is_empty() || is_passive_role(&target.role);
-
-            // Which action to actuate is decided by NAME, not by position. A
-            // GTK4 text view advertises `buffer.delete-line` first, so firing
-            // "action 0" there deletes a line of the user's document while
-            // reporting an ordinary click. An element that advertises no
-            // activation at all is a no-op the caller must escalate past —
-            // not an invitation to fire whatever happens to be first.
-            let chosen = activation_index(&target.role, &target.actions).ok_or_else(|| {
-                anyhow!("element {idx} does not advertise a safe activation action")
-            })?;
-
-            let ap = target
-                .acc
-                .proxies()
-                .await
-                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?
-                .action()
-                .await
-                .map_err(|e| anyhow!("Action unavailable: {e}"))?;
-            let action = target.actions.get(chosen).cloned().unwrap_or_default();
-            ap.do_action(chosen as i32)
-                .await
-                .map_err(|e| anyhow!("doAction failed: {e}"))?;
-            // AT-SPI's doAction acknowledgement can precede the renderer's
-            // queued DOM mutation. Give WebKit/Chromium one short event-loop
-            // turn before returning success so a caller's immediate external
-            // state read observes the action it was told was delivered.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok((action, suspected_noop))
+/// Perform the primary action on the exact AT-SPI object retained by an
+/// observation snapshot. No current-tree ordinal is consulted.
+pub(crate) fn perform_action_for_ref(
+    pid: u32,
+    element_ref: &AtspiElementRef,
+) -> Result<(String, bool)> {
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let target = visited_for_element_ref(conn, element_ref).await?;
+            perform_action_on_target(&target, "snapshot element").await
         },
         || {
             Err(anyhow!(
@@ -2022,6 +2179,107 @@ pub fn scroll_element(pid: u32, idx: usize, direction: &str, amount: usize) -> R
     )
 }
 
+/// Scroll the exact AT-SPI object retained by an observation snapshot.
+pub(crate) fn scroll_element_for_ref(
+    pid: u32,
+    element_ref: &AtspiElementRef,
+    direction: &str,
+    amount: usize,
+) -> Result<()> {
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let target = visited_for_element_ref(conn, element_ref).await?;
+            let proxies = target
+                .acc
+                .proxies()
+                .await
+                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+            let wanted = match direction {
+                "up" => ["scrollup", "scrollbackward"],
+                "left" => ["scrollleft", "scrollbackward"],
+                "right" => ["scrollright", "scrollforward"],
+                _ => ["scrolldown", "scrollforward"],
+            };
+            let mut selected = None;
+            let mut action_proxy = None;
+            if let Ok(action) = proxies.action().await {
+                let count = call(action.n_actions())
+                    .await
+                    .and_then(|result| result.ok())
+                    .unwrap_or(0);
+                for action_index in 0..count {
+                    if let Some(Ok(name)) = call(action.get_name(action_index)).await {
+                        let normalized: String = name
+                            .chars()
+                            .filter(|ch| ch.is_ascii_alphanumeric())
+                            .flat_map(|ch| ch.to_lowercase())
+                            .collect();
+                        if wanted.iter().any(|candidate| *candidate == normalized) {
+                            selected = Some(action_index);
+                            break;
+                        }
+                    }
+                }
+                action_proxy = Some(action);
+            }
+
+            if let (Some(action), Some(action_index)) = (action_proxy, selected) {
+                for _ in 0..amount.max(1) {
+                    match call(action.do_action(action_index)).await {
+                        Some(Ok(true)) => {}
+                        Some(Ok(false)) => return Err(anyhow!("scroll action returned false")),
+                        Some(Err(e)) => return Err(anyhow!("scroll action failed: {e}")),
+                        None => return Err(anyhow!("scroll action timed out")),
+                    }
+                }
+                return Ok(());
+            }
+
+            if target.has_value {
+                let value = proxies
+                    .value()
+                    .await
+                    .map_err(|e| anyhow!("Value interface unavailable: {e}"))?;
+                let current = call(value.current_value())
+                    .await
+                    .and_then(|result| result.ok())
+                    .ok_or_else(|| anyhow!("scroll value lookup timed out"))?;
+                let minimum = call(value.minimum_value())
+                    .await
+                    .and_then(|result| result.ok())
+                    .unwrap_or(current);
+                let maximum = call(value.maximum_value())
+                    .await
+                    .and_then(|result| result.ok())
+                    .unwrap_or(current);
+                let increment = call(value.minimum_increment())
+                    .await
+                    .and_then(|result| result.ok())
+                    .filter(|increment| *increment > 0.0)
+                    .unwrap_or(1.0);
+                let sign = if matches!(direction, "up" | "left") {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let next =
+                    (current + sign * increment * amount.max(1) as f64).clamp(minimum, maximum);
+                call(value.set_current_value(next))
+                    .await
+                    .and_then(|result| result.ok())
+                    .ok_or_else(|| anyhow!("scroll value update timed out"))?;
+                return Ok(());
+            }
+
+            Err(anyhow!(
+                "snapshot element exposes neither directional scroll actions nor Value"
+            ))
+        },
+        || Err(anyhow!("scroll_element timed out for pid {pid}")),
+    )
+}
+
 /// Give an indexed element keyboard focus through AT-SPI Component.GrabFocus
 /// without activating or raising its toplevel window.
 ///
@@ -2078,6 +2336,47 @@ pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
                 }
             }
             Ok(false)
+        },
+        || Err(anyhow!("focus_element timed out for pid {pid}")),
+    )
+}
+
+async fn focus_target(target: &Visited<'_>, label: &str) -> Result<bool> {
+    let proxies = target
+        .acc
+        .proxies()
+        .await
+        .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+    let component = proxies
+        .component()
+        .await
+        .map_err(|e| anyhow!("Component interface unavailable: {e}"))?;
+    let accepted = match call(component.grab_focus()).await {
+        Some(Ok(focused)) => focused,
+        Some(Err(e)) => return Err(anyhow!("Component.GrabFocus failed for {label}: {e}")),
+        None => return Err(anyhow!("Component.GrabFocus timed out for {label}")),
+    };
+    if !accepted {
+        return Ok(false);
+    }
+
+    let settle_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < settle_deadline {
+        match tokio::time::timeout(Duration::from_millis(100), target.acc.get_state()).await {
+            Ok(Ok(state)) if state.contains(State::Focused) => return Ok(true),
+            _ => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    Ok(false)
+}
+
+/// Focus the exact AT-SPI object retained by an observation snapshot.
+pub(crate) fn focus_element_for_ref(pid: u32, element_ref: &AtspiElementRef) -> Result<bool> {
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let target = visited_for_element_ref(conn, element_ref).await?;
+            focus_target(&target, "snapshot element").await
         },
         || Err(anyhow!("focus_element timed out for pid {pid}")),
     )
@@ -2383,6 +2682,65 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
             }
             Err(anyhow!(
                 "element {idx} exposes neither EditableText nor Value"
+            ))
+        },
+        || {
+            Err(anyhow!(
+                "set_value timed out for pid {pid} (app unresponsive to AT-SPI)"
+            ))
+        },
+    )
+}
+
+/// Set the value of the exact AT-SPI object retained by an observation
+/// snapshot, without consulting the current tree's element ordering.
+pub(crate) fn set_value_for_ref(
+    pid: u32,
+    element_ref: &AtspiElementRef,
+    value: &str,
+) -> Result<()> {
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let target = visited_for_element_ref(conn, element_ref).await?;
+            let proxies = target
+                .acc
+                .proxies()
+                .await
+                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+
+            if let Ok(editable) = proxies.editable_text().await {
+                if editable.set_text_contents(value).await.unwrap_or(false) {
+                    return Ok(());
+                }
+                let offset = match proxies.text().await {
+                    Ok(text) => text.caret_offset().await.unwrap_or(0),
+                    Err(_) => 0,
+                };
+                let length = value.chars().count() as i32;
+                if editable
+                    .insert_text(offset, value, length)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return Ok(());
+                }
+            }
+            if target.has_value {
+                let numeric: f64 = value
+                    .parse()
+                    .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
+                proxies
+                    .value()
+                    .await
+                    .map_err(|e| anyhow!("Value unavailable: {e}"))?
+                    .set_current_value(numeric)
+                    .await
+                    .map_err(|e| anyhow!("setCurrentValue failed: {e}"))?;
+                return Ok(());
+            }
+            Err(anyhow!(
+                "snapshot element exposes neither EditableText nor Value"
             ))
         },
         || {

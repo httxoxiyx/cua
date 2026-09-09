@@ -296,6 +296,56 @@ fn fixed_path_stress_no_uaf() {
     );
 }
 
+/// A recording marker must use the same observation generation that
+/// authorized the element action. Reusing only `(pid, hwnd, index)` would read
+/// the replacement center and annotate a click that the action correctly
+/// refused as stale.
+#[test]
+fn recording_marker_center_is_bound_to_snapshot_generation() {
+    let uaf_hits: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let cache = ElementCache::new();
+    let old_ptr = make_fake(uaf_hits, false);
+    let new_ptr = make_fake(uaf_hits, false);
+
+    let mut old = snapshot_with(vec![old_ptr]);
+    old.centers[0] = (10, 20);
+    cache.core.insert_for_snapshot(
+        CacheKey {
+            pid: PID,
+            hwnd: HWND,
+        },
+        Some(100),
+        old,
+    );
+
+    let mut replacement = snapshot_with(vec![new_ptr]);
+    replacement.centers[0] = (900, 800);
+    cache.core.insert_for_snapshot(
+        CacheKey {
+            pid: PID,
+            hwnd: HWND,
+        },
+        Some(101),
+        replacement,
+    );
+
+    assert_eq!(
+        cache.get_element_center(PID, HWND, 0),
+        Some((900, 800)),
+        "generation-unbound lookup demonstrates the replacement alias"
+    );
+    assert_eq!(
+        cache.get_element_center_for_snapshot(PID, HWND, 100, 0),
+        None,
+        "a stale recording marker must not use the replacement center"
+    );
+    assert_eq!(
+        cache.get_element_center_for_snapshot(PID, HWND, 101, 0),
+        Some((900, 800)),
+        "the replacement center remains available to its own generation"
+    );
+}
+
 // ---- Hard-crash demonstrations (run manually, never in the suite) -----------
 
 /// BEFORE (real fault): the pre-fix path takes a genuine

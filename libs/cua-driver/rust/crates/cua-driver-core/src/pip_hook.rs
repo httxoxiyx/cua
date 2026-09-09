@@ -15,8 +15,19 @@
 
 use std::sync::OnceLock;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipHookDelegation {
+    pub kind: String,
+    pub host_pid: i64,
+    pub panel_kind: String,
+    pub expected_bundle_id: Option<String>,
+    pub expected_app_name: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct PipHookTarget {
+    pub logical_pid: Option<i64>,
+    pub delegation: Option<PipHookDelegation>,
     pub pid: i64,
     pub window_id: u64,
     pub session_id: Option<String>,

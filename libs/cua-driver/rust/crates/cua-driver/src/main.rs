@@ -264,6 +264,16 @@ fn maybe_init_pip() {
                             cua_driver_core::pip_hook::PipHookEvent::Upsert(frame) => {
                                 b.push_frame(pip_preview::PipFrame {
                                     target: pip_preview::PipTarget {
+                                        logical_pid: frame.target.logical_pid,
+                                        delegation: frame.target.delegation.map(|delegation| {
+                                            pip_preview::PipDelegation {
+                                                kind: delegation.kind,
+                                                host_pid: delegation.host_pid,
+                                                panel_kind: delegation.panel_kind,
+                                                expected_bundle_id: delegation.expected_bundle_id,
+                                                expected_app_name: delegation.expected_app_name,
+                                            }
+                                        }),
                                         pid: frame.target.pid,
                                         window_id: frame.target.window_id,
                                         session_id: frame.target.session_id,
@@ -276,6 +286,16 @@ fn maybe_init_pip() {
                             }
                             cua_driver_core::pip_hook::PipHookEvent::Ensure(target) => {
                                 b.ensure_target(pip_preview::PipTarget {
+                                    logical_pid: target.logical_pid,
+                                    delegation: target.delegation.map(|delegation| {
+                                        pip_preview::PipDelegation {
+                                            kind: delegation.kind,
+                                            host_pid: delegation.host_pid,
+                                            panel_kind: delegation.panel_kind,
+                                            expected_bundle_id: delegation.expected_bundle_id,
+                                            expected_app_name: delegation.expected_app_name,
+                                        }
+                                    }),
                                     pid: target.pid,
                                     window_id: target.window_id,
                                     session_id: target.session_id,

@@ -53,6 +53,7 @@ fn resolve_onscreen_point_with_scroll(
     element_cache: &crate::uia::cache::ElementCache,
     pid: u32,
     hwnd: u64,
+    snapshot_id: u32,
     idx: usize,
     cx: i32,
     cy: i32,
@@ -94,7 +95,9 @@ fn resolve_onscreen_point_with_scroll(
     // remaining inside the outer HWND rectangle. UIA's IsOffscreen property is
     // authoritative for that case; without it a foreground tap can land on the
     // visible control covering the stale point (for example a bottom toolbar).
-    if let Some(retained) = element_cache.get_element_retained(pid, hwnd, idx) {
+    if let Some(retained) =
+        element_cache.get_element_retained_for_snapshot(pid, hwnd, snapshot_id, idx)
+    {
         if retained.is_uia() {
             let is_offscreen =
                 unsafe { crate::uia::scroll::element_is_offscreen(retained.as_ptr()) };
@@ -1367,17 +1370,6 @@ impl Tool for GetWindowStateTool {
                     content.push(cua_driver_core::protocol::Content::text(
                         header + &tr.tree_markdown,
                     ));
-                    // Route the cache to the matching dispatch path: any
-                    // node whose msaa_role is Some came from the MSAA
-                    // walker, so the entire snapshot must Drop via
-                    // IAccessible and click must dispatch through MSAA.
-                    if !observation_only {
-                        if is_msaa {
-                            state.element_cache.update_msaa(pid, hwnd, &tr.nodes);
-                        } else {
-                            state.element_cache.update(pid, hwnd, &tr.nodes);
-                        }
-                    }
                     structured["element_count"] = json!(count);
                     // UIA currently does not expose whether a bounded walk
                     // exhausted every subtree. Keep negative existence
@@ -1397,6 +1389,19 @@ impl Tool for GetWindowStateTool {
                             count,
                         )
                     });
+                    // Publish the cache only after minting its generation, so
+                    // an already-resolved old token cannot alias the new rows.
+                    if !observation_only {
+                        if is_msaa {
+                            state
+                                .element_cache
+                                .update_msaa(pid, hwnd, snapshot_id, &tr.nodes);
+                        } else {
+                            state
+                                .element_cache
+                                .update(pid, hwnd, snapshot_id, &tr.nodes);
+                        }
+                    }
 
                     // Structured `elements` array — preferred consumption
                     // path. Shape matches the cross-platform spec:
@@ -1517,7 +1522,7 @@ impl Tool for GetWindowStateTool {
                     // Screenshot-only observations intentionally create no
                     // fresh UIA/MSAA binding. Invalidate the old integer-index
                     // cache so it cannot be replayed after the window changed.
-                    state.element_cache.update(pid, hwnd, &[]);
+                    state.element_cache.update(pid, hwnd, None, &[]);
                 }
 
                 if let Some((b64_opt, file_path, w, h, orig_w)) = screenshot_opt {
@@ -3094,14 +3099,15 @@ impl Tool for ClickTool {
             Err(e) => return e,
         };
         // Surface 6: element_token / element_index precedence resolution.
-        // Windows uses u64 HWND but the token registry stores u32; truncate
-        // through the same path get_window_state used when registering.
+        // Keep the caller's full u64 HWND for the token/window conflict check.
+        // The registry stores the observed HWND as u32 on supported Windows
+        // editions, so an oversized alias must be rejected rather than truncated.
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid as i32,
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "click",
         ) {
             Ok(r) => r,
@@ -3113,6 +3119,7 @@ impl Tool for ClickTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => None,
         };
+        let snapshot_id = resolved.snapshot_id();
         let hwnd_opt: Option<u64> = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => window_id
                 .map(|v| v as u64)
@@ -3202,6 +3209,23 @@ impl Tool for ClickTool {
         };
 
         if let Some(idx) = elem_idx {
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+            let _snapshot_guard = match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx as usize,
+            ) {
+                Some(element) => element,
+                None => {
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "click",
+                        pid as i32,
+                        hwnd as u32,
+                        snapshot_id,
+                    )
+                }
+            };
             // ── MSAA dispatch (SAL/VCL targets) ────────────────────────────
             // For MSAA elements, route by role:
             //   - `action:"expand"` on BUTTONDROPDOWN → SendInput at the
@@ -3216,7 +3240,7 @@ impl Tool for ClickTool {
             if let Some((SnapshotKind::Msaa, role)) = self
                 .state
                 .element_cache
-                .get_element_kind_and_role(pid, hwnd, idx)
+                .get_element_kind_and_role_for_snapshot(pid, hwnd, snapshot_id, idx)
             {
                 const ROLE_BUTTONDROPDOWN: i32 = 0x38;
                 const ROLE_BUTTONMENU: i32 = 0x39;
@@ -3233,7 +3257,12 @@ impl Tool for ClickTool {
                     )
                 );
                 let (tx, ty) = if want_expand && is_dropdown_role {
-                    match self.state.element_cache.get_element_rect(pid, hwnd, idx) {
+                    match self.state.element_cache.get_element_rect_for_snapshot(
+                        pid,
+                        hwnd,
+                        snapshot_id,
+                        idx,
+                    ) {
                         Some((_l, t, r, b)) => {
                             // Right-edge of the SplitButton — the dropdown
                             // arrow half. -4 puts the click safely inside
@@ -3256,7 +3285,12 @@ impl Tool for ClickTool {
                          Use action:\"invoke\" or omit the action arg."
                     ));
                 } else {
-                    match self.state.element_cache.get_element_center(pid, hwnd, idx) {
+                    match self.state.element_cache.get_element_center_for_snapshot(
+                        pid,
+                        hwnd,
+                        snapshot_id,
+                        idx,
+                    ) {
                         Some(v) => v,
                         None => {
                             return ToolResult::error(format!(
@@ -3309,12 +3343,20 @@ impl Tool for ClickTool {
             }
 
             // UIA path: get cached center (no COM call needed — captured at walk time).
-            let (cx, cy) = match self.state.element_cache.get_element_center(pid, hwnd, idx) {
+            let (cx, cy) = match self.state.element_cache.get_element_center_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx,
+            ) {
                 Some(v) => v,
                 None => {
-                    return ToolResult::error(format!(
-                        "Element {idx} not in cache for hwnd={hwnd}. Call get_window_state first."
-                    ))
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "click",
+                        pid as i32,
+                        hwnd as u32,
+                        snapshot_id,
+                    )
                 }
             };
             // NB: the off-screen guard is applied per-delivery-path below (the
@@ -3352,7 +3394,7 @@ impl Tool for ClickTool {
 
                     let retained = state
                         .element_cache
-                        .get_element_retained(pid, hwnd, idx)
+                        .get_element_retained_for_snapshot(pid, hwnd, snapshot_id, idx)
                         .ok_or_else(|| {
                             anyhow::anyhow!("element [{idx}] is not in the UIA cache")
                         })?;
@@ -3403,7 +3445,7 @@ impl Tool for ClickTool {
                 let (cx, cy) = if !modifiers.is_empty() {
                     self.state
                         .element_cache
-                        .get_element_retained(pid, hwnd, idx)
+                        .get_element_retained_for_snapshot(pid, hwnd, snapshot_id, idx)
                         .and_then(|retained| {
                             retained.is_uia().then(|| unsafe {
                                 crate::uia::scroll::scroll_into_view_and_recenter(
@@ -3421,6 +3463,7 @@ impl Tool for ClickTool {
                     &self.state.element_cache,
                     pid,
                     hwnd,
+                    snapshot_id,
                     idx,
                     cx,
                     cy,
@@ -3464,8 +3507,15 @@ impl Tool for ClickTool {
             if delivery == DeliveryMode::Background
                 && (count > 1 || btn == "right" || btn == "middle")
             {
-                if let Some(r) =
-                    winui3_background_gesture(&self.state, pid, hwnd, Some(idx), count, &btn).await
+                if let Some(r) = winui3_background_gesture(
+                    &self.state,
+                    pid,
+                    hwnd,
+                    Some((snapshot_id, idx)),
+                    count,
+                    &btn,
+                )
+                .await
                 {
                     return r;
                 }
@@ -3519,7 +3569,14 @@ impl Tool for ClickTool {
                     && crate::input::is_chromium_target_window(hwnd)
                 {
                     let (cx, cy) = resolve_onscreen_point_with_scroll(
-                        &state_clone.element_cache, pid, hwnd, idx, cx, cy, "clicking",
+                        &state_clone.element_cache,
+                        pid,
+                        hwnd,
+                        snapshot_id,
+                        idx,
+                        cx,
+                        cy,
+                        "clicking",
                     )
                     .map_err(|result| anyhow::anyhow!(tool_result_text(result)))?;
                     return crate::input::inject_click_screen(hwnd, cx, cy, count, &btn)
@@ -3537,7 +3594,10 @@ impl Tool for ClickTool {
                     // is mid-flight (use-after-free → daemon crash). The guard
                     // lives to the end of this `if let` block, past every UIA
                     // pattern dispatch below; its Release fires when it drops.
-                    if let Some(element_guard) = state_clone.element_cache.get_element_retained(pid, hwnd, idx) {
+                    if let Some(element_guard) = state_clone
+                        .element_cache
+                        .get_element_retained_for_snapshot(pid, hwnd, snapshot_id, idx)
+                    {
                         let ptr = element_guard.as_ptr();
                         use windows::Win32::UI::Accessibility::{
                             IUIAutomationElement, IUIAutomationInvokePattern,
@@ -3631,6 +3691,7 @@ impl Tool for ClickTool {
                         &state_clone.element_cache,
                         pid,
                         hwnd,
+                        snapshot_id,
                         idx,
                         cx,
                         cy,
@@ -4007,15 +4068,18 @@ fn wait_for_cached_element_keyboard_focus(
     state: &ToolState,
     pid: u32,
     hwnd: u64,
+    snapshot_id: u32,
     element_index: usize,
     timeout: std::time::Duration,
 ) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if state
-            .element_cache
-            .element_has_keyboard_focus(pid, hwnd, element_index)
-            == Some(true)
+        if state.element_cache.element_has_keyboard_focus_for_snapshot(
+            pid,
+            hwnd,
+            snapshot_id,
+            element_index,
+        ) == Some(true)
         {
             return true;
         }
@@ -4035,6 +4099,7 @@ fn focus_cached_element_for_foreground(
     state: &ToolState,
     pid: u32,
     hwnd: u64,
+    snapshot_id: u32,
     element_index: usize,
     click_point: Option<(i32, i32)>,
 ) -> anyhow::Result<()> {
@@ -4044,12 +4109,16 @@ fn focus_cached_element_for_foreground(
     // which would make the enclosing verify-before-SendInput transaction
     // fail closed. The foreground route has already activated the exact HWND,
     // so focus the cached element directly and verify it below.
-    let set_focus = state.element_cache.focus_element(pid, hwnd, element_index);
+    let set_focus =
+        state
+            .element_cache
+            .focus_element_for_snapshot(pid, hwnd, snapshot_id, element_index);
     if set_focus.is_ok()
         && wait_for_cached_element_keyboard_focus(
             state,
             pid,
             hwnd,
+            snapshot_id,
             element_index,
             std::time::Duration::from_millis(350),
         )
@@ -4063,6 +4132,7 @@ fn focus_cached_element_for_foreground(
             state,
             pid,
             hwnd,
+            snapshot_id,
             element_index,
             std::time::Duration::from_millis(500),
         ) {
@@ -4191,7 +4261,7 @@ impl Tool for TypeTextTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "type_text",
         ) {
             Ok(r) => r,
@@ -4203,6 +4273,7 @@ impl Tool for TypeTextTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => None,
         };
+        let snapshot_id = resolved.snapshot_id();
         let hwnd_opt: Option<u64> = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => window_id
                 .map(|v| v as u64)
@@ -4287,11 +4358,13 @@ impl Tool for TypeTextTool {
             }
         };
         if let Some(idx) = elem_idx {
-            if let Some((cx, cy)) =
-                self.state
-                    .element_cache
-                    .get_element_center(pid, hwnd, idx as usize)
-            {
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+            if let Some((cx, cy)) = self.state.element_cache.get_element_center_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx as usize,
+            ) {
                 pin_overlay_above(&cursor_key, hwnd);
                 overlay_glide_to(&cursor_key, cx as f64, cy as f64).await;
                 self.state
@@ -4342,23 +4415,25 @@ impl Tool for TypeTextTool {
             // activation/focus/input transaction. The focus itself happens
             // only after exact top-level foreground is confirmed.
             let focus_target = if let Some(idx) = elem_idx {
-                let (cx, cy) =
-                    match self
-                        .state
-                        .element_cache
-                        .get_element_center(pid, hwnd, idx as usize)
-                    {
-                        Some(center) => center,
-                        None => {
-                            return ToolResult::error(format!(
+                let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+                let (cx, cy) = match self.state.element_cache.get_element_center_for_snapshot(
+                    pid,
+                    hwnd,
+                    snapshot_id,
+                    idx as usize,
+                ) {
+                    Some(center) => center,
+                    None => {
+                        return ToolResult::error(format!(
                         "Element {idx} not in cache for hwnd={hwnd}. Call get_window_state first."
                     ))
-                        }
-                    };
+                    }
+                };
                 let (cx, cy) = match resolve_onscreen_point_with_scroll(
                     &self.state.element_cache,
                     pid,
                     hwnd,
+                    snapshot_id,
                     idx as usize,
                     cx,
                     cy,
@@ -4367,7 +4442,7 @@ impl Tool for TypeTextTool {
                     Ok(point) => point,
                     Err(result) => return result,
                 };
-                Some((idx as usize, (cx, cy)))
+                Some((idx as usize, snapshot_id, (cx, cy)))
             } else {
                 None
             };
@@ -4375,8 +4450,15 @@ impl Tool for TypeTextTool {
             let state = self.state.clone();
             let r = tokio::task::spawn_blocking(move || {
                 crate::input::send_text_synthesized_after_focus(hwnd, &text_fg, || {
-                    if let Some((idx, point)) = focus_target {
-                        focus_cached_element_for_foreground(&state, pid, hwnd, idx, Some(point))?;
+                    if let Some((idx, snapshot_id, point)) = focus_target {
+                        focus_cached_element_for_foreground(
+                            &state,
+                            pid,
+                            hwnd,
+                            snapshot_id,
+                            idx,
+                            Some(point),
+                        )?;
                     }
                     Ok(())
                 })
@@ -4409,11 +4491,12 @@ impl Tool for TypeTextTool {
         // Only when an element_index is supplied (we have its cached center);
         // the focused-element path has no resolvable position to point at.
         if let Some(idx) = elem_idx {
-            if let Some((cx, cy)) =
-                self.state
-                    .element_cache
-                    .get_element_center(pid, hwnd, idx as usize)
-            {
+            if let Some((cx, cy)) = self.state.element_cache.get_element_center_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx as usize,
+            ) {
                 overlay_glide_to(&cursor_key, cx as f64, cy as f64).await;
                 crate::overlay::send_command(
                     cursor_key.clone(),
@@ -4441,14 +4524,29 @@ impl Tool for TypeTextTool {
         //    (most legacy Win32 EDITs consume WM_CHAR fine without focus steal).
         if let Some(idx) = elem_idx {
             let idx = idx as usize;
-            let state = self.state.clone();
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+            let element_guard = match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx,
+            ) {
+                Some(element) => element,
+                None => {
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "type_text",
+                        pid as i32,
+                        hwnd as u32,
+                        snapshot_id,
+                    )
+                }
+            };
             let text_for_uia = text.clone();
             let set_result = tokio::task::spawn_blocking(move || {
                 // Retain the element under the cache lock so a concurrent
                 // get_window_state snapshot-replace on the same (pid, hwnd)
                 // can't Release it to zero while this SetValue is in flight.
                 // The guard is held for the whole closure.
-                let element_guard = state.element_cache.get_element_retained(pid, hwnd, idx)?;
                 let ptr = element_guard.as_ptr();
                 use windows::core::{Interface, BSTR};
                 use windows::Win32::UI::Accessibility::{
@@ -4492,7 +4590,7 @@ impl Tool for TypeTextTool {
                 // return alone.
                 let state_rb = self.state.clone();
                 let verify = tokio::task::spawn_blocking(move || {
-                    let value = read_cached_element_value(&state_rb, pid, hwnd, idx);
+                    let value = read_cached_element_value(&state_rb, pid, hwnd, snapshot_id, idx);
                     classify_value_write_readback(value.as_deref(), &before, &expected)
                 })
                 .await
@@ -4586,6 +4684,7 @@ impl Tool for TypeTextTool {
         let text_for_post = text.clone();
         let verify_pid = pid;
         let verify_idx = elem_idx.map(|i| i as usize);
+        let verify_snapshot_id = snapshot_id;
         let state_rb = self.state.clone();
         let result = tokio::task::spawn_blocking(move || {
             // Prefer a focus-independent read of the *specific* cached element
@@ -4593,7 +4692,13 @@ impl Tool for TypeTextTool {
             // dependent) system focused element when typing into "whatever is
             // focused" with no element_index.
             let read = |idx: Option<usize>| match idx {
-                Some(i) => read_cached_element_value(&state_rb, verify_pid, hwnd, i),
+                Some(i) => read_cached_element_value(
+                    &state_rb,
+                    verify_pid,
+                    hwnd,
+                    verify_snapshot_id.expect("element targets carry snapshot identity"),
+                    i,
+                ),
                 None => read_focused_value_uia(verify_pid),
             };
             let before = read(verify_idx);
@@ -4780,13 +4885,22 @@ fn classify_value_write_readback(
 /// `None` if the index isn't cached or the element exposes no readable text
 /// pattern. Mirrors the cache-retain + `mem::forget` discipline of the
 /// ValuePattern.SetValue path so the cached COM ref isn't released.
-fn read_cached_element_value(state: &ToolState, pid: u32, hwnd: u64, idx: usize) -> Option<String> {
+fn read_cached_element_value(
+    state: &ToolState,
+    pid: u32,
+    hwnd: u64,
+    snapshot_id: u32,
+    idx: usize,
+) -> Option<String> {
     use windows::core::Interface;
     use windows::Win32::UI::Accessibility::{
         IUIAutomationElement, IUIAutomationTextPattern, IUIAutomationValuePattern,
         UIA_TextPatternId, UIA_ValuePatternId,
     };
-    let guard = state.element_cache.get_element_retained(pid, hwnd, idx)?;
+    let guard =
+        state
+            .element_cache
+            .get_element_retained_for_snapshot(pid, hwnd, snapshot_id, idx)?;
     let ptr = guard.as_ptr();
     let elem: IUIAutomationElement = unsafe { IUIAutomationElement::from_raw(ptr as *mut _) };
     let val = unsafe {
@@ -4947,7 +5061,7 @@ impl Tool for PressKeyTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "press_key",
         ) {
             Ok(r) => r,
@@ -4959,6 +5073,7 @@ impl Tool for PressKeyTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => None,
         };
+        let snapshot_id = resolved.snapshot_id();
         let hwnd_opt: Option<u64> = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => window_id
                 .map(|v| v as u64)
@@ -5033,6 +5148,28 @@ impl Tool for PressKeyTool {
             }
         };
 
+        let _element_snapshot_guard = if let Some(idx) = elem_idx {
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+            match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx as usize,
+            ) {
+                Some(element) => Some(element),
+                None => {
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "press_key",
+                        pid as i32,
+                        hwnd as u32,
+                        snapshot_id,
+                    )
+                }
+            }
+        } else {
+            None
+        };
+
         // Classify known background drops before touching UIA focus. Focusing
         // first made an honest Chromium refusal transiently activate the target.
         let event_kind = if mods.is_empty() {
@@ -5063,11 +5200,13 @@ impl Tool for PressKeyTool {
             None
         };
         if let Some(idx) = elem_idx.filter(|_| background_webview_focus) {
-            let Some((cx, cy)) =
-                self.state
-                    .element_cache
-                    .get_element_center(pid, hwnd, idx as usize)
-            else {
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+            let Some((cx, cy)) = self.state.element_cache.get_element_center_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx as usize,
+            ) else {
                 return ToolResult::error(format!(
                     "Element {idx} not in cache for hwnd={hwnd}. Call get_window_state first."
                 ));
@@ -5076,6 +5215,7 @@ impl Tool for PressKeyTool {
                 &self.state.element_cache,
                 pid,
                 hwnd,
+                snapshot_id,
                 idx as usize,
                 cx,
                 cy,
@@ -5110,10 +5250,16 @@ impl Tool for PressKeyTool {
                 return error;
             }
         } else if let Some(idx) = elem_idx.filter(|_| delivery != DeliveryMode::Foreground) {
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
             let state = self.state.clone();
             let focused = tokio::task::spawn_blocking(move || {
                 crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || {
-                    state.element_cache.focus_element(pid, hwnd, idx as usize)
+                    state.element_cache.focus_element_for_snapshot(
+                        pid,
+                        hwnd,
+                        snapshot_id,
+                        idx as usize,
+                    )
                 })
             })
             .await;
@@ -5136,18 +5282,28 @@ impl Tool for PressKeyTool {
         // goes via the plain background post path below.
         if !px_focus && delivery == DeliveryMode::Foreground {
             let focus_target = elem_idx.map(|idx| {
-                let point = self
-                    .state
-                    .element_cache
-                    .get_element_center(pid, hwnd, idx as usize);
-                (idx as usize, point)
+                let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+                let point = self.state.element_cache.get_element_center_for_snapshot(
+                    pid,
+                    hwnd,
+                    snapshot_id,
+                    idx as usize,
+                );
+                (idx as usize, snapshot_id, point)
             });
             let state = self.state.clone();
             let send_result = tokio::task::spawn_blocking(move || {
                 let m: Vec<&str> = mods.iter().map(String::as_str).collect();
                 crate::input::send_key_synthesized_after_focus(hwnd, &key, &m, || {
-                    if let Some((idx, point)) = focus_target {
-                        focus_cached_element_for_foreground(&state, pid, hwnd, idx, point)?;
+                    if let Some((idx, snapshot_id, point)) = focus_target {
+                        focus_cached_element_for_foreground(
+                            &state,
+                            pid,
+                            hwnd,
+                            snapshot_id,
+                            idx,
+                            point,
+                        )?;
                     }
                     Ok(())
                 })
@@ -5358,7 +5514,7 @@ impl Tool for HotkeyTool {
             args.opt_u64("element_index").map(|value| value as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|value| value as u32),
+            args.opt_u64("window_id"),
             "hotkey",
         ) {
             Ok(resolved) => resolved,
@@ -5370,6 +5526,7 @@ impl Tool for HotkeyTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => None,
         };
+        let snapshot_id = resolved.snapshot_id();
         let hwnd_opt = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => window_id
                 .map(|value| value as u64)
@@ -5403,6 +5560,28 @@ impl Tool for HotkeyTool {
                     }
                 }
             }
+        };
+
+        let _element_snapshot_guard = if let Some(idx) = elem_idx {
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+            match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx,
+            ) {
+                Some(element) => Some(element),
+                None => {
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "hotkey",
+                        pid as i32,
+                        hwnd as u32,
+                        snapshot_id,
+                    )
+                }
+            }
+        } else {
+            None
         };
 
         // Match Swift's text format exactly: `"✅ Pressed K1+K2+... on pid X."`
@@ -5545,16 +5724,29 @@ impl Tool for HotkeyTool {
         // chord even though the renderer control is focused.
         let use_send_input = delivery == DeliveryMode::Foreground;
         let focus_target = elem_idx.map(|idx| {
-            let point = self.state.element_cache.get_element_center(pid, hwnd, idx);
-            (idx, point)
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+            let point = self.state.element_cache.get_element_center_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx,
+            );
+            (idx, snapshot_id, point)
         });
         let state = self.state.clone();
         let result = tokio::task::spawn_blocking(move || {
             let m: Vec<&str> = mods.iter().map(String::as_str).collect();
             if use_send_input {
                 crate::input::send_key_synthesized_after_focus(hwnd, &key, &m, || {
-                    if let Some((idx, point)) = focus_target {
-                        focus_cached_element_for_foreground(&state, pid, hwnd, idx, point)?;
+                    if let Some((idx, snapshot_id, point)) = focus_target {
+                        focus_cached_element_for_foreground(
+                            &state,
+                            pid,
+                            hwnd,
+                            snapshot_id,
+                            idx,
+                            point,
+                        )?;
                     }
                     Ok(())
                 })
@@ -5642,18 +5834,19 @@ impl Tool for SetValueTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "set_value",
         ) {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (hwnd, idx) = match resolved {
+        let (hwnd, idx, snapshot_id) = match resolved {
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: Some(wid),
                 element_index,
+                snapshot_id,
                 ..
-            } => (wid as u64, element_index),
+            } => (wid as u64, element_index, snapshot_id),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: None, ..
             } => {
@@ -5688,7 +5881,11 @@ impl Tool for SetValueTool {
         // value, so a value write gets the same visual feedback as a click —
         // the viewer can see *where* the agent is acting. No-op when the
         // overlay is disabled or the element has no cached center.
-        if let Some((cx, cy)) = self.state.element_cache.get_element_center(pid, hwnd, idx) {
+        if let Some((cx, cy)) =
+            self.state
+                .element_cache
+                .get_element_center_for_snapshot(pid, hwnd, snapshot_id, idx)
+        {
             pin_overlay_above(&cursor_key, hwnd);
             overlay_glide_to(&cursor_key, cx as f64, cy as f64).await;
             crate::overlay::send_command(
@@ -5700,16 +5897,27 @@ impl Tool for SetValueTool {
             );
         }
 
-        let state = self.state.clone();
+        let element_guard = match self.state.element_cache.get_element_retained_for_snapshot(
+            pid,
+            hwnd,
+            snapshot_id,
+            idx,
+        ) {
+            Some(element) => element,
+            None => {
+                return cua_driver_core::element_token::stale_element_cache_result(
+                    "set_value",
+                    pid as i32,
+                    hwnd as u32,
+                    snapshot_id,
+                )
+            }
+        };
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             // Retain the element under the cache lock so a concurrent
             // get_window_state snapshot-replace on the same (pid, hwnd) can't
             // Release it to zero while this Value/RangeValue SetValue is in
             // flight. The guard is held for the whole closure.
-            let element_guard = state
-                .element_cache
-                .get_element_retained(pid, hwnd, idx)
-                .ok_or_else(|| anyhow::anyhow!("Element {idx} not in cache."))?;
             let ptr = element_guard.as_ptr();
             use windows::core::{Interface, BSTR};
             use windows::Win32::UI::Accessibility::{
@@ -5898,7 +6106,7 @@ impl Tool for ScrollTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "scroll",
         ) {
             Ok(r) => r,
@@ -5910,6 +6118,7 @@ impl Tool for ScrollTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => None,
         };
+        let snapshot_id = resolved.snapshot_id();
         let hwnd_opt: Option<u64> = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => window_id
                 .map(|v| v as u64)
@@ -5954,6 +6163,23 @@ impl Tool for ScrollTool {
             );
         }
         if let Some(idx) = elem_idx {
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+            let retained = match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx as usize,
+            ) {
+                Some(element) => element,
+                None => {
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "scroll",
+                        pid as i32,
+                        hwnd as u32,
+                        snapshot_id,
+                    )
+                }
+            };
             let prev_fg_addr = if delivery == DeliveryMode::Background {
                 Some(unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize
@@ -5968,13 +6194,8 @@ impl Tool for ScrollTool {
             } else {
                 None
             };
-            let state = self.state.clone();
             let direction_for_uia = direction.clone();
             let uia_result = tokio::task::spawn_blocking(move || {
-                let retained = state
-                    .element_cache
-                    .get_element_retained(pid, hwnd, idx as usize)
-                    .ok_or_else(|| anyhow::anyhow!("element [{idx}] is not in the UIA cache"))?;
                 if !retained.is_uia() {
                     anyhow::bail!("element [{idx}] is not a UIA scroll element");
                 }
@@ -6249,10 +6470,14 @@ fn winui3_uia_multi_invoke(
     state: &Arc<ToolState>,
     pid: u32,
     hwnd: u64,
+    snapshot_id: u32,
     idx: usize,
     count: usize,
 ) -> Option<anyhow::Result<()>> {
-    let guard = state.element_cache.get_element_retained(pid, hwnd, idx)?;
+    let guard =
+        state
+            .element_cache
+            .get_element_retained_for_snapshot(pid, hwnd, snapshot_id, idx)?;
     let ptr = guard.as_ptr();
     use windows::core::Interface;
     use windows::Win32::UI::Accessibility::{
@@ -6310,7 +6535,7 @@ async fn winui3_background_gesture(
     state: &Arc<ToolState>,
     pid: u32,
     hwnd: u64,
-    idx: Option<usize>,
+    element_target: Option<(u32, usize)>,
     count: usize,
     button: &str,
 ) -> Option<ToolResult> {
@@ -6322,10 +6547,10 @@ async fn winui3_background_gesture(
         return None;
     }
     if count >= 2 && button == "left" {
-        if let Some(idx) = idx {
+        if let Some((snapshot_id, idx)) = element_target {
             let st = state.clone();
             let uia = tokio::task::spawn_blocking(move || {
-                winui3_uia_multi_invoke(&st, pid, hwnd, idx, count)
+                winui3_uia_multi_invoke(&st, pid, hwnd, snapshot_id, idx, count)
             })
             .await
             .ok()
@@ -6405,7 +6630,7 @@ impl Tool for DoubleClickTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "double_click",
         ) {
             Ok(r) => r,
@@ -6417,6 +6642,7 @@ impl Tool for DoubleClickTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => None,
         };
+        let snapshot_id = resolved.snapshot_id();
         let hwnd_opt: Option<u64> = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => window_id
                 .map(|v| v as u64)
@@ -6469,18 +6695,28 @@ impl Tool for DoubleClickTool {
         };
 
         if let Some(idx) = elem_idx {
-            let (cx, cy) = match self.state.element_cache.get_element_center(pid, hwnd, idx) {
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+            let (cx, cy) = match self.state.element_cache.get_element_center_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx,
+            ) {
                 Some(v) => v,
                 None => {
-                    return ToolResult::error(format!(
-                        "Element {idx} not in cache for hwnd={hwnd}. Call get_window_state first."
-                    ))
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "double_click",
+                        pid as i32,
+                        hwnd as u32,
+                        snapshot_id,
+                    )
                 }
             };
             let (cx, cy) = match resolve_onscreen_point_with_scroll(
                 &self.state.element_cache,
                 pid,
                 hwnd,
+                snapshot_id,
                 idx,
                 cx,
                 cy,
@@ -6507,8 +6743,15 @@ impl Tool for DoubleClickTool {
             // swap. If the element has no InvokePattern, a background double-
             // click isn't expressible → structured error.
             if delivery == DeliveryMode::Background {
-                if let Some(r) =
-                    winui3_background_gesture(&self.state, pid, hwnd, Some(idx), 2, "left").await
+                if let Some(r) = winui3_background_gesture(
+                    &self.state,
+                    pid,
+                    hwnd,
+                    Some((snapshot_id, idx)),
+                    2,
+                    "left",
+                )
+                .await
                 {
                     return r;
                 }
@@ -6752,7 +6995,7 @@ impl Tool for RightClickTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "right_click",
         ) {
             Ok(r) => r,
@@ -6764,6 +7007,7 @@ impl Tool for RightClickTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => None,
         };
+        let snapshot_id = resolved.snapshot_id();
         let hwnd_opt: Option<u64> = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => window_id
                 .map(|v| v as u64)
@@ -6816,18 +7060,28 @@ impl Tool for RightClickTool {
         };
 
         if let Some(idx) = elem_idx {
-            let (cx, cy) = match self.state.element_cache.get_element_center(pid, hwnd, idx) {
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
+            let (cx, cy) = match self.state.element_cache.get_element_center_for_snapshot(
+                pid,
+                hwnd,
+                snapshot_id,
+                idx,
+            ) {
                 Some(v) => v,
                 None => {
-                    return ToolResult::error(format!(
-                        "Element {idx} not in cache for hwnd={hwnd}. Call get_window_state first."
-                    ))
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "right_click",
+                        pid as i32,
+                        hwnd as u32,
+                        snapshot_id,
+                    )
                 }
             };
             let (cx, cy) = match resolve_onscreen_point_with_scroll(
                 &self.state.element_cache,
                 pid,
                 hwnd,
+                snapshot_id,
                 idx,
                 cx,
                 cy,
@@ -6851,8 +7105,15 @@ impl Tool for RightClickTool {
             // fired), and the pen-barrel injector click-activates the frame.
             // Return the structured error (retry with delivery_mode:foreground).
             if delivery == DeliveryMode::Background {
-                if let Some(r) =
-                    winui3_background_gesture(&self.state, pid, hwnd, Some(idx), 1, "right").await
+                if let Some(r) = winui3_background_gesture(
+                    &self.state,
+                    pid,
+                    hwnd,
+                    Some((snapshot_id, idx)),
+                    1,
+                    "right",
+                )
+                .await
                 {
                     return r;
                 }

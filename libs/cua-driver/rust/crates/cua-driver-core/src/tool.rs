@@ -1561,7 +1561,6 @@ impl ToolRegistry {
 
         let mut result = tool.invoke(args.clone()).await;
         drop(pip_input_passthrough);
-        drop(lifecycle_dispatch);
         // The platform worker has exited, so another text operation for this
         // pid may now start even while result projection and evidence capture
         // finish for the completed call.
@@ -1701,8 +1700,12 @@ impl ToolRegistry {
                 png_bytes.is_some(),
                 runtime_session.is_some(),
             );
-            if let Some((window_id, pid)) = pip_exact_native_target(&args) {
+            if let Some((window_id, pid, logical_pid, delegation)) =
+                pip_native_target(resolved_name, &args, &result)
+            {
                 let target = pip_hook::PipHookTarget {
+                    logical_pid,
+                    delegation,
                     pid,
                     window_id,
                     session_id: runtime_session.clone(),
@@ -1722,6 +1725,13 @@ impl ToolRegistry {
                 }
             }
         }
+
+        // Keep the lifecycle episode admitted until its PiP publication has
+        // been enqueued. If end_session raced the tool, dropping this guard
+        // completes cleanup and enqueues removal only after the old episode's
+        // frame, preserving queue order even if the public session id is later
+        // revived for a new episode.
+        drop(lifecycle_dispatch);
 
         result
     }
@@ -2639,6 +2649,108 @@ fn pip_exact_native_target(args: &Value) -> Option<(u64, i64)> {
     nested
         .or_else(|| args.opt_u64("window_id").zip(args.opt_i64("pid")))
         .filter(|(window_id, pid)| *window_id > 0 && *pid > 0)
+}
+
+/// Resolve the physical window whose pixels a successful observation returned.
+///
+/// App-context observations intentionally omit `window_id` from their request,
+/// so their exact target exists only in structured output. A trusted transient
+/// observation keeps the host as its public action target but explicitly names
+/// the different `visual_target` that supplied the PNG; PiP follows that visual
+/// target rather than replacing the seed with a live stream of the host.
+fn pip_native_target(
+    tool_name: &str,
+    args: &Value,
+    result: &ToolResult,
+) -> Option<(u64, i64, Option<i64>, Option<pip_hook::PipHookDelegation>)> {
+    if tool_name == "get_window_state" && result.is_error != Some(true) {
+        if let Some(structured) = result.structured_content.as_ref() {
+            let actual = if structured.get("screenshot_target").and_then(Value::as_str)
+                == Some("transient_ui.visual_target")
+            {
+                structured.pointer("/transient_ui/visual_target")
+            } else {
+                Some(structured)
+            };
+            if let Some((window_id, pid)) = actual.and_then(|target| {
+                target
+                    .get("window_id")
+                    .and_then(Value::as_u64)
+                    .zip(target.get("pid").and_then(Value::as_i64))
+            }) {
+                if window_id > 0 && pid > 0 {
+                    let delegation =
+                        structured
+                            .pointer("/selection/delegation")
+                            .and_then(|delegation| {
+                                let host_pid = delegation.get("host_pid")?.as_i64()?;
+                                let panel_kind = delegation.get("panel_kind")?.as_str()?;
+                                let kind = delegation.get("kind")?.as_str()?;
+                                let exact_evidence = kind == "trusted_macos_open_save_panel"
+                                    && delegation.get("stable").and_then(Value::as_bool)
+                                        == Some(true)
+                                    && delegation.get("target_pid").and_then(Value::as_i64)
+                                        == Some(pid)
+                                    && delegation.get("target_window_id").and_then(Value::as_u64)
+                                        == Some(window_id)
+                                    && delegation.get("host_ax_reference").and_then(Value::as_bool)
+                                        == Some(true)
+                                    && delegation
+                                        .get("helper_identity_verified")
+                                        .and_then(Value::as_bool)
+                                        == Some(true)
+                                    && delegation
+                                        .get("helper_ax_window_verified")
+                                        .and_then(Value::as_bool)
+                                        == Some(true)
+                                    && delegation.get("helper_bundle_id").and_then(Value::as_str)
+                                        == Some("com.apple.appkit.xpc.openAndSavePanelService")
+                                    && matches!(panel_kind, "open" | "save")
+                                    && host_pid > 0;
+                                if !exact_evidence {
+                                    return None;
+                                }
+                                let identity =
+                                    structured.pointer("/selection/observed_identity")?;
+                                let expected_bundle_id = identity
+                                    .get("bundle_id")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                                    .map(str::to_owned);
+                                let expected_app_name = identity
+                                    .get("app_name")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                                    .map(str::to_owned);
+                                (expected_bundle_id.is_some() || expected_app_name.is_some()).then(
+                                    || pip_hook::PipHookDelegation {
+                                        kind: kind.to_owned(),
+                                        host_pid,
+                                        panel_kind: panel_kind.to_owned(),
+                                        expected_bundle_id,
+                                        expected_app_name,
+                                    },
+                                )
+                            });
+                    if structured.pointer("/selection/delegation").is_some() && delegation.is_none()
+                    {
+                        return None;
+                    }
+                    let logical_pid = delegation
+                        .as_ref()
+                        .map(|delegation| delegation.host_pid)
+                        .or_else(|| {
+                            structured
+                                .pointer("/transient_ui/host_pid")
+                                .and_then(Value::as_i64)
+                        })
+                        .filter(|logical_pid| *logical_pid > 0 && *logical_pid != pid);
+                    return Some((window_id, pid, logical_pid, delegation));
+                }
+            }
+        }
+    }
+    pip_exact_native_target(args).map(|(window_id, pid)| (window_id, pid, None, None))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5656,6 +5768,111 @@ mod capability_tests {
         assert_eq!(
             pip_exact_native_target(&serde_json::json!({"pid": 42})),
             None
+        );
+    }
+
+    #[test]
+    fn pip_uses_the_successful_observation_result_for_app_context_targets() {
+        let result = ToolResult {
+            structured_content: Some(serde_json::json!({
+                "pid": 42,
+                "window_id": 88,
+                "selection": {"mode": "app_context"}
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            pip_native_target(
+                "get_window_state",
+                &serde_json::json!({"pid": 42, "window_selection": "app_context"}),
+                &result
+            ),
+            Some((88, 42, None, None))
+        );
+    }
+
+    #[test]
+    fn pip_uses_the_visual_target_for_transient_observation_pixels() {
+        let result = ToolResult {
+            structured_content: Some(serde_json::json!({
+                "pid": 42,
+                "window_id": 7,
+                "screenshot_target": "transient_ui.visual_target",
+                "transient_ui": {
+                    "host_pid": 42,
+                    "visual_target": {"pid": 900, "window_id": 99}
+                }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            pip_native_target(
+                "get_window_state",
+                &serde_json::json!({"pid": 42, "window_id": 7}),
+                &result
+            ),
+            Some((99, 900, Some(42), None))
+        );
+    }
+
+    #[test]
+    fn pip_keeps_exact_argument_fallback_for_existing_observers() {
+        assert_eq!(
+            pip_native_target(
+                "get_window_state",
+                &serde_json::json!({"pid": 42, "window_id": 77}),
+                &ToolResult::default()
+            ),
+            Some((77, 42, None, None))
+        );
+    }
+
+    #[test]
+    fn pip_separates_delegated_app_context_host_from_helper_capture_target() {
+        let result = ToolResult {
+            structured_content: Some(serde_json::json!({
+                "pid": 900,
+                "window_id": 99,
+                "selection": {
+                    "mode": "app_context",
+                    "observed_identity": {
+                        "bundle_id": "com.example.host",
+                        "app_name": "Host"
+                    },
+                    "delegation": {
+                        "kind": "trusted_macos_open_save_panel",
+                        "stable": true,
+                        "host_pid": 42,
+                        "target_pid": 900,
+                        "target_window_id": 99,
+                        "panel_kind": "open",
+                        "host_ax_reference": true,
+                        "helper_identity_verified": true,
+                        "helper_ax_window_verified": true,
+                        "helper_bundle_id": "com.apple.appkit.xpc.openAndSavePanelService"
+                    }
+                }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            pip_native_target(
+                "get_window_state",
+                &serde_json::json!({"pid": 42, "window_selection": "app_context"}),
+                &result
+            ),
+            Some((
+                99,
+                900,
+                Some(42),
+                Some(pip_hook::PipHookDelegation {
+                    kind: "trusted_macos_open_save_panel".to_owned(),
+                    host_pid: 42,
+                    panel_kind: "open".to_owned(),
+                    expected_bundle_id: Some("com.example.host".to_owned()),
+                    expected_app_name: Some("Host".to_owned()),
+                })
+            ))
         );
     }
 

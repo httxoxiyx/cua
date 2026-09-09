@@ -71,39 +71,54 @@ impl Tool for TypeTextCharsTool {
         let delay_ms = args.u64_or("delay_ms", 30);
         // Surface 6: element_token / element_index precedence resolution.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg_u64 = args.opt_u64("window_id");
+        let window_id_arg = match args.opt_u32("window_id") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
+            window_id_arg_u64,
             "type_text_chars",
         ) {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg),
+        let (element_index, window_id, snapshot_id) = match resolved {
+            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg, None),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: wid,
                 element_index: idx,
+                snapshot_id,
                 via_token: _,
-            } => (Some(idx), wid),
+            } => (Some(idx), wid, Some(snapshot_id)),
         };
         let type_chars_only = args.bool_or("type_chars_only", false);
 
         // Retain the addressed element (if any) so a concurrent
         // get_window_state can't free it during the gate/focus below
         // (use-after-free → daemon crash). Guard lives past the focus call.
-        let element_guard = if let (Some(idx), Some(wid)) = (element_index, window_id) {
-            match self.state.element_cache.get_element_retained(pid, wid, idx) {
+        let element_guard = if let (Some(idx), Some(wid), Some(snapshot_id)) =
+            (element_index, window_id, snapshot_id)
+        {
+            match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                wid,
+                snapshot_id,
+                idx,
+            ) {
                 Some(guard) => Some(guard),
                 None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found. Call get_window_state first."
-                    ));
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "type_text_chars",
+                        pid,
+                        wid,
+                        snapshot_id,
+                    );
                 }
             }
         } else {

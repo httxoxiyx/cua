@@ -84,6 +84,7 @@ impl Tool for DoubleClickTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let app_context_route = crate::ax::app_context::delegation_route_from_args(&args);
         // delivery_mode: foreground briefly fronts the window before the pixel
         // double-click (the explicit last resort for surfaces that drop
         // background CGEvents), via the same skylight assist click uses.
@@ -92,26 +93,31 @@ impl Tool for DoubleClickTool {
         // Surface 6: token / index precedence — see click.rs for the
         // canonical comment.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg_u64 = args.opt_u64("window_id");
+        let window_id_arg = match args.opt_u32("window_id") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
+            window_id_arg_u64,
             "double_click",
         ) {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg),
+        let (element_index, window_id, snapshot_id) = match resolved {
+            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg, None),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: wid,
                 element_index: idx,
+                snapshot_id,
                 via_token: _,
-            } => (Some(idx), wid),
+            } => (Some(idx), wid, Some(snapshot_id)),
         };
         if let Err(refusal) = super::guard_same_pid_transient_target(pid, window_id).await {
             return refusal;
@@ -125,18 +131,36 @@ impl Tool for DoubleClickTool {
         }
 
         // ── AX element path ──────────────────────────────────────────────────
-        if let (Some(idx), Some(wid)) = (element_index, window_id) {
+        if let (Some(idx), Some(wid), Some(snapshot_id)) = (element_index, window_id, snapshot_id) {
             // Retain out of the cache so a concurrent get_window_state can't
             // free the element mid-action (use-after-free → daemon crash).
-            let element_guard = match self.state.element_cache.get_element_retained(pid, wid, idx) {
+            let element_guard = match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                wid,
+                snapshot_id,
+                idx,
+            ) {
                 Some(e) => e,
                 None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found. Call get_window_state first."
-                    ))
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "double_click",
+                        pid,
+                        wid,
+                        snapshot_id,
+                    )
                 }
             };
             let element_ptr = element_guard.as_ptr();
+            if unsafe {
+                super::ensure_app_context_element_window(
+                    app_context_route.as_ref(),
+                    element_ptr as AXUIElementRef,
+                )
+            }
+            .is_err()
+            {
+                return super::app_context_delegation_stale_refusal();
+            }
 
             // Choose one background actuator before dispatch. An element that
             // advertises AXOpen uses the exact semantic route; all other
@@ -166,12 +190,22 @@ impl Tool for DoubleClickTool {
             let ck = cursor_key.clone();
             let foreground = delivery_mode.is_foreground();
             let prior_front = crate::apps::frontmost_pid();
+            let ax_app_context_route = app_context_route.clone();
             let result = crate::focus_guard::with_focus_suppressed(
                 if foreground { None } else { Some(pid) },
                 prior_front,
                 "double_click.AX",
                 || async move {
                     tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                        super::ensure_app_context_delegation_live(
+                            ax_app_context_route.as_ref(),
+                        )?;
+                        unsafe {
+                            super::ensure_app_context_element_window(
+                                ax_app_context_route.as_ref(),
+                                element_ptr as AXUIElementRef,
+                            )?;
+                        }
                         if !foreground {
                             return ax_double_click(
                                 pid,
@@ -185,8 +219,11 @@ impl Tool for DoubleClickTool {
                         }
 
                         let mut outcome = None;
-                        let fronted =
-                            crate::input::skylight::with_foreground_assist(pid, wid, || {
+                        let fronted = crate::input::skylight::with_foreground_assist_delegated(
+                            pid,
+                            wid,
+                            ax_app_context_route,
+                            || {
                                 outcome = Some(ax_double_click(
                                     pid,
                                     wid,
@@ -197,7 +234,8 @@ impl Tool for DoubleClickTool {
                                     true,
                                 )?);
                                 Ok(())
-                            })?;
+                            },
+                        )?;
                         let mut message = outcome.ok_or_else(|| {
                             anyhow::anyhow!("foreground double-click did not execute")
                         })?;
@@ -310,12 +348,14 @@ impl Tool for DoubleClickTool {
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
         let prior_front = crate::apps::frontmost_pid();
+        let pixel_app_context_route = app_context_route.clone();
         let result = crate::focus_guard::with_focus_suppressed(
             if fg { None } else { Some(pid) },
             prior_front,
             "double_click.pixel",
             || async move {
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    super::ensure_app_context_delegation_live(pixel_app_context_route.as_ref())?;
                     let do_click = move || -> anyhow::Result<()> {
                         if let Some(wid) = window_id {
                             crate::input::mouse::click_at_xy_with_window_local(
@@ -337,9 +377,10 @@ impl Tool for DoubleClickTool {
                     // Foreground rung: brief front → double-click → restore prior frontmost.
                     match (fg, window_id) {
                         (true, Some(wid)) => {
-                            crate::input::skylight::with_foreground_assist(
+                            crate::input::skylight::with_foreground_assist_delegated(
                                 pid as libc::pid_t,
                                 wid,
+                                pixel_app_context_route,
                                 do_click,
                             )?;
                             Ok(())

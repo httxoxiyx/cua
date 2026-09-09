@@ -12,7 +12,9 @@
 //! - Tree is walked depth-first; element_index is assigned in DFS order.
 
 use super::bindings::*;
-use super::window_scope::{decide_window_scope, TopLevelCandidate, WindowScope};
+use super::window_scope::{
+    decide_window_scope, decide_window_scope_strict, TopLevelCandidate, WindowScope,
+};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 
 /// Default maximum depth for AX tree walks. Deep menus and complex web views
@@ -150,9 +152,9 @@ pub struct TreeWalkResult {
 
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
 ///
-/// `window_id` — when Some, only the AXWindow matching that CGWindowID is
-/// walked (plus non-window children like the menu bar). When None, all
-/// top-level children are walked.
+/// `window_id` — when Some, only the window-like AX element matching that
+/// CGWindowID is walked (plus permitted non-window children like the menu bar).
+/// When None, all top-level children are walked.
 ///
 /// Key background-app fix: at the application root we union `AXChildren`
 /// and `AXWindows`. macOS only puts windows in `AXChildren` when the app
@@ -186,6 +188,30 @@ pub fn walk_tree_bounded(
     query: Option<&str>,
     max_elements: usize,
     max_depth: usize,
+) -> TreeWalkResult {
+    walk_tree_bounded_with_projection(pid, window_id, query, max_elements, max_depth, false)
+}
+
+/// Walk one exact native window without inheriting sibling top-level AX
+/// surfaces. Reserved for a verified delegated Open/Save panel whose helper
+/// process may simultaneously host panels for other applications.
+pub fn walk_tree_bounded_strict_window(
+    pid: i32,
+    window_id: u32,
+    query: Option<&str>,
+    max_elements: usize,
+    max_depth: usize,
+) -> TreeWalkResult {
+    walk_tree_bounded_with_projection(pid, Some(window_id), query, max_elements, max_depth, true)
+}
+
+fn walk_tree_bounded_with_projection(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_elements: usize,
+    max_depth: usize,
+    strict_exact_window: bool,
 ) -> TreeWalkResult {
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
@@ -258,9 +284,9 @@ pub fn walk_tree_bounded(
                     let role = copy_string_attr(child, "AXRole").unwrap_or_default();
                     let subrole = copy_string_attr(child, "AXSubrole");
                     let identifier = copy_string_attr(child, "AXIdentifier");
-                    // Match AX window element → CGWindowID via private SPI.
-                    // Only windows carry one, so skip the round-trip elsewhere.
-                    let ax_window_id = if role == "AXWindow" {
+                    // Match AX window/sheet element → CGWindowID via private
+                    // SPI. Skip the round-trip for unrelated top-level roles.
+                    let ax_window_id = if matches!(role.as_str(), "AXWindow" | "AXSheet") {
                         ax_get_window_id(child)
                     } else {
                         None
@@ -273,9 +299,15 @@ pub fn walk_tree_bounded(
                     }
                 })
                 .collect();
-            let decision = decide_window_scope(&candidates, wid, || {
-                crate::windows::resolve_window_owner(pid, wid)
-            });
+            let decision = if strict_exact_window {
+                decide_window_scope_strict(&candidates, wid, || {
+                    crate::windows::resolve_window_owner(pid, wid)
+                })
+            } else {
+                decide_window_scope(&candidates, wid, || {
+                    crate::windows::resolve_window_owner(pid, wid)
+                })
+            };
             let walk = decision
                 .walk
                 .iter()

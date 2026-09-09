@@ -12,8 +12,10 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "list_windows".into(),
-        description: "List all layer-0 top-level windows currently known to WindowServer. \
+        description: "List public layer-0 top-level windows currently known to WindowServer. \
             Includes off-screen windows (minimized, on another Space, hidden-launched). \
+            Private trusted system helpers such as the AppKit Open/Save panel service are omitted; \
+            observe those only through the original host application's app_context. \
             Use this to find a window_id before calling get_window_state.\n\n\
             Per-record fields: window_id, pid, app_name, title, bounds \
             (x/y/width/height, top-left origin), z_index (integer or null; higher values are \
@@ -83,6 +85,20 @@ impl Tool for ListWindowsTool {
         let current_space_id = enumeration.current_space_id;
         let mut windows = enumeration.windows;
 
+        // The AppKit Open/Save XPC service is an implementation detail, not a
+        // public application/window target. Use the cheap bundle/path/name
+        // predicate here; full signature and AX validation belongs only to an
+        // app-context observation that can establish the host relationship.
+        let mut helper_pids = std::collections::HashMap::new();
+        windows = filter_private_helper_windows(windows, |window| {
+            *helper_pids.entry(window.pid).or_insert_with(|| {
+                crate::ax::app_context::hide_open_save_panel_from_inventory(
+                    window.pid,
+                    &window.app_name,
+                )
+            })
+        });
+
         if let Some(pid) = pid_filter {
             windows.retain(|w| w.pid == pid);
         }
@@ -142,6 +158,16 @@ impl Tool for ListWindowsTool {
             }),
         )
     }
+}
+
+pub(super) fn filter_private_helper_windows(
+    windows: Vec<crate::windows::WindowInfo>,
+    mut is_private_helper: impl FnMut(&crate::windows::WindowInfo) -> bool,
+) -> Vec<crate::windows::WindowInfo> {
+    windows
+        .into_iter()
+        .filter(|window| !is_private_helper(window))
+        .collect()
 }
 
 fn lifecycle_evidence_json(evidence: crate::ax::exact_target::AxWindowLifecycleEvidence) -> Value {
@@ -224,6 +250,35 @@ pub(super) fn window_record_json(w: &crate::windows::WindowInfo) -> Value {
 mod tests {
     use super::*;
     use crate::ax::exact_target::AxWindowLifecycleEvidence;
+
+    fn window(window_id: u32, pid: i32, app_name: &str) -> crate::windows::WindowInfo {
+        crate::windows::WindowInfo {
+            window_id,
+            pid,
+            app_name: app_name.into(),
+            title: "Document".into(),
+            bounds: crate::windows::WindowBounds {
+                x: 1.0,
+                y: 2.0,
+                width: 300.0,
+                height: 200.0,
+            },
+            layer: 0,
+            z_index: 7,
+            is_on_screen: true,
+            current_space_id: Some(1),
+            on_current_space: Some(true),
+            space_ids: Some(vec![1]),
+        }
+    }
+
+    #[test]
+    fn private_helper_windows_are_removed_from_public_inventory() {
+        let windows = vec![window(1, 10, "Editor"), window(2, 20, "Private Helper")];
+        let public = filter_private_helper_windows(windows, |window| window.pid == 20);
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].window_id, 1);
+    }
 
     #[test]
     fn window_record_includes_observed_z_index() {

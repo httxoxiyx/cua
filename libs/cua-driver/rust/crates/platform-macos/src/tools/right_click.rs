@@ -87,6 +87,7 @@ impl Tool for RightClickTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let app_context_route = crate::ax::app_context::delegation_route_from_args(&args);
         // delivery_mode: foreground briefly fronts the window before the pixel
         // right-click (the explicit last resort for surfaces that drop
         // background CGEvents), via the same skylight assist click uses. The AX
@@ -96,26 +97,31 @@ impl Tool for RightClickTool {
 
         // Surface 6: element_token / element_index precedence resolution.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg_u64 = args.opt_u64("window_id");
+        let window_id_arg = match args.opt_u32("window_id") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
+            window_id_arg_u64,
             "right_click",
         ) {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg),
+        let (element_index, window_id, snapshot_id) = match resolved {
+            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg, None),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: wid,
                 element_index: idx,
+                snapshot_id,
                 via_token: _,
-            } => (Some(idx), wid),
+            } => (Some(idx), wid, Some(snapshot_id)),
         };
         let x = args.opt_f64("x");
         let y = args.opt_f64("y");
@@ -149,18 +155,36 @@ impl Tool for RightClickTool {
         }
 
         // ── AX element path ──────────────────────────────────────────────────
-        if let (Some(idx), Some(wid)) = (element_index, window_id) {
+        if let (Some(idx), Some(wid), Some(snapshot_id)) = (element_index, window_id, snapshot_id) {
             // Retain out of the cache so a concurrent get_window_state can't
             // free the element mid-action (use-after-free → daemon crash).
-            let element_guard = match self.state.element_cache.get_element_retained(pid, wid, idx) {
+            let element_guard = match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                wid,
+                snapshot_id,
+                idx,
+            ) {
                 Some(e) => e,
                 None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found. Call get_window_state first."
-                    ))
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "right_click",
+                        pid,
+                        wid,
+                        snapshot_id,
+                    )
                 }
             };
             let element_ptr = element_guard.as_ptr();
+            if unsafe {
+                super::ensure_app_context_element_window(
+                    app_context_route.as_ref(),
+                    element_ptr as AXUIElementRef,
+                )
+            }
+            .is_err()
+            {
+                return super::app_context_delegation_stale_refusal();
+            }
 
             let _mutation_lease = match super::gate_background_window_action(
                 pid,
@@ -175,13 +199,23 @@ impl Tool for RightClickTool {
             };
 
             let prior_front = crate::apps::frontmost_pid();
+            let ax_app_context_route = app_context_route.clone();
             let result = crate::focus_guard::with_focus_suppressed(
                 Some(pid),
                 prior_front,
                 "right_click.AX",
                 || async move {
-                    tokio::task::spawn_blocking(move || ax_show_menu(element_ptr, idx, pid, wid))
-                        .await
+                    tokio::task::spawn_blocking(move || {
+                        super::ensure_app_context_delegation_live(ax_app_context_route.as_ref())?;
+                        unsafe {
+                            super::ensure_app_context_element_window(
+                                ax_app_context_route.as_ref(),
+                                element_ptr as AXUIElementRef,
+                            )?;
+                        }
+                        ax_show_menu(element_ptr, idx, pid, wid)
+                    })
+                    .await
                 },
             )
             .await;
@@ -282,6 +316,7 @@ impl Tool for RightClickTool {
             "right_click.pixel",
             || async move {
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
                     let do_it = move || -> anyhow::Result<()> {
                         let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                         if let Some(wid) = window_id {
@@ -301,9 +336,10 @@ impl Tool for RightClickTool {
                     // Foreground rung: brief front → right-click → restore prior frontmost.
                     match (fg, window_id) {
                         (true, Some(wid)) => {
-                            crate::input::skylight::with_foreground_assist(
+                            crate::input::skylight::with_foreground_assist_delegated(
                                 pid as libc::pid_t,
                                 wid,
+                                app_context_route,
                                 do_it,
                             )?;
                             Ok(())

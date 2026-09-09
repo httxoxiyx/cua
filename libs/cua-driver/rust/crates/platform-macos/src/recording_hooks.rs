@@ -59,7 +59,12 @@ pub fn app_state_json_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Ve
 /// (pid, window_id). `element_screen_center` returns SCREEN points; convert
 /// by subtracting the window's screen origin and multiplying by the
 /// screenshot's pixels-per-point scale.
-pub fn element_window_local_xy(window_id: u64, pid: i64, element_index: u32) -> Option<(f64, f64)> {
+pub fn element_window_local_xy(
+    window_id: u64,
+    pid: i64,
+    snapshot_id: u32,
+    element_index: u32,
+) -> Option<(f64, f64)> {
     let runtime_scope =
         cua_driver_core::tool::current_dispatch_runtime_scope().unwrap_or_else(|| "legacy".into());
     let cache = ELEMENT_CACHES
@@ -72,7 +77,12 @@ pub fn element_window_local_xy(window_id: u64, pid: i64, element_index: u32) -> 
     let window_id_u32 = u32::try_from(window_id).ok()?;
     // Retain so a concurrent get_window_state can't free the element between
     // the lookup and element_screen_center (use-after-free → daemon crash).
-    let element = cache.get_element_retained(pid_i32, window_id_u32, element_index as usize)?;
+    let element = cache.get_element_retained_for_snapshot(
+        pid_i32,
+        window_id_u32,
+        snapshot_id,
+        element_index as usize,
+    )?;
     let (sx, sy) = unsafe { element_screen_center(element.as_ptr() as AXUIElementRef)? };
 
     // Same frame resolution the pixel action rungs use (origin + Retina scale

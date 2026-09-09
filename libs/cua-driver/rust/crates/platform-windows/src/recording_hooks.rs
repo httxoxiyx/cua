@@ -113,7 +113,12 @@ pub fn app_state_json_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Ve
 }
 
 #[cfg(target_os = "windows")]
-pub fn element_window_local_xy(window_id: u64, pid: i64, element_index: u32) -> Option<(f64, f64)> {
+pub fn element_window_local_xy(
+    window_id: u64,
+    pid: i64,
+    snapshot_id: u32,
+    element_index: u32,
+) -> Option<(f64, f64)> {
     let runtime_scope =
         cua_driver_core::tool::current_dispatch_runtime_scope().unwrap_or_else(|| "legacy".into());
     let cache = ELEMENT_CACHES
@@ -123,7 +128,12 @@ pub fn element_window_local_xy(window_id: u64, pid: i64, element_index: u32) -> 
         .get(&runtime_scope)?
         .upgrade()?;
     let pid_u32 = u32::try_from(pid).ok()?;
-    let (sx, sy) = cache.get_element_center(pid_u32, window_id, element_index as usize)?;
+    let (sx, sy) = cache.get_element_center_for_snapshot(
+        pid_u32,
+        window_id,
+        snapshot_id,
+        element_index as usize,
+    )?;
     // The cached center is in SCREEN coords. Convert to window-local pixel
     // coords by subtracting the window's screen origin (GetWindowRect-equivalent
     // in WindowInfo). Windows captures at logical pixels so no scale factor.
@@ -148,6 +158,7 @@ pub fn screenshot_for_recording(_window_id: Option<u64>, _pid: Option<i64>) -> S
 pub fn element_window_local_xy(
     _window_id: u64,
     _pid: i64,
+    _snapshot_id: u32,
     _element_index: u32,
 ) -> Option<(f64, f64)> {
     None

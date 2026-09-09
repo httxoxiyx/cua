@@ -337,6 +337,7 @@ impl Tool for ClickTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let app_context_route = crate::ax::app_context::delegation_route_from_args(&args);
         // Resolve this action's cursor key so its click-pulse / glide land on
         // the calling session's cursor, not the shared "default" one.
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
@@ -346,26 +347,33 @@ impl Tool for ClickTool {
         // stale token returns an explicit error instead of silently
         // falling back to the integer (Surface 6 hard constraint).
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg_u64 = args.opt_u64("window_id");
+        let window_id_arg = match args.opt_u32("window_id") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
+            window_id_arg_u64,
             "click",
         ) {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id, _via_token) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg, false),
+        let (element_index, window_id, snapshot_id, _via_token) = match resolved {
+            cua_driver_core::element_token::ResolvedElement::None => {
+                (None, window_id_arg, None, false)
+            }
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: wid,
                 element_index: idx,
+                snapshot_id,
                 via_token,
-            } => (Some(idx), wid, via_token),
+            } => (Some(idx), wid, Some(snapshot_id), via_token),
         };
         let x = args
             .opt_f64("x")
@@ -435,22 +443,39 @@ impl Tool for ClickTool {
             return refusal;
         }
 
-        if let (Some(idx), Some(wid)) = (element_index, window_id) {
+        if let (Some(idx), Some(wid), Some(snapshot_id)) = (element_index, window_id, snapshot_id) {
             // ── AX element path ────────────────────────────────────────────
             // Retain the element out of the cache so it can't be freed by a
             // concurrent get_window_state on the same (pid, window_id) while
             // this click is mid-flight (use-after-free → daemon crash). The
             // guard lives to the end of this method, past the AX action below.
-            let element_guard = match self.state.element_cache.get_element_retained(pid, wid, idx) {
+            let element_guard = match self.state.element_cache.get_element_retained_for_snapshot(
+                pid,
+                wid,
+                snapshot_id,
+                idx,
+            ) {
                 Some(e) => e,
                 None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found in cache for pid={pid} window_id={wid}. \
-                     Call get_window_state first."
-                    ))
+                    return cua_driver_core::element_token::stale_element_cache_result(
+                        "click",
+                        pid,
+                        wid,
+                        snapshot_id,
+                    )
                 }
             };
             let element_ptr = element_guard.as_ptr();
+            if unsafe {
+                super::ensure_app_context_element_window(
+                    app_context_route.as_ref(),
+                    element_ptr as AXUIElementRef,
+                )
+            }
+            .is_err()
+            {
+                return super::app_context_delegation_stale_refusal();
+            }
 
             // ── Exact-target background gate (macOS background input v1) ──
             // The element branch is semantic AX delivery, except button=middle
@@ -519,16 +544,31 @@ impl Tool for ClickTool {
 
                 let mods_owned = modifiers.clone();
                 let foreground = delivery_mode.is_foreground();
+                let middle_app_context_route = app_context_route.clone();
                 let result = tokio::task::spawn_blocking(move || {
+                    super::ensure_app_context_delegation_live(
+                        middle_app_context_route.as_ref(),
+                    )?;
+                    unsafe {
+                        super::ensure_app_context_element_window(
+                            middle_app_context_route.as_ref(),
+                            element_ptr as AXUIElementRef,
+                        )?;
+                    }
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                    if foreground && !m.is_empty() {
-                        crate::input::skylight::with_foreground_hid_activation(
+                    if foreground {
+                        crate::input::skylight::with_foreground_hid_activation_delegated(
                             pid as libc::pid_t,
                             wid,
+                            middle_app_context_route,
                             || {
-                                crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
-                                    cx, cy, 1, "middle", &m,
-                                )
+                                if m.is_empty() {
+                                    crate::input::mouse::middle_click_at_xy(pid, cx, cy, &m)
+                                } else {
+                                    crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
+                                        cx, cy, 1, "middle", &m,
+                                    )
+                                }
                             },
                         )
                     } else {
@@ -643,6 +683,7 @@ impl Tool for ClickTool {
             // and stomp default for a non-default session).
             let ck = cursor_key.clone();
             let selection_modifiers = modifiers.clone();
+            let ax_app_context_route = app_context_route.clone();
             let result = focus_guard::with_focus_suppressed(
                 // The observation snapshot owns the canonical target-only
                 // lease; foreground delivery owns its activation.
@@ -651,6 +692,13 @@ impl Tool for ClickTool {
                 "click.AXPress",
                 || async move {
                     tokio::task::spawn_blocking(move || {
+                        super::ensure_app_context_delegation_live(ax_app_context_route.as_ref())?;
+                        unsafe {
+                            super::ensure_app_context_element_window(
+                                ax_app_context_route.as_ref(),
+                                element_ptr as AXUIElementRef,
+                            )?;
+                        }
                         if foreground {
                             let mut outcome = None;
                             let has_modifiers = !selection_modifiers.is_empty();
@@ -671,16 +719,18 @@ impl Tool for ClickTool {
                                 Ok(())
                             };
                             let fronted = if has_modifiers {
-                                crate::input::skylight::with_foreground_hid_activation(
+                                crate::input::skylight::with_foreground_hid_activation_delegated(
                                     pid as libc::pid_t,
                                     wid,
+                                    ax_app_context_route,
                                     action,
                                 )?;
                                 true
                             } else {
-                                crate::input::skylight::with_foreground_assist(
+                                crate::input::skylight::with_foreground_assist_delegated(
                                     pid as libc::pid_t,
                                     wid,
+                                    ax_app_context_route,
                                     action,
                                 )?
                             };
@@ -1102,6 +1152,7 @@ impl Tool for ClickTool {
             // button != left. Left-button path stays on the existing Chromium-
             // routed `click_at_xy_with_window_local` for back-compat.
             let button_kind = button_str.clone();
+            let pixel_app_context_route = app_context_route.clone();
             let result = focus_guard::with_focus_suppressed(
                 // The observation snapshot owns the canonical target-only
                 // lease, including synthetic target-focus delivery.
@@ -1110,6 +1161,9 @@ impl Tool for ClickTool {
                 "click.pixel",
                 || async move {
                     tokio::task::spawn_blocking(move || {
+                        super::ensure_app_context_delegation_live(
+                            pixel_app_context_route.as_ref(),
+                        )?;
                         let do_click = move || -> anyhow::Result<()> {
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                             if fg {
@@ -1167,9 +1221,10 @@ impl Tool for ClickTool {
                         // reported `path` honestly reflects the rung that ran.
                         match (fg, window_id) {
                             (true, Some(wid)) => {
-                                crate::input::skylight::with_foreground_hid_activation(
+                                crate::input::skylight::with_foreground_hid_activation_delegated(
                                     pid as libc::pid_t,
                                     wid,
+                                    pixel_app_context_route,
                                     do_click,
                                 )
                                 .map(|_| true)

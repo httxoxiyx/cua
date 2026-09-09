@@ -79,10 +79,11 @@ struct SnapshotEntry {
     /// this so tools can verify the caller's `window_id` arg matches —
     /// a token-only call doesn't have to pass window_id at all.
     window_id: u32,
-    /// Maximum element_index that was assigned in this snapshot. The
-    /// resolver rejects out-of-range tokens up-front instead of waiting
-    /// for the per-platform cache to NPE.
-    max_element_index: usize,
+    /// Exclusive upper bound of the element-index space represented by this
+    /// snapshot. Dense trees pass their element count; window-scoped trees
+    /// with application-wide sparse indices pass `max(element_index) + 1`.
+    /// The platform cache remains authoritative for holes within that range.
+    element_index_capacity: usize,
 }
 
 /// Process-global token registry. Thread-safe; tools resolve from any
@@ -107,14 +108,19 @@ impl TokenRegistry {
     /// token strings emitted alongside `element_index` in the structured
     /// `elements` array.
     ///
-    /// `element_count` is the number of actionable elements in the
-    /// snapshot (the count of nodes that received an `element_index`).
-    /// Used for up-front range checks on `resolve`.
+    /// `element_index_capacity` is the exclusive upper bound of valid element
+    /// indices. For dense snapshots this is the actionable-element count; for
+    /// sparse snapshots it is `max(element_index) + 1`.
     ///
     /// Side effect: if this pid already has [`LRU_CAP_PER_PID`] snapshots
     /// in its lane, the oldest is evicted and any token that referenced
     /// it becomes stale — that's the contract.
-    pub fn register_snapshot(&self, pid: i32, window_id: u32, element_count: usize) -> u32 {
+    pub fn register_snapshot(
+        &self,
+        pid: i32,
+        window_id: u32,
+        element_index_capacity: usize,
+    ) -> u32 {
         // Keep the full 32-bit counter. Truncating to 16 bits repeats an id
         // every 65,536 process-global snapshots. A long-lived daemon can then
         // mint an id that still exists in another runtime/pid lane, allowing a
@@ -131,7 +137,7 @@ impl TokenRegistry {
         lane.push(SnapshotEntry {
             snapshot_id: id,
             window_id,
-            max_element_index: element_count.saturating_sub(1),
+            element_index_capacity,
         });
         // Evict oldest. The loop guards against pre-existing over-cap
         // state from a previous version of the binary; in steady state
@@ -154,6 +160,18 @@ impl TokenRegistry {
     /// - `"element_token element_index out of range"` — the index in
     ///   the token is past the max recorded for the snapshot.
     pub fn resolve(&self, pid: i32, token: &str) -> Result<(u32, usize), String> {
+        self.resolve_with_snapshot(pid, token)
+            .map(|(_, window_id, element_index)| (window_id, element_index))
+    }
+
+    /// Resolve a token while preserving the exact snapshot generation that
+    /// authorized it. Element actions carry this id through async preflight
+    /// work and require the element cache to still match it at lookup time.
+    pub fn resolve_with_snapshot(
+        &self,
+        pid: i32,
+        token: &str,
+    ) -> Result<(u32, u32, usize), String> {
         let (sid, idx) =
             parse_token(token).ok_or_else(|| "element_token has invalid format".to_string())?;
         let runtime_scope = current_runtime_scope();
@@ -179,13 +197,13 @@ impl TokenRegistry {
                 STALE_TOKEN_ERROR.to_owned()
             }
         })?;
-        if idx > entry.max_element_index {
+        if idx >= entry.element_index_capacity {
             return Err(format!(
-                "element_token element_index {idx} out of range (snapshot had {} elements)",
-                entry.max_element_index + 1
+                "element_token element_index {idx} out of range (snapshot index capacity {})",
+                entry.element_index_capacity
             ));
         }
-        Ok((entry.window_id, idx))
+        Ok((entry.snapshot_id, entry.window_id, idx))
     }
 
     pub fn clear_runtime_scope(&self, runtime_scope: &str) -> usize {
@@ -308,6 +326,27 @@ pub fn token_for(snapshot_id: u32, element_index: usize) -> String {
     format_token(snapshot_id, element_index)
 }
 
+/// Canonical refusal when a token resolved successfully but the platform
+/// element cache no longer contains that exact snapshot generation.
+pub fn stale_element_cache_result(
+    tool_name: &str,
+    pid: i32,
+    window_id: u32,
+    snapshot_id: u32,
+) -> crate::protocol::ToolResult {
+    let message = format!(
+        "{tool_name}: element snapshot s{snapshot_id:08x} is no longer current for pid={pid} window_id={window_id}; call get_window_state again to refresh"
+    );
+    crate::protocol::ToolResult::error(message.clone()).with_structured(serde_json::json!({
+        "status": "refused",
+        "effect": "refused",
+        "refusal": {
+            "code": "stale_element_token",
+            "message": message,
+        }
+    }))
+}
+
 /// Result of validating an `element_token` or snapshot-bound `element_index`
 /// on a tool call's args. Returned by [`resolve_element_args`].
 #[derive(Debug, Clone)]
@@ -322,11 +361,24 @@ pub enum ResolvedElement {
     Element {
         window_id: Option<u32>,
         element_index: usize,
+        /// Exact observation generation that authorized this element. Cache
+        /// lookup must match it atomically with reading the native handle.
+        snapshot_id: u32,
         /// True when the caller supplied a token and we resolved
         /// through the registry — informational, used by tools that
         /// want to log "via token" in the success summary.
         via_token: bool,
     },
+}
+
+impl ResolvedElement {
+    /// Snapshot generation carried by an element target, if present.
+    pub fn snapshot_id(&self) -> Option<u32> {
+        match self {
+            Self::Element { snapshot_id, .. } => Some(*snapshot_id),
+            Self::None => None,
+        }
+    }
 }
 
 /// Validate tool args that accept `element_index`, `snapshot_id`, and
@@ -354,7 +406,7 @@ pub fn resolve_element_args(
     args_element_index: Option<usize>,
     args_element_token: Option<&str>,
     args_snapshot_id: Option<&str>,
-    args_window_id: Option<u32>,
+    args_window_id: Option<u64>,
     tool_name: &str,
 ) -> Result<ResolvedElement, crate::protocol::ToolResult> {
     let refusal = |code: &str, message: String| {
@@ -364,17 +416,20 @@ pub fn resolve_element_args(
         }))
     };
     let resolve_token = |tok: &str| {
-        let (wid, idx) = global().resolve(pid, tok).map_err(|message| {
-            let code = if message.contains("another runtime generation") {
-                "generation_mismatch"
-            } else if message == STALE_TOKEN_ERROR {
-                "stale_element_token"
-            } else {
-                "invalid_element_token"
-            };
-            refusal(code, message)
-        })?;
-        Ok::<_, crate::protocol::ToolResult>((wid, idx))
+        let (snapshot_id, wid, idx) =
+            global()
+                .resolve_with_snapshot(pid, tok)
+                .map_err(|message| {
+                    let code = if message.contains("another runtime generation") {
+                        "generation_mismatch"
+                    } else if message == STALE_TOKEN_ERROR {
+                        "stale_element_token"
+                    } else {
+                        "invalid_element_token"
+                    };
+                    refusal(code, message)
+                })?;
+        Ok::<_, crate::protocol::ToolResult>((snapshot_id, wid, idx))
     };
 
     match (args_element_index, args_element_token, args_snapshot_id) {
@@ -397,8 +452,8 @@ pub fn resolve_element_args(
                 )
             })?;
             let token = format_token(snapshot_id, idx);
-            let (wid, resolved_idx) = resolve_token(&token)?;
-            if args_window_id.is_some_and(|arg_wid| arg_wid != wid) {
+            let (resolved_snapshot_id, wid, resolved_idx) = resolve_token(&token)?;
+            if args_window_id.is_some_and(|arg_wid| arg_wid != u64::from(wid)) {
                 return Err(refusal(
                     "conflicting_element_target",
                     format!(
@@ -410,13 +465,14 @@ pub fn resolve_element_args(
             Ok(ResolvedElement::Element {
                 window_id: Some(wid),
                 element_index: resolved_idx,
+                snapshot_id: resolved_snapshot_id,
                 via_token: false,
             })
         }
         (idx_opt, Some(tok), snapshot_opt) => {
-            let (wid, idx) = resolve_token(tok)?;
+            let (resolved_snapshot_id, wid, idx) = resolve_token(tok)?;
             if idx_opt.is_some_and(|arg_idx| arg_idx != idx)
-                || args_window_id.is_some_and(|arg_wid| arg_wid != wid)
+                || args_window_id.is_some_and(|arg_wid| arg_wid != u64::from(wid))
                 || snapshot_opt.is_some_and(|handle| {
                     parse_snapshot_handle(handle)
                         != parse_token(tok).map(|(snapshot_id, _)| snapshot_id)
@@ -432,6 +488,7 @@ pub fn resolve_element_args(
             Ok(ResolvedElement::Element {
                 window_id: Some(wid),
                 element_index: idx,
+                snapshot_id: resolved_snapshot_id,
                 via_token: true,
             })
         }
@@ -490,7 +547,7 @@ mod tests {
     fn register_then_resolve_returns_window_and_index() {
         let reg = fresh_registry();
         let pid = 100;
-        let snapshot_id = reg.register_snapshot(pid, 42, /* element_count */ 5);
+        let snapshot_id = reg.register_snapshot(pid, 42, /* element_index_capacity */ 5);
         let token = format_token(snapshot_id, 3);
         let (wid, idx) = reg.resolve(pid, &token).expect("fresh token must resolve");
         assert_eq!(wid, 42);
@@ -521,11 +578,37 @@ mod tests {
     fn out_of_range_index_returns_actionable_error() {
         let reg = fresh_registry();
         let pid = 11;
-        let snapshot_id = reg.register_snapshot(pid, 1, /* element_count */ 3);
+        let snapshot_id = reg.register_snapshot(pid, 1, /* element_index_capacity */ 3);
         // Snapshot has indices 0..2 — 7 is past the end.
         let token = format_token(snapshot_id, 7);
         let err = reg.resolve(pid, &token).unwrap_err();
         assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_capacity_snapshot_rejects_index_zero() {
+        let reg = fresh_registry();
+        let pid = 111;
+        let snapshot_id = reg.register_snapshot(pid, 1, 0);
+        let err = reg.resolve(pid, &format_token(snapshot_id, 0)).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn sparse_snapshot_capacity_accepts_its_highest_emitted_index() {
+        let reg = fresh_registry();
+        let pid = 112;
+        // A window-scoped projection may emit only indices 7 and 11 from the
+        // application-wide index space, so its exclusive upper bound is 12.
+        let snapshot_id = reg.register_snapshot(pid, 2, 12);
+        assert_eq!(
+            reg.resolve(pid, &format_token(snapshot_id, 11)),
+            Ok((2, 11))
+        );
+        assert!(reg
+            .resolve(pid, &format_token(snapshot_id, 12))
+            .unwrap_err()
+            .contains("out of range"));
     }
 
     #[test]
@@ -669,10 +752,12 @@ mod tests {
             ResolvedElement::Element {
                 window_id,
                 element_index,
+                snapshot_id: resolved_snapshot_id,
                 via_token,
             } => {
                 assert_eq!(window_id, Some(555), "window_id comes from the snapshot");
                 assert_eq!(element_index, 2);
+                assert_eq!(resolved_snapshot_id, snapshot_id);
                 assert!(via_token, "token path must report via_token=true");
             }
             _ => panic!("expected Element, got {resolved:?}"),
@@ -690,6 +775,29 @@ mod tests {
     }
 
     #[test]
+    fn oversized_window_id_cannot_alias_token_window() {
+        let reg = global();
+        let pid = 0x7fff_0005_i32;
+        let snapshot_id = reg.register_snapshot(pid, 7, 1);
+        let token = format_token(snapshot_id, 0);
+        let aliased_window_id = u64::from(u32::MAX) + 1 + 7;
+
+        let refusal = resolve_element_args(
+            pid,
+            None,
+            Some(&token),
+            None,
+            Some(aliased_window_id),
+            "click",
+        )
+        .expect_err("an oversized window id must not alias the token's u32 window id");
+        assert_eq!(
+            refusal.structured_content.as_ref().unwrap()["refusal"]["code"],
+            "conflicting_element_target"
+        );
+    }
+
+    #[test]
     fn snapshot_id_and_index_resolve_safely() {
         let reg = global();
         let pid = 0x7fff_0004_i32;
@@ -702,8 +810,9 @@ mod tests {
             ResolvedElement::Element {
                 window_id: Some(888),
                 element_index: 2,
+                snapshot_id: resolved_snapshot_id,
                 via_token: false
-            }
+            } if resolved_snapshot_id == snapshot_id
         ));
     }
 
@@ -729,5 +838,15 @@ mod tests {
         let resolved = resolve_element_args(1, None, None, None, None, "click")
             .expect("neither arg returns None, not error");
         assert!(matches!(resolved, ResolvedElement::None));
+    }
+
+    #[test]
+    fn cache_generation_mismatch_has_canonical_stale_refusal() {
+        let result = stale_element_cache_result("click", 42, 7, 0x1234);
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured refusal");
+        assert_eq!(structured["status"], "refused");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["refusal"]["code"], "stale_element_token");
     }
 }
