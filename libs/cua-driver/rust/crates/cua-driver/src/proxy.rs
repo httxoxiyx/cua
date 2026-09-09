@@ -16,7 +16,9 @@
 //!   Putting the proxy here avoids `mcp-server → cua-driver` reverse
 //!   coupling.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cua_driver_core::policy::{authorize_tool_call, validate_configured_policy};
 use cua_driver_core::protocol::{initialize_result, Request, Response};
@@ -24,10 +26,30 @@ use cua_driver_core::server::{
     observe_proxy_session_started, observe_proxy_tool_completed, tool_observation_timer,
     StdioExecutionPath,
 };
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
-use crate::serve::{is_daemon_listening, send_request, DaemonRequest, ToolObservationOrigin};
+use crate::serve::{
+    is_daemon_listening, send_request, DaemonRequest, DaemonResponse, ToolObservationOrigin,
+};
+
+const CONTROL_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+const CONTROL_SESSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+struct ControlConnectionTiming {
+    heartbeat_interval: Duration,
+    response_timeout: Duration,
+}
+
+impl Default for ControlConnectionTiming {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: CONTROL_SESSION_HEARTBEAT_INTERVAL,
+            response_timeout: CONTROL_SESSION_RESPONSE_TIMEOUT,
+        }
+    }
+}
 
 /// Run stdio MCP directly over an SDK-owned runtime.
 ///
@@ -183,7 +205,7 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
     // == one MCP session; the daemon outlives it. We stamp this id on every
     // forwarded request so the daemon can OWN and CLEAN UP this session's
     // state (recording, config overrides) and tear it down on disconnect via
-    // a `session_end` signal. Dep-free `pid + start-nanos` is sufficient for
+    // the control socket's EOF. Dep-free `pid + start-nanos` is sufficient for
     // daemon-local uniqueness over this proxy's lifetime (no `uuid` crate dep
     // for one mint).
     let session_id = mint_session_id();
@@ -191,33 +213,41 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
 
     // Open ONE long-lived "control" connection to the daemon and hold it open
     // for this proxy's entire lifetime (separate from the per-call connections
-    // that `send_request` opens and closes per tool call). It sends a single
-    // `session_begin` line and then parks reading — it never writes again and
-    // never closes until this process dies.
+    // that `send_request` opens and closes per tool call). It sends
+    // `session_begin`, then renews the transport-owned lifecycle sessions every
+    // minute while the MCP proxy remains alive.
     //
     // This is the reaper: when the proxy exits (graceful stdin EOF) OR is
     // SIGKILLed/crashes, the kernel closes this socket; the daemon's
     // per-connection reader hits EOF and fires `session_end` for `session_id`,
     // tearing down every piece of state this session owns (overlay cursor,
-    // config overrides, recording). Liveness is connection-based, so an
-    // alive-but-idle session — one issuing zero tool calls — is never reaped:
-    // its control connection stays parked open.
+    // config overrides, recording). The bounded heartbeat keeps already-created
+    // lifecycle sessions fresh; before the first Computer Use call there is
+    // nothing to create or renew.
     //
     // The daemon must acknowledge `session_begin` before the proxy accepts tool
     // calls. Besides lifecycle cleanup, that registered control channel is the
     // trust boundary used by destructive `browser_prepare` calls.
     let (control_ready_tx, control_ready_rx) = tokio::sync::oneshot::channel();
-    {
-        let socket = socket_path.clone();
-        let sid = session_id.clone();
-        tokio::spawn(async move {
-            run_control_connection(socket, sid, control_ready_tx).await;
-        });
+    let socket = socket_path.clone();
+    let sid = session_id.clone();
+    let control_task =
+        tokio::spawn(async move { run_control_connection(socket, sid, control_ready_tx).await });
+    match tokio::time::timeout(Duration::from_secs(4), control_ready_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            let result = control_task.await;
+            return Err(control_task_failure(
+                result,
+                "daemon control session closed before acknowledgement",
+            ));
+        }
+        Err(_) => {
+            control_task.abort();
+            let _ = control_task.await;
+            anyhow::bail!("daemon did not acknowledge the MCP control session");
+        }
     }
-    tokio::time::timeout(std::time::Duration::from_secs(4), control_ready_rx)
-        .await
-        .map_err(|_| anyhow::anyhow!("daemon did not acknowledge the MCP control session"))?
-        .map_err(|_| anyhow::anyhow!("daemon control session closed before acknowledgement"))?;
 
     // Cache the tool list once at startup. The daemon's registry is
     // static for the lifetime of the daemon, so polling on every
@@ -229,15 +259,50 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    run_proxy_io(
-        BufReader::new(stdin),
-        tokio::io::BufWriter::new(stdout),
-        &socket_path,
-        &cached_tools_list,
-        &session_id,
-        daemon_observes_tool_calls,
+    supervise_proxy_io(
+        run_proxy_io(
+            BufReader::new(stdin),
+            tokio::io::BufWriter::new(stdout),
+            &socket_path,
+            &cached_tools_list,
+            &session_id,
+            daemon_observes_tool_calls,
+        ),
+        control_task,
     )
     .await
+}
+
+fn control_task_failure(
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+    fallback: &str,
+) -> anyhow::Error {
+    match result {
+        Ok(Ok(())) => anyhow::anyhow!(fallback.to_owned()),
+        Ok(Err(error)) => error,
+        Err(error) => anyhow::anyhow!("MCP control-session task failed: {error}"),
+    }
+}
+
+async fn supervise_proxy_io<F>(
+    proxy_io: F,
+    mut control_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    tokio::pin!(proxy_io);
+    tokio::select! {
+        result = &mut proxy_io => {
+            control_task.abort();
+            let _ = control_task.await;
+            result
+        }
+        result = &mut control_task => Err(control_task_failure(
+            result,
+            "daemon control session closed while the MCP proxy was still running",
+        )),
+    }
 }
 
 /// Run the service-owned stdio loop over caller-provided I/O.
@@ -371,38 +436,35 @@ fn proxy_knows_tool(cached_tools_list: &serde_json::Value, name: &str) -> bool {
 }
 
 /// Own the proxy's single long-lived control connection. Connects directly to
-/// the daemon socket (its OWN async open — `send_request` is sync, blocking,
-/// and one-shot, so it cannot be reused here), sends one `session_begin` line
-/// carrying `session_id`, then parks in a read loop until the connection
-/// closes. It never writes again. The daemon records `session_id` from
-/// `session_begin` and fires `session_end` when this connection EOFs — which
-/// the kernel triggers on proxy exit AND on kill -9.
+/// the daemon socket (its own async open — `send_request` is sync, blocking,
+/// and one-shot, so it cannot be reused here), binds `session_id`, and renews
+/// the transport-owned lifecycle sessions at a bounded interval. The daemon
+/// fires session cleanup when this connection reaches EOF, which the kernel
+/// triggers on graceful proxy exit and on process death.
 ///
-/// On any read result/error (daemon-side close, broken pipe), the loop exits
-/// and the task ends; the proxy keeps running on its per-call connections. A
-/// connect failure (racing daemon startup) is logged and swallowed — it must
-/// not bail the proxy.
+/// Any control-channel loss is terminal for the proxy. Continuing to forward
+/// per-call requests after the daemon has reaped their owner would produce a
+/// stream of misleading ended-session failures.
 async fn run_control_connection(
     socket_path: String,
     session_id: String,
     control_ready: tokio::sync::oneshot::Sender<()>,
-) {
-    let begin = DaemonRequest {
-        method: "session_begin".into(),
-        name: None,
-        args: None,
-        session_id: Some(session_id.clone()),
-        observation_origin: None,
-        client_kind: None,
-    };
-    let line = match serde_json::to_string(&begin) {
-        Ok(s) => s + "\n",
-        Err(e) => {
-            warn!("control connection: serialize session_begin failed: {e}");
-            return;
-        }
-    };
+) -> anyhow::Result<()> {
+    run_control_connection_with_timing(
+        socket_path,
+        session_id,
+        control_ready,
+        ControlConnectionTiming::default(),
+    )
+    .await
+}
 
+async fn run_control_connection_with_timing(
+    socket_path: String,
+    session_id: String,
+    control_ready: tokio::sync::oneshot::Sender<()>,
+    timing: ControlConnectionTiming,
+) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use tokio::net::UnixStream;
@@ -410,7 +472,7 @@ async fn run_control_connection(
         // (mirrors the windows pipe-open retry below). The is_daemon_listening
         // precheck makes the window tiny, but keep both paths symmetric.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut stream = loop {
+        let stream = loop {
             match UnixStream::connect(&socket_path).await {
                 Ok(s) => break s,
                 Err(_) if std::time::Instant::now() < deadline => {
@@ -418,37 +480,13 @@ async fn run_control_connection(
                 }
                 Err(e) => {
                     debug!(session_id = %session_id, "control connect failed (daemon starting?): {e}");
-                    return;
+                    return Err(anyhow::anyhow!(
+                        "connect MCP control session to daemon: {e}"
+                    ));
                 }
             }
         };
-        if let Err(e) = stream.write_all(line.as_bytes()).await {
-            debug!("control connection: write session_begin failed: {e}");
-            return;
-        }
-        let _ = stream.flush().await;
-        debug!(session_id = %session_id, "control connection established (session_begin sent)");
-
-        // Park: read until the daemon closes (it ACKs session_begin then keeps
-        // the conn open; we drain anything and only return on EOF/error). The
-        // proxy never writes here again — the connection lives until process
-        // death, when the kernel closes it and the daemon reaps the session.
-        let mut reader = BufReader::new(stream);
-        let mut buf = String::new();
-        match reader.read_line(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {
-                let _ = control_ready.send(());
-            }
-        }
-        loop {
-            buf.clear();
-            match reader.read_line(&mut buf).await {
-                Ok(0) | Err(_) => break, // daemon closed or error — task done.
-                Ok(_) => continue,       // ACK / stray line — ignore, keep parked.
-            }
-        }
-        debug!(session_id = %session_id, "control connection closed");
+        return maintain_control_connection(stream, session_id, control_ready, timing).await;
     }
 
     #[cfg(all(not(unix), target_os = "windows"))]
@@ -459,49 +497,147 @@ async fn run_control_connection(
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let client = loop {
             match ClientOptions::new().open(&socket_path) {
-                Ok(c) => break Some(c),
+                Ok(c) => break c,
                 Err(_) if std::time::Instant::now() < deadline => {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Err(e) => {
                     debug!(session_id = %session_id, "control pipe open failed (daemon starting?): {e}");
-                    break None;
+                    return Err(anyhow::anyhow!("open MCP control session named pipe: {e}"));
                 }
             }
         };
-        let mut client = match client {
-            Some(c) => c,
-            None => return,
-        };
-        if let Err(e) = client.write_all(line.as_bytes()).await {
-            debug!("control connection: write session_begin failed: {e}");
-            return;
-        }
-        let _ = client.flush().await;
-        debug!(session_id = %session_id, "control connection established (session_begin sent)");
-
-        let mut reader = BufReader::new(client);
-        let mut buf = String::new();
-        match reader.read_line(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {
-                let _ = control_ready.send(());
-            }
-        }
-        loop {
-            buf.clear();
-            match reader.read_line(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
-            }
-        }
-        debug!(session_id = %session_id, "control connection closed");
+        return maintain_control_connection(client, session_id, control_ready, timing).await;
     }
 
     #[cfg(all(not(unix), not(target_os = "windows")))]
     {
-        let _ = (line, session_id, socket_path, control_ready);
+        let _ = (session_id, socket_path, control_ready, timing);
+        anyhow::bail!("daemon-backed MCP control sessions are not supported on this platform");
     }
+}
+
+async fn maintain_control_connection<S>(
+    stream: S,
+    session_id: String,
+    control_ready: tokio::sync::oneshot::Sender<()>,
+    timing: ControlConnectionTiming,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if timing.heartbeat_interval.is_zero() || timing.response_timeout.is_zero() {
+        anyhow::bail!("MCP control-session timing must be greater than zero");
+    }
+
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut lines = BufReader::new(reader).lines();
+    let begin = control_request("session_begin", &session_id);
+    write_control_request(&mut writer, &begin).await?;
+    let response = read_control_response(&mut lines, timing.response_timeout).await?;
+    validate_control_ack(&response, "session_begin")?;
+    control_ready
+        .send(())
+        .map_err(|_| anyhow::anyhow!("MCP control-session owner stopped before acknowledgement"))?;
+    debug!(session_id = %session_id, "control connection established and acknowledged");
+
+    let heartbeat = control_request("session_heartbeat", &session_id);
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + timing.heartbeat_interval,
+        timing.heartbeat_interval,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                match line {
+                    Ok(None) => anyhow::bail!("daemon closed the MCP control session"),
+                    Err(error) => return Err(anyhow::anyhow!(
+                        "read MCP control session: {error}"
+                    )),
+                    Ok(Some(_)) => anyhow::bail!(
+                        "daemon sent an unsolicited MCP control-session response"
+                    ),
+                }
+            }
+            _ = interval.tick() => {
+                write_control_request(&mut writer, &heartbeat).await?;
+                let response = read_control_response(&mut lines, timing.response_timeout).await?;
+                validate_control_ack(&response, "session_heartbeat")?;
+                debug!(session_id = %session_id, "MCP control session renewed");
+            }
+        }
+    }
+}
+
+fn control_request(method: &str, session_id: &str) -> DaemonRequest {
+    DaemonRequest {
+        method: method.to_owned(),
+        name: None,
+        args: None,
+        session_id: Some(session_id.to_owned()),
+        observation_origin: None,
+        client_kind: None,
+    }
+}
+
+async fn write_control_request<W>(writer: &mut W, request: &DaemonRequest) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let line = serde_json::to_string(request)
+        .map_err(|error| anyhow::anyhow!("serialize MCP control request: {error}"))?;
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|error| anyhow::anyhow!("write MCP control request: {error}"))?;
+    writer
+        .write_all(b"\n")
+        .await
+        .map_err(|error| anyhow::anyhow!("write MCP control request delimiter: {error}"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| anyhow::anyhow!("flush MCP control request: {error}"))
+}
+
+async fn read_control_response<R>(
+    lines: &mut tokio::io::Lines<BufReader<R>>,
+    timeout: Duration,
+) -> anyhow::Result<DaemonResponse>
+where
+    R: AsyncRead + Unpin,
+{
+    let line = tokio::time::timeout(timeout, lines.next_line())
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon timed out acknowledging the MCP control session"))?
+        .map_err(|error| anyhow::anyhow!("read MCP control-session response: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("daemon closed the MCP control session"))?;
+    serde_json::from_str(&line)
+        .map_err(|error| anyhow::anyhow!("decode MCP control-session response: {error}"))
+}
+
+fn validate_control_ack(response: &DaemonResponse, method: &str) -> anyhow::Result<()> {
+    if !response.ok {
+        anyhow::bail!(
+            "daemon rejected MCP control method `{method}`: {}",
+            response
+                .error
+                .as_deref()
+                .unwrap_or("daemon reported failure")
+        );
+    }
+    if response
+        .result
+        .as_ref()
+        .and_then(|result| result.get(method))
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        anyhow::bail!("daemon returned an invalid `{method}` acknowledgement");
+    }
+    Ok(())
 }
 
 /// Mint a session id unique among the live proxies sharing one daemon, for the
@@ -874,6 +1010,107 @@ mod tests {
             serde_json::from_slice(&writer).expect("response must be JSON");
         assert_eq!(response["id"], 1);
         assert!(response.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn control_connection_renews_after_the_interval_and_fails_on_eof() {
+        let (client, server) = tokio::io::duplex(4096);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let timing = ControlConnectionTiming {
+            heartbeat_interval: Duration::from_millis(40),
+            response_timeout: Duration::from_millis(250),
+        };
+        let control = tokio::spawn(maintain_control_connection(
+            client,
+            "heartbeat-test-session".to_owned(),
+            ready_tx,
+            timing,
+        ));
+
+        let (server_reader, mut server_writer) = tokio::io::split(server);
+        let mut server_lines = BufReader::new(server_reader).lines();
+        let begin_line = server_lines
+            .next_line()
+            .await
+            .expect("read session_begin")
+            .expect("session_begin line");
+        let begin: DaemonRequest = serde_json::from_str(&begin_line).expect("decode session_begin");
+        assert_eq!(begin.method, "session_begin");
+        assert_eq!(begin.session_id.as_deref(), Some("heartbeat-test-session"));
+        server_writer
+            .write_all(
+                (serde_json::to_string(&DaemonResponse::ok(serde_json::json!({
+                    "session_begin": true
+                })))
+                .unwrap()
+                    + "\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write session_begin ack");
+        server_writer
+            .flush()
+            .await
+            .expect("flush session_begin ack");
+        ready_rx.await.expect("control connection ready");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), server_lines.next_line())
+                .await
+                .is_err(),
+            "the heartbeat must not fire immediately"
+        );
+        let heartbeat_line =
+            tokio::time::timeout(Duration::from_millis(200), server_lines.next_line())
+                .await
+                .expect("heartbeat deadline")
+                .expect("read heartbeat")
+                .expect("heartbeat line");
+        let heartbeat: DaemonRequest =
+            serde_json::from_str(&heartbeat_line).expect("decode heartbeat");
+        assert_eq!(heartbeat.method, "session_heartbeat");
+        assert_eq!(
+            heartbeat.session_id.as_deref(),
+            Some("heartbeat-test-session")
+        );
+        server_writer
+            .write_all(
+                (serde_json::to_string(&DaemonResponse::ok(serde_json::json!({
+                    "session_heartbeat": true,
+                    "renewed_sessions": 1
+                })))
+                .unwrap()
+                    + "\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write heartbeat ack");
+        server_writer.flush().await.expect("flush heartbeat ack");
+        drop(server_writer);
+        drop(server_lines);
+
+        let error = tokio::time::timeout(Duration::from_millis(250), control)
+            .await
+            .expect("control task must notice EOF")
+            .expect("control task join")
+            .expect_err("control EOF must be terminal");
+        assert!(error.to_string().contains("closed"));
+    }
+
+    #[tokio::test]
+    async fn control_loss_fails_the_proxy_supervisor_closed() {
+        let proxy_io = std::future::pending::<anyhow::Result<()>>();
+        let control_task =
+            tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("test control channel lost")) });
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(250),
+            supervise_proxy_io(proxy_io, control_task),
+        )
+        .await
+        .expect("supervisor must stop promptly")
+        .expect_err("control loss must fail the proxy");
+        assert!(error.to_string().contains("test control channel lost"));
     }
 
     /// Reconstruct the `!resp.ok` branch in isolation so we can assert

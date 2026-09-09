@@ -419,7 +419,9 @@ is call-scoped: if a later call omits it, that call uses the authenticated
 transport's implicit session instead. Unnamed calls on one transport reuse that
 implicit identity. The default idle TTL is five minutes. Call
 `start_session(session)` to name or configure a run before acting, or to revive
-an ended name.
+an ended name. A live daemon-backed MCP control connection renews sessions that
+its transport already owns; it cannot create or revive a session, and closing
+the MCP transport still cleans those sessions up immediately.
 
 Do not use `config set capture_scope` or `set_config`; that key is retired and
 stale values on disk are ignored. `start_session.capture_scope`,
@@ -727,7 +729,9 @@ need to name or configure the run before acting, or to revive a name after
 and the transport still gets one private lifecycle identity and visible agent
 cursor. A public label makes inspection and cleanup easier, but it is not a
 credential. End with `end_session` when useful; transport close or the
-five-minute idle TTL also reclaims it.
+five-minute idle TTL also reclaims it. Daemon-backed MCP transports renew their
+existing live sessions while the authenticated control connection remains
+open, so the idle TTL acts as a fallback if that renewal stops unexpectedly.
 
 **Concurrent runs/subagents:** each transport gets its own implicit session.
 Also,

@@ -302,6 +302,11 @@ impl SdkAdapter {
         )
     }
 
+    pub fn renew_transport_sessions(&self, transport_session: &str) -> usize {
+        let owner = format!("{}{}", self.runtime_prefix, transport_session);
+        cua_driver_core::session::touch_sessions_for_owner(&owner)
+    }
+
     pub fn operator_sessions_json(&self) -> Value {
         let sessions = cua_driver_core::session::list_session_snapshots_with_prefix(
             &self.runtime_prefix,
@@ -619,6 +624,51 @@ mod tests {
 
         first.shutdown().await.expect("shutdown first");
         second.shutdown().await.expect("shutdown second");
+    }
+
+    #[tokio::test]
+    async fn transport_touch_refreshes_only_sessions_owned_by_that_lease() {
+        let _runtime_guard = crate::test_runtime_lock().lock().await;
+        let sdk = SdkAdapter::load(host_driver()).await.expect("SDK adapter");
+        let transport = "adapter-touch-transport";
+        let other_transport = "adapter-touch-other-transport";
+        let owner = format!("{}{transport}", sdk.runtime_prefix);
+        let other_owner = format!("{}{other_transport}", sdk.runtime_prefix);
+        let owned_session = format!("{}adapter-touch-owned", sdk.runtime_prefix);
+        let other_session = format!("{}adapter-touch-other", sdk.runtime_prefix);
+
+        cua_driver_core::session::activate_session(
+            &owned_session,
+            Some("adapter-touch-owned"),
+            &owner,
+            false,
+            cua_driver_core::session::SessionTransport::McpStdio,
+            cua_driver_core::session::SessionClientKind::Mcp,
+        )
+        .unwrap();
+        cua_driver_core::session::activate_session(
+            &other_session,
+            Some("adapter-touch-other"),
+            &other_owner,
+            false,
+            cua_driver_core::session::SessionTransport::McpStdio,
+            cua_driver_core::session::SessionClientKind::Mcp,
+        )
+        .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let owned_before = cua_driver_core::session::session_idle_duration(&owned_session).unwrap();
+        let other_before = cua_driver_core::session::session_idle_duration(&other_session).unwrap();
+        assert_eq!(sdk.renew_transport_sessions(transport), 1);
+        let owned_after = cua_driver_core::session::session_idle_duration(&owned_session).unwrap();
+        let other_after = cua_driver_core::session::session_idle_duration(&other_session).unwrap();
+        assert!(owned_after < owned_before);
+        assert!(other_after >= other_before);
+        assert_eq!(sdk.renew_transport_sessions("adapter-touch-unknown"), 0);
+
+        assert_eq!(sdk.end_transport_sessions(transport), 1);
+        assert_eq!(sdk.end_transport_sessions(other_transport), 1);
+        sdk.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]

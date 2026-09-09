@@ -1148,11 +1148,11 @@ fn fire_session_end_for_owner(session_id: &str, owner_transport: Option<&str>) -
 /// the same lock order as dispatch admission prevents a racing first action
 /// from recreating a record immediately before or after termination.
 fn mark_session_ended(session_id: &str, owner_transport: Option<&str>) -> bool {
-    activity().lock().unwrap().remove(session_id);
     let mut ended = ended_sessions().lock().unwrap();
-    let record_owner = lifecycle_records()
-        .lock()
-        .unwrap()
+    let mut records = lifecycle_records().lock().unwrap();
+    let mut activity = activity().lock().unwrap();
+    activity.remove(session_id);
+    let record_owner = records
         .remove(session_id)
         .map(|record| record.owner_transport);
     if ended.contains_key(session_id) {
@@ -1422,6 +1422,40 @@ pub fn touch_session(session_id: &str) {
         .lock()
         .unwrap()
         .insert(session_id.to_owned(), Instant::now());
+}
+
+/// Refresh the idle deadline for every live session owned by one trusted
+/// transport lease.
+///
+/// This is intentionally owner-scoped rather than prefix-scoped: a transport
+/// heartbeat must not extend another connection's sessions in the same
+/// runtime. Existing activity entries are updated in place so renewal cannot
+/// create or revive lifecycle state. Tombstoned and pending-end sessions are
+/// skipped.
+pub fn touch_sessions_for_owner(owner_transport: &str) -> usize {
+    let now = Instant::now();
+    // Keep the same lock order as lifecycle admission and terminal teardown.
+    // Holding all three locks makes the live check and timestamp update one
+    // atomic transition with respect to end/revival.
+    let ended = ended_sessions().lock().unwrap();
+    let records = lifecycle_records().lock().unwrap();
+    let mut activity = activity().lock().unwrap();
+    let mut touched = 0;
+    for (session_id, record) in records.iter() {
+        if record.owner_transport != owner_transport
+            || record.pending_end.is_some()
+            || ended.contains_key(session_id)
+            || !is_trackable(session_id)
+        {
+            continue;
+        }
+        let Some(last_activity) = activity.get_mut(session_id) else {
+            continue;
+        };
+        *last_activity = now;
+        touched += 1;
+    }
+    touched
 }
 
 #[doc(hidden)]
@@ -1787,6 +1821,135 @@ mod tests {
         assert!(revive_session_for_owner(sid, owner_b).is_err());
         assert!(is_session_ended(sid));
         assert_eq!(revive_session_for_owner(sid, owner_a), Ok(true));
+    }
+
+    #[test]
+    fn owner_touch_refreshes_only_live_existing_activity() {
+        let owner_a = "test-owner-touch-transport-a";
+        let owner_b = "test-owner-touch-transport-b";
+        let owned_a = "test-owner-touch-session-a";
+        let owned_b = "test-owner-touch-session-b";
+        let foreign = "test-owner-touch-session-foreign";
+        let missing_activity = "test-owner-touch-session-missing-activity";
+        for (session_id, owner) in [
+            (owned_a, owner_a),
+            (owned_b, owner_a),
+            (foreign, owner_b),
+            (missing_activity, owner_a),
+        ] {
+            activate_session(
+                session_id,
+                None,
+                owner,
+                true,
+                SessionTransport::McpStdio,
+                SessionClientKind::Mcp,
+            )
+            .unwrap();
+        }
+
+        let old = Instant::now() - Duration::from_secs(60);
+        {
+            let mut timestamps = activity().lock().unwrap();
+            for session_id in [owned_a, owned_b, foreign] {
+                *timestamps.get_mut(session_id).unwrap() = old;
+            }
+            timestamps.remove(missing_activity);
+        }
+
+        assert_eq!(touch_sessions_for_owner(owner_a), 2);
+        {
+            let timestamps = activity().lock().unwrap();
+            assert!(timestamps[owned_a] > old);
+            assert!(timestamps[owned_b] > old);
+            assert_eq!(timestamps[foreign], old);
+            assert!(!timestamps.contains_key(missing_activity));
+        }
+        assert_eq!(touch_sessions_for_owner("test-owner-touch-unknown"), 0);
+        assert_eq!(
+            evict_idle_with_prefix(Duration::from_secs(30), "test-owner-touch-session-"),
+            vec![foreign.to_owned()],
+            "renewal must protect only the matching owner's existing leases"
+        );
+        assert!(!is_session_ended(owned_a));
+        assert!(!is_session_ended(owned_b));
+        assert!(is_session_ended(foreign));
+
+        assert!(end_session_for_owner(owned_a, owner_a));
+        assert!(is_session_ended(owned_a));
+        assert_eq!(touch_sessions_for_owner(owner_a), 1);
+        assert!(!has_session_activity(owned_a));
+
+        assert!(end_session_for_owner(owned_b, owner_a));
+        assert!(end_session_for_owner(missing_activity, owner_a));
+        assert!(end_session_for_owner(foreign, owner_b));
+    }
+
+    #[test]
+    fn owner_touch_skips_a_pending_end_session() {
+        let session_id = "test-owner-touch-pending-session";
+        let owner = "test-owner-touch-pending-transport";
+        let guard = begin_session_dispatch(
+            session_id,
+            None,
+            owner,
+            true,
+            SessionTransport::McpStdio,
+            SessionClientKind::Mcp,
+        )
+        .unwrap();
+        let old = Instant::now() - Duration::from_secs(60);
+        *activity().lock().unwrap().get_mut(session_id).unwrap() = old;
+
+        assert!(end_session_for_owner(session_id, owner));
+        assert!(
+            session_snapshot(session_id, owner, DEFAULT_SESSION_IDLE_TTL)
+                .unwrap()
+                .ending
+        );
+        assert_eq!(touch_sessions_for_owner(owner), 0);
+        assert_eq!(activity().lock().unwrap()[session_id], old);
+
+        drop(guard);
+        assert!(is_session_ended(session_id));
+        assert!(!has_session_activity(session_id));
+        assert_eq!(touch_sessions_for_owner(owner), 0);
+    }
+
+    #[test]
+    fn owner_touch_racing_with_end_never_resurrects_activity() {
+        let owner = "test-owner-touch-race-transport";
+        for iteration in 0..32 {
+            let session_id = format!("test-owner-touch-race-session-{iteration}");
+            activate_session(
+                &session_id,
+                None,
+                owner,
+                true,
+                SessionTransport::McpStdio,
+                SessionClientKind::Mcp,
+            )
+            .unwrap();
+
+            let barrier = Arc::new(Barrier::new(3));
+            let touch_barrier = barrier.clone();
+            let touch = std::thread::spawn(move || {
+                touch_barrier.wait();
+                touch_sessions_for_owner(owner)
+            });
+            let end_barrier = barrier.clone();
+            let end_session_id = session_id.clone();
+            let end = std::thread::spawn(move || {
+                end_barrier.wait();
+                end_session_for_owner(&end_session_id, owner)
+            });
+            barrier.wait();
+
+            let _ = touch.join().unwrap();
+            assert!(end.join().unwrap());
+            assert!(is_session_ended(&session_id));
+            assert!(!has_session_activity(&session_id));
+        }
     }
 
     #[test]

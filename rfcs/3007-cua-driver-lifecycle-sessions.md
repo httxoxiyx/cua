@@ -545,9 +545,12 @@ round:
 
 - Implicit and explicit lifecycle sessions use a five-minute default idle TTL.
   Trusted hosts may configure a shorter or longer value within documented
-  bounds. A session cannot expire while one of its actions is in flight. Only
-  an admitted session-requiring call that reaches dispatch refreshes the TTL;
-  health reads, denied calls, transport keepalives, and cursor idle-hide do not.
+  bounds. A session cannot expire while one of its actions is in flight. An
+  admitted session-requiring call that reaches dispatch refreshes the TTL. A
+  durable authenticated transport lease also renews only the live sessions it
+  already owns while its control connection remains open; this renewal cannot
+  create or revive a session. Generic health reads, denied calls, unbound
+  transport keepalives, and cursor idle-hide do not refresh the TTL.
   Active recording does not suspend idle expiry, which stops the recording as
   part of normal session cleanup. Transport close and revocation still clean up
   immediately.
@@ -678,11 +681,13 @@ or authorization.
   implicit or explicit session.
 - Cursor idle fade does not change session identity; later activity wakes the
   same cursor.
-- Connection or lease close, idle TTL, revocation, runtime shutdown, and
-  explicit end invoke the same cleanup hooks exactly once.
+- Connection or lease close, unrenewed idle TTL, revocation, runtime shutdown,
+  and explicit end invoke the same cleanup hooks exactly once.
 - An in-flight action cannot expire. Only an admitted session-requiring call
-  that reaches dispatch refreshes idle time; health reads, denied calls,
-  transport keepalives, and cursor idle-hide do not.
+  that reaches dispatch or an authenticated owner-bound control renewal
+  refreshes idle time. Control renewal touches only existing live sessions and
+  cannot create or revive them; health reads, denied calls, unbound transport
+  keepalives, and cursor idle-hide do not.
 - Active recording does not prevent idle expiry. Idle cleanup stops and
   finalizes the recording exactly once.
 - A one-shot CLI command uses one disposable session and cannot observe state
@@ -763,3 +768,9 @@ After acceptance, the maintainer shortened the default idle TTL from 30 minutes
 to five minutes for implicit and explicit sessions. The amendment also fixes
 which events refresh the TTL, protects in-flight actions from expiry, and keeps
 active recordings subject to normal idle cleanup.
+
+A later maintenance amendment makes a durable MCP transport's authenticated
+control connection renew the live lifecycle sessions owned by that transport.
+The renewal is bounded, content-free, cannot create or revive a session, and
+stops when the control connection closes. The five-minute TTL remains the crash
+fallback when transport cleanup cannot run.

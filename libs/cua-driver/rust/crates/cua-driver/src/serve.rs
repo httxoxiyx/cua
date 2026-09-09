@@ -144,6 +144,58 @@ fn is_active_proxy_session(session: Option<&str>) -> bool {
     session.is_some_and(|session| active_proxy_sessions().lock().unwrap().contains(session))
 }
 
+fn begin_proxy_control_session(
+    control_session_id: &mut Option<String>,
+    requested_session_id: Option<&str>,
+) -> DaemonResponse {
+    let Some(requested_session_id) = requested_session_id.filter(|session| !session.is_empty())
+    else {
+        return DaemonResponse::err("session_begin requires a non-empty session_id", 65);
+    };
+
+    if let Some(bound_session_id) = control_session_id.as_deref() {
+        if bound_session_id != requested_session_id {
+            return DaemonResponse::err(
+                "a control connection cannot change its bound session_id",
+                65,
+            );
+        }
+        return DaemonResponse::ok(serde_json::json!({"session_begin": true}));
+    }
+
+    *control_session_id = Some(requested_session_id.to_owned());
+    active_proxy_sessions()
+        .lock()
+        .unwrap()
+        .insert(requested_session_id.to_owned());
+    DaemonResponse::ok(serde_json::json!({"session_begin": true}))
+}
+
+fn renew_proxy_control_session(
+    sdk: &crate::sdk_adapter::SdkAdapter,
+    control_session_id: Option<&str>,
+    requested_session_id: Option<&str>,
+) -> DaemonResponse {
+    let Some(bound_session_id) = control_session_id else {
+        return DaemonResponse::err(
+            "session_heartbeat requires an established control connection",
+            65,
+        );
+    };
+    if requested_session_id != Some(bound_session_id) {
+        return DaemonResponse::err(
+            "session_heartbeat session_id does not match the control connection",
+            65,
+        );
+    }
+
+    let renewed_sessions = sdk.renew_transport_sessions(bound_session_id);
+    DaemonResponse::ok(serde_json::json!({
+        "session_heartbeat": true,
+        "renewed_sessions": renewed_sessions,
+    }))
+}
+
 fn inject_browser_approvals(tool_name: &str, args: &mut serde_json::Value, session: Option<&str>) {
     if tool_name == "browser_download" && is_active_proxy_session(session) {
         if let Some(arguments) = args.as_object_mut() {
@@ -1291,15 +1343,19 @@ pub async fn run_serve(
                                 // session in the post-loop block below. This is
                                 // the ONLY place a connection is marked control;
                                 // per-call connections never send this. ACK ok.
-                                if let Some(sid) = req.session_id.as_deref() {
-                                    control_session_id = Some(sid.to_owned());
-                                    active_proxy_sessions()
-                                        .lock()
-                                        .unwrap()
-                                        .insert(sid.to_owned());
-                                }
-                                let resp = DaemonResponse::ok(
-                                    serde_json::json!({"session_begin": true})
+                                let resp = begin_proxy_control_session(
+                                    &mut control_session_id,
+                                    req.session_id.as_deref(),
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "session_heartbeat" => {
+                                let resp = renew_proxy_control_session(
+                                    &reg,
+                                    control_session_id.as_deref(),
+                                    req.session_id.as_deref(),
                                 );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -2012,15 +2068,19 @@ pub async fn run_serve(
                                 // the unix branch). Record the session_id so this
                                 // pipe instance's EOF / broken-pipe reaps the
                                 // session in the post-loop block below. ACK ok.
-                                if let Some(sid) = req.session_id.as_deref() {
-                                    control_session_id = Some(sid.to_owned());
-                                    active_proxy_sessions()
-                                        .lock()
-                                        .unwrap()
-                                        .insert(sid.to_owned());
-                                }
-                                let resp = DaemonResponse::ok(
-                                    serde_json::json!({"session_begin": true})
+                                let resp = begin_proxy_control_session(
+                                    &mut control_session_id,
+                                    req.session_id.as_deref(),
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "session_heartbeat" => {
+                                let resp = renew_proxy_control_session(
+                                    &reg,
+                                    control_session_id.as_deref(),
+                                    req.session_id.as_deref(),
                                 );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -2473,6 +2533,7 @@ mod gate_tests {
     use cua_driver_core::tool::{Tool, ToolDef, ToolRegistry};
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     static PROBE_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -2522,6 +2583,210 @@ mod gate_tests {
         }
     }
 
+    async fn wait_for_socket(socket: &str) {
+        for _ in 0..100 {
+            if std::path::Path::new(socket).exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("daemon did not bind {socket}");
+    }
+
+    async fn write_control_request(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        request: &DaemonRequest,
+    ) {
+        writer
+            .write_all((serde_json::to_string(request).unwrap() + "\n").as_bytes())
+            .await
+            .expect("write control request");
+        writer.flush().await.expect("flush control request");
+    }
+
+    async fn read_control_response(
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    ) -> super::DaemonResponse {
+        let line = lines
+            .next_line()
+            .await
+            .expect("read control response")
+            .expect("control response line");
+        serde_json::from_str(&line).expect("decode control response")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_control_connection_renews_and_eof_reaps_its_session() {
+        let _runtime_guard = crate::test_runtime_lock().lock().await;
+        PROBE_INVOCATIONS.store(0, Ordering::SeqCst);
+
+        let driver =
+            cua_driver_sdk::CuaDriver::create_for_host(cua_driver_sdk::DriverHostOptions {
+                cursor: cursor_overlay::CursorConfig {
+                    enabled: false,
+                    ..cursor_overlay::CursorConfig::default()
+                },
+                host_owns_permission_ux: false,
+                host_bundle_id: None,
+                claude_code_compatibility: false,
+                prepare_desktop_environment: false,
+                register_host_tools: Some(register_probe),
+                authorization_host: None,
+                activity_observer: None,
+            });
+        let sdk = crate::sdk_adapter::SdkAdapter::load(driver)
+            .await
+            .expect("SDK adapter");
+        let socket = format!(
+            "/tmp/cua-driver-heartbeat-test-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let socket_for_server = socket.clone();
+        let sdk_for_server = sdk.clone();
+        let server = tokio::spawn(async move {
+            let _ = run_serve(sdk_for_server, &socket_for_server, None).await;
+        });
+        wait_for_socket(&socket).await;
+
+        let sid = "heartbeat-integration-session";
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect control socket");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        write_control_request(
+            &mut writer,
+            &DaemonRequest {
+                method: "session_begin".into(),
+                name: None,
+                args: None,
+                session_id: Some(sid.to_owned()),
+                observation_origin: None,
+                client_kind: None,
+            },
+        )
+        .await;
+        assert!(read_control_response(&mut lines).await.ok);
+
+        let call_socket = socket.clone();
+        let call_sid = sid.to_owned();
+        let response = tokio::task::spawn_blocking(move || {
+            send_request(&call_socket, &call_req(Some(&call_sid)))
+        })
+        .await
+        .unwrap()
+        .expect("probe response");
+        assert!(response.ok);
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        assert!(
+            sdk.operator_sessions_json()["sessions"][0]["idle_seconds"]
+                .as_u64()
+                .is_some_and(|idle| idle >= 1),
+            "the session must be measurably idle before renewal"
+        );
+
+        let unbound_socket = socket.clone();
+        let unbound_heartbeat = DaemonRequest {
+            method: "session_heartbeat".into(),
+            name: None,
+            args: None,
+            session_id: Some(sid.to_owned()),
+            observation_origin: None,
+            client_kind: None,
+        };
+        let unbound_response =
+            tokio::task::spawn_blocking(move || send_request(&unbound_socket, &unbound_heartbeat))
+                .await
+                .unwrap()
+                .expect("unbound heartbeat response");
+        assert!(
+            !unbound_response.ok,
+            "a per-call socket must not renew a control-owned session"
+        );
+        assert!(
+            sdk.operator_sessions_json()["sessions"][0]["idle_seconds"]
+                .as_u64()
+                .is_some_and(|idle| idle >= 1),
+            "a rejected heartbeat must not refresh the session"
+        );
+
+        write_control_request(
+            &mut writer,
+            &DaemonRequest {
+                method: "session_heartbeat".into(),
+                name: None,
+                args: None,
+                session_id: Some("heartbeat-integration-other".to_owned()),
+                observation_origin: None,
+                client_kind: None,
+            },
+        )
+        .await;
+        assert!(
+            !read_control_response(&mut lines).await.ok,
+            "a bound control connection must not renew another owner"
+        );
+
+        write_control_request(
+            &mut writer,
+            &DaemonRequest {
+                method: "session_heartbeat".into(),
+                name: None,
+                args: None,
+                session_id: Some(sid.to_owned()),
+                observation_origin: None,
+                client_kind: None,
+            },
+        )
+        .await;
+        let heartbeat = read_control_response(&mut lines).await;
+        assert!(heartbeat.ok);
+        assert_eq!(
+            heartbeat
+                .result
+                .as_ref()
+                .and_then(|result| result.get("renewed_sessions"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            sdk.operator_sessions_json()["sessions"][0]["idle_seconds"],
+            0
+        );
+
+        drop(writer);
+        drop(lines);
+        for _ in 0..100 {
+            if sdk.is_session_ended(sid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            sdk.is_session_ended(sid),
+            "control EOF must reap the session"
+        );
+
+        let shutdown_socket = socket.clone();
+        let shutdown = DaemonRequest {
+            method: "shutdown".into(),
+            name: None,
+            args: None,
+            session_id: None,
+            observation_origin: None,
+            client_kind: None,
+        };
+        let _ =
+            tokio::task::spawn_blocking(move || send_request(&shutdown_socket, &shutdown)).await;
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ended_session_and_runtime_revocation_are_gated() {
         let _runtime_guard = crate::test_runtime_lock().lock().await;
@@ -2569,12 +2834,7 @@ mod gate_tests {
         });
 
         // Wait for the daemon to bind.
-        for _ in 0..100 {
-            if std::path::Path::new(&socket).exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        wait_for_socket(&socket).await;
 
         let sid = "gate-test-session-A1B2C3";
 
@@ -2903,7 +3163,10 @@ mod service_authorization_status_tests {
 
 #[cfg(test)]
 mod session_boundary_tests {
-    use super::{active_proxy_sessions, apply_session_identity, inject_browser_approvals};
+    use super::{
+        active_proxy_sessions, apply_session_identity, begin_proxy_control_session,
+        inject_browser_approvals,
+    };
     use cua_driver_core::browser::download::MCP_HOST_DOWNLOAD_APPROVAL_ARG;
     use serde_json::json;
 
@@ -2970,5 +3233,31 @@ mod session_boundary_tests {
         inject_browser_approvals("browser_download", &mut proxy_download, Some(session));
         active_proxy_sessions().lock().unwrap().remove(session);
         assert_eq!(proxy_download[MCP_HOST_DOWNLOAD_APPROVAL_ARG], true);
+    }
+
+    #[test]
+    fn control_connection_binds_one_immutable_nonempty_session() {
+        let first = "control-boundary-first";
+        let second = "control-boundary-second";
+        let mut bound = None;
+
+        let missing = begin_proxy_control_session(&mut bound, None);
+        assert!(!missing.ok);
+        assert!(bound.is_none());
+
+        let established = begin_proxy_control_session(&mut bound, Some(first));
+        assert!(established.ok);
+        assert_eq!(bound.as_deref(), Some(first));
+        assert!(active_proxy_sessions().lock().unwrap().contains(first));
+
+        let repeated = begin_proxy_control_session(&mut bound, Some(first));
+        assert!(repeated.ok, "repeating the same binding is idempotent");
+
+        let rebound = begin_proxy_control_session(&mut bound, Some(second));
+        assert!(!rebound.ok, "a live control connection cannot change owner");
+        assert_eq!(bound.as_deref(), Some(first));
+        assert!(!active_proxy_sessions().lock().unwrap().contains(second));
+
+        active_proxy_sessions().lock().unwrap().remove(first);
     }
 }
