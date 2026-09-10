@@ -399,6 +399,15 @@ fn with_foreground_keyboard_pointer_context_using<B: ForegroundKeyboardPointerBa
             return Err(error);
         }
         backend.wait(std::time::Duration::from_millis(40));
+        // Blender may finish its application-active bookkeeping on the first
+        // event-loop turn after the focus click. Send another non-mutating move
+        // at the same validated anchor so the following keyboard event does not
+        // have to serve as that readiness event.
+        if let Err(error) = backend.post_mouse_moved(anchor) {
+            let _ = backend.warp(prior);
+            return Err(error);
+        }
+        backend.wait(std::time::Duration::from_millis(40));
     }
     let action_result = action();
     backend.wait(post_action_drain);
@@ -1652,6 +1661,50 @@ mod tests {
         }
     }
 
+    struct FailingSecondMoveBackend {
+        prior: ForegroundKeyboardAnchor,
+        events: Rc<RefCell<Vec<String>>>,
+        move_count: usize,
+    }
+
+    impl ForegroundKeyboardPointerBackend for FailingSecondMoveBackend {
+        fn current_position(&mut self) -> anyhow::Result<ForegroundKeyboardAnchor> {
+            self.events.borrow_mut().push("capture".into());
+            Ok(self.prior)
+        }
+
+        fn warp(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("warp:{:.0},{:.0}", point.x, point.y));
+            Ok(())
+        }
+
+        fn post_mouse_moved(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
+            self.move_count += 1;
+            self.events
+                .borrow_mut()
+                .push(format!("move:{:.0},{:.0}", point.x, point.y));
+            if self.move_count == 2 {
+                anyhow::bail!("second move failed");
+            }
+            Ok(())
+        }
+
+        fn focus_click(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("click:{:.0},{:.0}", point.x, point.y));
+            Ok(())
+        }
+
+        fn wait(&mut self, duration: std::time::Duration) {
+            self.events
+                .borrow_mut()
+                .push(format!("wait:{}", duration.as_millis()));
+        }
+    }
+
     #[test]
     fn foreground_keyboard_context_moves_before_action_and_restores_without_move() {
         let events = Rc::new(RefCell::new(Vec::new()));
@@ -1717,6 +1770,8 @@ mod tests {
                 "wait:40",
                 "click:500,350",
                 "wait:40",
+                "move:500,350",
+                "wait:40",
                 "keyboard",
                 "wait:500",
                 "warp:12,34",
@@ -1754,6 +1809,48 @@ mod tests {
                 .count(),
             1,
             "restoration must not post a second MouseMoved"
+        );
+    }
+
+    #[test]
+    fn foreground_focus_click_restores_cursor_when_readiness_move_fails() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = FailingSecondMoveBackend {
+            prior: ForegroundKeyboardAnchor { x: 12.0, y: 34.0 },
+            events: events.clone(),
+            move_count: 0,
+        };
+        let action_ran = Rc::new(RefCell::new(false));
+
+        let error = with_foreground_keyboard_pointer_context_using(
+            &mut backend,
+            ForegroundKeyboardAnchor { x: 500.0, y: 350.0 },
+            true,
+            std::time::Duration::from_millis(500),
+            {
+                let action_ran = action_ran.clone();
+                move || {
+                    *action_ran.borrow_mut() = true;
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("a failed readiness move must stop keyboard delivery");
+
+        assert_eq!(error.to_string(), "second move failed");
+        assert!(!*action_ran.borrow());
+        assert_eq!(
+            *events.borrow(),
+            [
+                "capture",
+                "warp:500,350",
+                "move:500,350",
+                "wait:40",
+                "click:500,350",
+                "wait:40",
+                "move:500,350",
+                "warp:12,34",
+            ]
         );
     }
 }

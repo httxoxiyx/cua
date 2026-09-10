@@ -850,12 +850,13 @@ pub fn with_foreground_assist(
     // remaining, from AppKit's point of view, unfocused — so the AXFocused
     // write in the body has no responder chain to attach to.
     make_exact_window_key(target_pid, target_wid);
-    await_window_focused(target_pid, target_wid);
+    let _ = await_exact_window_ready(target_pid, target_wid, target_psn);
 
     let result = body();
 
     if prev_ok && should_restore_previous_process(current_front_process_psn(), target_psn) {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
+        await_previous_process_restore_or_log(target_pid, target_wid, target_psn, prev_psn);
     }
 
     result?;
@@ -980,35 +981,98 @@ pub(crate) fn with_foreground_assist_delegated(
 /// target degrades to the old behavior instead of hanging.
 const ACTIVATION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// Poll interval for [`await_window_focused`]. Short enough that a fast native
+/// Poll interval for foreground transition checks. Short enough that a fast native
 /// app pays roughly one tick, long enough not to spin on the WindowServer.
 const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Block until `target_wid` is the application's focused AX window, or the
-/// timeout expires. Returns whether that state was observed.
+const REQUIRED_READY_SAMPLES: u8 = 2;
+
+fn exact_window_is_ready(
+    current_front_psn: Option<[u8; 8]>,
+    target_psn: [u8; 8],
+    focused_window_id: Option<u32>,
+    target_window_id: u32,
+) -> bool {
+    current_front_psn == Some(target_psn) && focused_window_id == Some(target_window_id)
+}
+
+/// Block until WindowServer and Accessibility agree that the exact target is
+/// active, and require two consecutive samples so a stale AX value cannot make
+/// an asynchronous foreground transition look complete.
 ///
-/// The predicate is deliberately `AXFocusedWindow` and not
-/// `NSWorkspace.frontmostApplication`. The latter does not observe a
-/// SkyLight-level front-process change at all: polling it every 15ms across a
-/// full foreground `type_text` against WhatsApp showed zero transitions while
-/// the target was demonstrably being fronted, so a frontmost-based wait always
-/// burns its whole timeout and never actually gates on anything. `AXFocusedWindow`
-/// is the same proof [`preserves_exact_existing_focus`] already trusts to decide
-/// whether a window is focused.
-///
-/// A `false` return is not fatal: the caller proceeds with delivery regardless,
-/// because a target that never reports focus is exactly the case the pre-existing
-/// best-effort contract already covered.
-fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
+/// A missing front-process query never counts as ready. Global HID callers fail
+/// closed in that case because the event itself has no process address; the
+/// older best-effort foreground-assist API may still choose to continue.
+fn await_exact_window_ready(pid: libc::pid_t, window_id: u32, target_psn: [u8; 8]) -> bool {
     let deadline = std::time::Instant::now() + ACTIVATION_WAIT_TIMEOUT;
+    let mut consecutive_ready_samples = 0u8;
     loop {
-        if crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id) {
-            return true;
+        if exact_window_is_ready(
+            current_front_process_psn(),
+            target_psn,
+            crate::ax::bindings::focused_window_id_of_pid(pid),
+            window_id,
+        ) {
+            consecutive_ready_samples += 1;
+            if consecutive_ready_samples >= REQUIRED_READY_SAMPLES {
+                return true;
+            }
+        } else {
+            consecutive_ready_samples = 0;
         }
         if std::time::Instant::now() >= deadline {
             return false;
         }
         std::thread::sleep(ACTIVATION_POLL_INTERVAL);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestoreTransition {
+    Pending,
+    Restored,
+    Superseded,
+}
+
+fn restore_transition(
+    current_front_psn: Option<[u8; 8]>,
+    target_psn: [u8; 8],
+    previous_psn: [u8; 8],
+) -> RestoreTransition {
+    match current_front_psn {
+        Some(current) if current == previous_psn => RestoreTransition::Restored,
+        Some(current) if current != target_psn => RestoreTransition::Superseded,
+        _ => RestoreTransition::Pending,
+    }
+}
+
+/// Wait for an asynchronous foreground restore to settle before allowing the
+/// next action to sample foreground state. A third-party takeover ends the wait
+/// immediately; the driver must never overwrite or delay genuine user input.
+fn await_previous_process_restore(target_psn: [u8; 8], previous_psn: [u8; 8]) -> RestoreTransition {
+    let deadline = std::time::Instant::now() + ACTIVATION_WAIT_TIMEOUT;
+    loop {
+        let transition = restore_transition(current_front_process_psn(), target_psn, previous_psn);
+        if transition != RestoreTransition::Pending || std::time::Instant::now() >= deadline {
+            return transition;
+        }
+        std::thread::sleep(ACTIVATION_POLL_INTERVAL);
+    }
+}
+
+fn await_previous_process_restore_or_log(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    target_psn: [u8; 8],
+    previous_psn: [u8; 8],
+) {
+    if await_previous_process_restore(target_psn, previous_psn) == RestoreTransition::Pending {
+        tracing::warn!(
+            target: "platform_macos::input::skylight",
+            target_pid,
+            target_wid,
+            "foreground process restore did not settle before timeout"
+        );
     }
 }
 
@@ -1091,6 +1155,7 @@ fn with_foreground_hid_activation_inner(
 
     let focused_window_id = crate::ax::bindings::focused_window_id_of_pid(target_pid);
     if preserves_exact_existing_focus(prev_ok, prev_psn, target_psn, focused_window_id, target_wid)
+        && await_exact_window_ready(target_pid, target_wid, target_psn)
     {
         // Re-activating an already key exact window can clear Chromium's
         // renderer focus even though WindowServer keeps the app frontmost.
@@ -1105,7 +1170,7 @@ fn with_foreground_hid_activation_inner(
     }
 
     make_exact_window_key(target_pid, target_wid);
-    if !await_window_focused(target_pid, target_wid)
+    if !await_exact_window_ready(target_pid, target_wid, target_psn)
         && !(transient_route_authorizes_auxiliary_bypass(transient_route, transient_target)
             && transient_route.is_some_and(|route| {
                 crate::transient_ui::active_helper_has_unique_visible_window_for_route(
@@ -1116,6 +1181,7 @@ fn with_foreground_hid_activation_inner(
     {
         if prev_ok && should_restore_previous_process(current_front_process_psn(), target_psn) {
             unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
+            await_previous_process_restore_or_log(target_pid, target_wid, target_psn, prev_psn);
         }
         anyhow::bail!("exact target window did not become focused for foreground HID delivery");
     }
@@ -1125,6 +1191,7 @@ fn with_foreground_hid_activation_inner(
 
     if prev_ok && should_restore_previous_process(current_front_process_psn(), target_psn) {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
+        await_previous_process_restore_or_log(target_pid, target_wid, target_psn, prev_psn);
     }
 
     result
@@ -1392,10 +1459,11 @@ pub fn with_menu_shortcut_activation(
 #[cfg(test)]
 mod tests {
     use super::{
-        foreground_keyboard_focus_click_for_bundle_id, foreground_keyboard_focus_click_policy,
-        make_key_window_record, preserves_exact_existing_focus, should_deactivate_synthetic_target,
+        exact_window_is_ready, foreground_keyboard_focus_click_for_bundle_id,
+        foreground_keyboard_focus_click_policy, make_key_window_record,
+        preserves_exact_existing_focus, restore_transition, should_deactivate_synthetic_target,
         should_restore_previous_process, synthetic_focus_record, synthetic_target_focus_plan,
-        transient_route_authorizes_auxiliary_bypass,
+        transient_route_authorizes_auxiliary_bypass, RestoreTransition,
     };
 
     #[test]
@@ -1512,6 +1580,41 @@ mod tests {
             target
         ));
         assert!(!should_restore_previous_process(None, target));
+    }
+
+    #[test]
+    fn exact_window_readiness_requires_front_process_and_ax_window() {
+        let target = [1, 2, 3, 4, 5, 6, 7, 8];
+        let other = [8, 7, 6, 5, 4, 3, 2, 1];
+
+        assert!(exact_window_is_ready(Some(target), target, Some(42), 42));
+        assert!(!exact_window_is_ready(Some(other), target, Some(42), 42));
+        assert!(!exact_window_is_ready(Some(target), target, Some(41), 42));
+        assert!(!exact_window_is_ready(None, target, Some(42), 42));
+    }
+
+    #[test]
+    fn restore_transition_distinguishes_completion_pending_and_takeover() {
+        let target = [1, 2, 3, 4, 5, 6, 7, 8];
+        let previous = [8, 7, 6, 5, 4, 3, 2, 1];
+        let takeover = [9, 9, 9, 9, 9, 9, 9, 9];
+
+        assert_eq!(
+            restore_transition(Some(previous), target, previous),
+            RestoreTransition::Restored
+        );
+        assert_eq!(
+            restore_transition(Some(target), target, previous),
+            RestoreTransition::Pending
+        );
+        assert_eq!(
+            restore_transition(None, target, previous),
+            RestoreTransition::Pending
+        );
+        assert_eq!(
+            restore_transition(Some(takeover), target, previous),
+            RestoreTransition::Superseded
+        );
     }
 
     #[test]
