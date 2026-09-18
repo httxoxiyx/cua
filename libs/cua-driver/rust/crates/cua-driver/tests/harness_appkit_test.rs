@@ -1097,9 +1097,9 @@ fn harness_appkit_indexed_text_click_background() {
                     "indexed text click failed: {}",
                     clicked.raw
                 );
-                assert_eq!(clicked.structured()["path"], "cgevent");
-                assert_eq!(clicked.structured()["verified"], false);
-                assert_eq!(clicked.structured()["effect"], "unverifiable");
+                assert_eq!(clicked.action_route(), Some("synthetic_events"));
+                assert_eq!(clicked.action_delivery_mode(), Some("background"));
+                assert_eq!(clicked.action_effect(), Some("unverifiable"));
                 let observed = wait_for_keyboard_oracle(&oracle, "text_field_mouse_down");
                 assert_eq!(observed["pid"].as_u64(), Some(harness.pid as u64));
                 assert_eq!(observed["window_id"].as_u64(), Some(wid));
