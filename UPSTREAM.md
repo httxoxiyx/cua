@@ -4,17 +4,18 @@ This repository starts a new, standalone Git history for the Driver component;
 it does not claim original authorship of the imported code.
 
 - Original project: [trycua/cua](https://github.com/trycua/cua).
-- Import source: [httxoxiyx/cua](https://github.com/httxoxiyx/cua), GitHub
-  repository ID `1352768248`.
+- Import source: [httxoxiyx/cua-archive](https://github.com/httxoxiyx/cua-archive),
+  formerly `httxoxiyx/cua`, GitHub repository ID `1352768248`.
 - Exact source commit:
-  [`be9f243bf9e9c52f9fb3573effa993bcf7c78834`](https://github.com/httxoxiyx/cua/commit/be9f243bf9e9c52f9fb3573effa993bcf7c78834),
+  [`be9f243bf9e9c52f9fb3573effa993bcf7c78834`](https://github.com/httxoxiyx/cua-archive/commit/be9f243bf9e9c52f9fb3573effa993bcf7c78834),
   including the developer branch's native, PiP and optional-UniFFI changes.
 - Upstream authorship and prior changes remain available in the source history.
   Original copyright headers and license texts are retained unchanged.
 
-If the source repository is renamed to `cua-archive`, update the source links
-here before reusing its old name. A reused repository name cannot be relied on
-to redirect to the original history; the repository ID above identifies it.
+The source repository was renamed to `cua-archive` when this independent
+repository took the name `cua`. Source links use the archive explicitly:
+reusing a repository name removes the old-name redirect to its former history.
+The standalone repository has GitHub repository ID `1375969240`.
 
 ## Extraction boundary
 

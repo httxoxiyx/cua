@@ -2,8 +2,9 @@
 
 An independent development repository for the Cua Driver component, derived
 from [Cua](https://github.com/trycua/cua). This is not an official TryCua
-distribution. The temporary repository name is `cua-next` while the standalone
-source and packaging are qualified; the previous repository remains intact.
+distribution. The standalone repository is [httxoxiyx/cua](https://github.com/httxoxiyx/cua).
+The previous fork and its history remain intact at
+[httxoxiyx/cua-archive](https://github.com/httxoxiyx/cua-archive).
 
 ## Scope
 
