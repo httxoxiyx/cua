@@ -1,0 +1,184 @@
+//! Application-state snapshots used by trajectory recording on Linux.
+
+#[cfg(target_os = "linux")]
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
+
+#[cfg(target_os = "linux")]
+use crate::atspi::ElementCache;
+
+#[cfg(target_os = "linux")]
+static ELEMENT_CACHES: OnceLock<Mutex<HashMap<String, Weak<ElementCache>>>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+pub fn set_element_cache(cache: Arc<ElementCache>) {
+    let runtime_scope =
+        cua_driver_core::tool::current_dispatch_runtime_scope().unwrap_or_else(|| "legacy".into());
+    let mut caches = ELEMENT_CACHES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    caches.retain(|_, cache| cache.strong_count() > 0);
+    caches.insert(runtime_scope, Arc::downgrade(&cache));
+}
+
+#[cfg(target_os = "linux")]
+pub fn app_state_json_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::spawn(move || app_state_json_for_blocking(window_id, pid))
+            .join()
+            .ok()
+            .flatten();
+    }
+    app_state_json_for_blocking(window_id, pid)
+}
+
+#[cfg(target_os = "linux")]
+fn app_state_json_for_blocking(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
+    let pid = u32::try_from(pid?).ok()?;
+    let window_id = if crate::wayland::is_inject_mode() {
+        // Most injected actions already carry the protocol-verified window id.
+        // Process-scoped setup calls such as browser_prepare do not, so resolve
+        // their single target here instead of classifying required AX evidence
+        // as a capture failure.
+        match window_id {
+            Some(window_id) => window_id,
+            None => resolve_window_for_recording(pid, None)?.xid,
+        }
+    } else {
+        resolve_window_for_recording(pid, window_id)?.xid
+    };
+    let result = if crate::wayland::is_inject_mode() {
+        // Evidence capture runs inside the daemon call. Keep it below the
+        // transport deadline so an unresponsive renderer cannot block input.
+        crate::atspi::walk_tree_for_recording(pid, window_id, std::time::Duration::from_secs(2))
+    } else {
+        crate::atspi::walk_tree(pid, window_id, None)
+    };
+    if result.nodes.is_empty() || result.tree_markdown.trim().is_empty() {
+        return None;
+    }
+    let element_count = result
+        .nodes
+        .iter()
+        .filter(|node| node.element_index.is_some())
+        .count();
+    let payload = serde_json::json!({
+        "pid": pid,
+        "window_id": window_id,
+        "element_count": element_count,
+        "tree_markdown": result.tree_markdown,
+    });
+    serde_json::to_vec_pretty(&payload).ok()
+}
+
+#[cfg(target_os = "linux")]
+pub fn screenshot_for_recording(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
+    if crate::wayland::is_wayland() {
+        // Wayland surface ids are connection-scoped, so a later recording hook
+        // cannot safely re-attest the action call's per-window crop. Preserve
+        // ownership by recording the compositor's complete rendered output.
+        return crate::wayland::screenshot_display_dispatch().ok();
+    }
+    if let Some(window_id) = window_id {
+        crate::wayland::screenshot_dispatch(window_id).ok()
+    } else if let Some(pid) = pid.and_then(|pid| u32::try_from(pid).ok()) {
+        let windows = crate::wayland::list_windows_dispatch(Some(pid));
+        windows
+            .first()
+            .and_then(|window| crate::wayland::screenshot_dispatch(window.xid).ok())
+    } else {
+        crate::capture::screenshot_display_bytes().ok()
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn element_window_local_xy(
+    window_id: u64,
+    pid: i64,
+    snapshot_id: u32,
+    element_index: u32,
+) -> Option<(f64, f64)> {
+    let runtime_scope =
+        cua_driver_core::tool::current_dispatch_runtime_scope().unwrap_or_else(|| "legacy".into());
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::spawn(move || {
+            element_window_local_xy_blocking(
+                window_id,
+                pid,
+                snapshot_id,
+                element_index,
+                &runtime_scope,
+            )
+        })
+        .join()
+        .ok()
+        .flatten();
+    }
+    element_window_local_xy_blocking(window_id, pid, snapshot_id, element_index, &runtime_scope)
+}
+
+#[cfg(target_os = "linux")]
+fn element_window_local_xy_blocking(
+    window_id: u64,
+    pid: i64,
+    snapshot_id: u32,
+    element_index: u32,
+    runtime_scope: &str,
+) -> Option<(f64, f64)> {
+    let pid = u32::try_from(pid).ok()?;
+    let cache = ELEMENT_CACHES
+        .get()?
+        .lock()
+        .unwrap()
+        .get(runtime_scope)?
+        .upgrade()?;
+    let (screen_x, screen_y, width, height) = cache
+        .get_element_for_snapshot(pid, window_id, snapshot_id, element_index as usize)?
+        .screen_bounds?;
+    let window = resolve_window_for_recording(pid, Some(window_id))?;
+    Some((
+        f64::from(screen_x - window.x) + f64::from(width) / 2.0,
+        f64::from(screen_y - window.y) + f64::from(height) / 2.0,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_window_for_recording(
+    pid: u32,
+    window_id: Option<u64>,
+) -> Option<crate::x11::WindowInfo> {
+    let windows = crate::wayland::list_windows_dispatch(Some(pid));
+    if crate::wayland::is_wayland() {
+        // Foreign-toplevel protocol object ids are scoped to one Wayland
+        // connection. Recording hooks open a fresh connection, so re-resolve
+        // the target by pid instead of comparing an id from the action call.
+        windows.into_iter().next()
+    } else if let Some(window_id) = window_id {
+        windows.into_iter().find(|window| window.xid == window_id)
+    } else {
+        windows.into_iter().next()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn app_state_json_for(_window_id: Option<u64>, _pid: Option<i64>) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn screenshot_for_recording(_window_id: Option<u64>, _pid: Option<i64>) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn element_window_local_xy(
+    _window_id: u64,
+    _pid: i64,
+    _snapshot_id: u32,
+    _element_index: u32,
+) -> Option<(f64, f64)> {
+    None
+}

@@ -1,0 +1,10 @@
+.DS_Store
+**/target/
+**/node_modules/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc
+/.local-evidence/
+/build-*/
+/dist/

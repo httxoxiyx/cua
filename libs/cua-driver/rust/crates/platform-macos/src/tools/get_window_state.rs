@@ -1,0 +1,3141 @@
+use async_trait::async_trait;
+use cua_driver_core::{
+    protocol::{Content, ToolResult},
+    tool::{Tool, ToolDef},
+};
+use serde_json::Value;
+use std::sync::Arc;
+
+use super::ToolState;
+
+pub struct GetWindowStateTool {
+    state: Arc<ToolState>,
+}
+
+struct AppContextCommitRollback {
+    registry: Arc<crate::ax::app_context::AppContextDelegationRegistry>,
+    state: Arc<ToolState>,
+    ticket: crate::ax::app_context::DelegationObservationTicket,
+    target: crate::ax::app_context::AppContextTarget,
+    armed: bool,
+}
+
+impl AppContextCommitRollback {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AppContextCommitRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.registry
+            .revoke_committed_observation(&self.ticket, self.target);
+        invalidate_observation_target_state(
+            &self.state,
+            crate::transient_ui::WindowTarget {
+                pid: self.target.pid,
+                window_id: self.target.window_id,
+            },
+        );
+    }
+}
+
+impl GetWindowStateTool {
+    pub fn new(state: Arc<ToolState>) -> Self {
+        Self { state }
+    }
+}
+
+static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+
+fn def() -> &'static ToolDef {
+    DEF.get_or_init(|| ToolDef {
+        name: "get_window_state".into(),
+        description: "Walk a running app's AX tree and return BOTH a structured \
+            `elements` array (preferred) AND a Markdown rendering of the same tree \
+            (back-compat). Every actionable element is tagged with [element_index N] \
+            in the markdown and as `element_index` in the structured array — pass \
+            those indices to click, type_text, press_key, etc.\n\n\
+            INVARIANT: call get_window_state once per turn per resolved (pid, window_id) before any \
+            element-indexed action. The index map is replaced by the next snapshot.\n\n\
+            The default `window_selection:\"exact\"` preserves the existing contract and requires \
+            `window_id`. `window_selection:\"app_context\"` instead reselects the application's \
+            current AX context on every call using AXFocusedWindow, then AXMainWindow, then the \
+            final AXWindows entry. App-context calls require `expected_bundle_id`, or \
+            `expected_app_name` only when no bundle identity is available, so a recycled pid \
+            cannot silently observe another application. The selected exact pid/window_id and \
+            selection evidence are returned in structuredContent.\n\n\
+            PREFERRED CONSUMERS read `structuredContent.elements` (one entry per \
+            indexed row with `element_index`, `role`, `label`, `value` (the \
+            element's text/AXValue when present — use it to verify what a field \
+            holds), `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown \
+            `tree_markdown` stays available \
+            and unchanged in shape for existing text-parsing callers — but new \
+            fields will only be added to the structured side.\n\n\
+            By default returns BOTH the element tree AND a screenshot — ground on \
+            both and cross-check (the tree lies on some surfaces: Electron \
+            echo-confirms, Catalyst null values, virtualized off-viewport rows \
+            with `h:1` frames). You choose the modality at ACTION time, not here: \
+            an element ax action (pass `element_index`/`element_token` → the \
+            accessibility rung) or an element px action (pass `x`,`y` → the pixel \
+            rung, read straight off this screenshot). `capture_mode` is deprecated \
+            and ignored. Pass `include_elements:false` for a screenshot-only fast \
+            path after a surface is known to require visual grounding; pass \
+            `include_screenshot:false` for a tree-only re-index. At least one output \
+            must remain enabled.\n\n\
+            The snapshot is SCOPED to `window_id`: a window_id that no longer exists is \
+            refused with `window_id_not_found`, and one owned by another process is \
+            refused with `window_owner_pid_mismatch` naming the real `owner_pid` only for \
+            ordinary applications. macOS Open/Save panel helpers are private targets: direct \
+            observation is redacted and callers must use `window_selection:\"app_context\"` \
+            on the original host application. When the requested Shortcuts \
+            host window has its trusted system WorkflowKit view-service modal visible, \
+            this call observes that transient surface and reports `transient_ui`; callers \
+            may keep using the host target for a subsequent unaddressed foreground \
+            type_text/press_key/hotkey action. Helper AX elements and screenshot coordinates \
+            are intentionally non-actionable; pointer calls fail closed. The helper remains \
+            absent from app inventory. If the window is live under \
+            this pid but its accessibility surface can't be resolved, the tree comes back \
+            EMPTY with `degraded_reason: ax_window_unresolved` and the screenshot of the \
+            requested window — act by pixel there. This tool never returns another \
+            surface's elements under your window_id. Before exposing a screenshot, \
+            its raw dimensions are validated as a coherent 1x/2x representation of \
+            the requested WindowServer bounds. `px_frame_mismatch` or \
+            `px_capture_unavailable` omits an unprovable screenshot/pixel frame \
+            instead of guessing a transform; the truthful AX payload remains available.\n\n\
+            Optional `query` projects both tree_markdown and structured `elements` to \
+            matching lines plus their ancestor chain (case-insensitive substring). The \
+            element_index values are unchanged, the complete snapshot remains actionable, \
+            and `element_count` continues to report its total size; \
+            `filtered_element_count` reports the projected response size.\n\n\
+            Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
+            context-window blow-up on Electron / Obsidian / large web apps that \
+            produce 10k+ element trees. When applied, BOTH the markdown \
+            and the structured elements are truncated identically. Omit both for \
+            current default behaviour (≤2 000 elements, depth ≤25).".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["pid"],
+            "properties": {
+                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
+                "pid": { "type": "integer", "description": "Target process ID." },
+                "window_id": { "type": "integer", "description": "Target window ID from list_windows. Required for exact selection and omitted for app_context selection." },
+                "window_selection": {
+                    "type": "string",
+                    "enum": ["exact", "app_context"],
+                    "description": "Default exact. app_context reselects AXFocusedWindow, then AXMainWindow, then AXWindows.last inside this observation call."
+                },
+                "expected_bundle_id": {
+                    "type": "string",
+                    "description": "Expected live bundle identifier. Required for app_context unless expected_app_name is supplied for an app without a bundle identifier."
+                },
+                "expected_app_name": {
+                    "type": "string",
+                    "description": "Expected live application name. App-context identity fallback only when expected_bundle_id is omitted or the live process exposes no bundle identifier."
+                },
+                "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown and structured elements. Returns matching actionable rows plus their actionable ancestors without renumbering element_index values." },
+                "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
+                "include_screenshot": {
+                    "type": "boolean",
+                    "description": "Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return the tree only (the cheap path when you're just re-indexing before an element ax action; saves the image tokens + screen-grab latency). screenshot_out_file still forces a capture to disk."
+                },
+                "include_elements": {
+                    "type": "boolean",
+                    "description": "Default true. Set false for the screenshot-only fast path after the caller has established that the window is a canvas/WebGL/custom-drawn surface. This skips the AX walk and invalidates the prior element-index cache for the window; exact WindowServer ownership and screenshot-frame validation still apply."
+                },
+                "screenshot_out_file": {
+                    "type": "string",
+                    "description": "When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead."
+                },
+                "max_elements": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Cap on the total number of AX nodes walked. Truncates depth-first; markdown and structured elements truncate together. Omit for the default (2 000). Lower this for Electron / Obsidian / large web apps that produce 10k+ element trees and blow context windows."
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (25). Lower this for deep menu/Electron trees."
+                }
+            },
+            "additionalProperties": false
+        }),
+        read_only: true,
+        destructive: false,
+        idempotent: false,
+        open_world: false,
+    })
+}
+
+const NO_OBSERVATION_CONTENT: &str =
+    "get_window_state requires at least one of include_elements or include_screenshot";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservationPlan {
+    include_elements: bool,
+    include_screenshot: bool,
+}
+
+fn observation_plan(
+    include_elements: Option<bool>,
+    include_screenshot: Option<bool>,
+    has_screenshot_out_file: bool,
+) -> Result<ObservationPlan, &'static str> {
+    let plan = ObservationPlan {
+        include_elements: include_elements != Some(false),
+        include_screenshot: include_screenshot != Some(false) || has_screenshot_out_file,
+    };
+    if !plan.include_elements && !plan.include_screenshot {
+        Err(NO_OBSERVATION_CONTENT)
+    } else {
+        Ok(plan)
+    }
+}
+
+fn begin_transient_observation(
+    registry: &crate::transient_ui::TransientUiRegistry,
+    session: &crate::transient_ui::TransientSessionKey,
+    source: crate::transient_ui::WindowTarget,
+    observation_only: bool,
+) -> Option<crate::transient_ui::WindowTarget> {
+    if !observation_only {
+        // Revoke first. Every early return below therefore leaves no stale
+        // keyboard authorization from an older successful observation.
+        registry.clear_route(session, source)
+    } else {
+        None
+    }
+}
+
+fn invalidate_observation_target_state(
+    state: &ToolState,
+    target: crate::transient_ui::WindowTarget,
+) {
+    state
+        .element_cache
+        .update(target.pid, target.window_id, None, &[]);
+    state
+        .resize_registry
+        .clear_ratio(target.pid, target.window_id);
+    // Mint an unexposed empty generation to invalidate every previously
+    // published token for this exact target. No token for this generation is
+    // returned to the caller.
+    cua_driver_core::element_token::global().register_snapshot(target.pid, target.window_id, 0);
+}
+
+async fn lock_and_invalidate_app_context_targets(
+    state: &ToolState,
+    targets: Vec<crate::ax::app_context::AppContextTarget>,
+) -> Result<Option<crate::ax::app_context::AppContextTargetObservationLeases>, ToolResult> {
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    let registry = state.app_context_delegation_registry.clone();
+    let lease_targets = targets.clone();
+    let leases = tokio::task::spawn_blocking(move || {
+        registry.acquire_target_observation_leases(lease_targets)
+    })
+    .await
+    .map_err(|error| {
+        ToolResult::error(format!("Application-context target lease failed: {error}"))
+    })?;
+    for target in targets {
+        invalidate_observation_target_state(
+            state,
+            crate::transient_ui::WindowTarget {
+                pid: target.pid,
+                window_id: target.window_id,
+            },
+        );
+    }
+    Ok(Some(leases))
+}
+
+fn transient_target_from_detection(
+    detection: crate::transient_ui::TransientHelperDetection,
+    source: crate::transient_ui::WindowTarget,
+    rewrite_allowed: bool,
+) -> Result<Option<crate::transient_ui::WindowTarget>, ToolResult> {
+    match detection {
+        crate::transient_ui::TransientHelperDetection::None => Ok(None),
+        crate::transient_ui::TransientHelperDetection::Unique(target) if rewrite_allowed => {
+            Ok(Some(target))
+        }
+        crate::transient_ui::TransientHelperDetection::Unique(_) => {
+            Err(super::transient_ui_policy_refusal(source.pid, source.window_id))
+        }
+        crate::transient_ui::TransientHelperDetection::Ambiguous => Err(
+            ToolResult::error(
+                "Multiple trusted transient helper surfaces match the requested host window. The observation is ambiguous and was refused.",
+            )
+            .with_structured(serde_json::json!({
+                "code": "transient_ui_ambiguous",
+                "effect": "refused",
+                "pid": source.pid,
+                "window_id": source.window_id,
+                "retryable": true,
+                "suggestion": "Close the extra modal surface, then call get_window_state again."
+            })),
+        ),
+    }
+}
+
+fn apply_transient_observation_contract(
+    structured: &mut serde_json::Value,
+    source: crate::transient_ui::WindowTarget,
+    target: crate::transient_ui::WindowTarget,
+) {
+    // The stable public target remains the caller-authorized host. The helper
+    // is deliberately nested as a non-actionable visual surface so clients do
+    // not feed its pid/window or screenshot coordinates back into ordinary
+    // click/AX APIs.
+    structured["pid"] = serde_json::json!(source.pid);
+    structured["window_id"] = serde_json::json!(source.window_id);
+    structured["transient_ui"] = serde_json::json!({
+        "routed": true,
+        "host_pid": source.pid,
+        "host_window_id": source.window_id,
+        "host_target": {
+            "pid": source.pid,
+            "window_id": source.window_id
+        },
+        "visual_target": {
+            "pid": target.pid,
+            "window_id": target.window_id,
+            "screenshot_visible": true,
+            "pixel_actions_supported": false,
+            "ax_actions_supported": false
+        },
+        "input_policy": "foreground_keyboard_only",
+        "reason": "visible out-of-process modal helper associated with the requested host window",
+        "action_guidance": "Keep using the host pid/window_id. Only an unaddressed type_text, press_key, or hotkey with delivery_mode:\"foreground\" may be routed after revalidation; do not use screenshot coordinates, element_index, element_token, or the helper target directly."
+    });
+    structured["screenshot_target"] = serde_json::json!("transient_ui.visual_target");
+    structured["_note"] = serde_json::json!(
+        "This response keeps the requested host as the public target. The image shows transient_ui.visual_target for visual verification only; no actionable AX elements or pixel coordinate target are published for that helper."
+    );
+}
+
+fn commit_transient_observation(
+    registry: &crate::transient_ui::TransientUiRegistry,
+    session: &crate::transient_ui::TransientSessionKey,
+    source: crate::transient_ui::WindowTarget,
+    target: crate::transient_ui::WindowTarget,
+    observation_only: bool,
+) {
+    if !observation_only {
+        registry.record(session, source, Some(target));
+    }
+}
+
+async fn join_observation_branches<Tree, Screenshot, TreeFuture, ScreenshotFuture>(
+    tree: TreeFuture,
+    screenshot: ScreenshotFuture,
+) -> (Tree, Screenshot)
+where
+    TreeFuture: std::future::Future<Output = Tree>,
+    ScreenshotFuture: std::future::Future<Output = Screenshot>,
+{
+    tokio::join!(tree, screenshot)
+}
+
+type CapturedScreenshot = (
+    Vec<u8>,
+    u32,
+    u32,
+    Option<u32>,
+    crate::windows::WindowBounds,
+    f64,
+);
+
+fn capture_screenshot(
+    window_id: u32,
+    max_dim: u32,
+) -> Result<CapturedScreenshot, super::px_frame::PxFrameError> {
+    let bounds = crate::windows::window_bounds_by_id(window_id)
+        .filter(|bounds| bounds.width > 0.0 && bounds.height > 0.0)
+        .ok_or(super::px_frame::PxFrameError::WindowNotFound { window_id })?;
+    let raw = crate::capture::screenshot_window_bytes(window_id).map_err(|error| {
+        super::px_frame::PxFrameError::CaptureUnavailable {
+            window_id,
+            reason: error.to_string(),
+        }
+    })?;
+    let (original_width, original_height) =
+        crate::capture::png_dimensions(&raw).map_err(|error| {
+            super::px_frame::PxFrameError::CaptureUnavailable {
+                window_id,
+                reason: error.to_string(),
+            }
+        })?;
+    let scale = super::px_frame::validate_capture_frame(
+        window_id,
+        &bounds,
+        original_width,
+        original_height,
+    )?;
+    let png = crate::capture::resize_png_if_needed(&raw, max_dim).map_err(|error| {
+        super::px_frame::PxFrameError::CaptureUnavailable {
+            window_id,
+            reason: error.to_string(),
+        }
+    })?;
+    let (width, height) = crate::capture::png_dimensions(&png).map_err(|error| {
+        super::px_frame::PxFrameError::CaptureUnavailable {
+            window_id,
+            reason: error.to_string(),
+        }
+    })?;
+    let resized_from_width = (width < original_width).then_some(original_width);
+
+    Ok((png, width, height, resized_from_width, bounds, scale))
+}
+
+fn apply_application_menu_metadata(
+    structured: &mut Value,
+    menu: &crate::ax::application_menu::ApplicationMenuImage,
+    scale: f64,
+) {
+    // AX tokens remain document-anchored; these pixels deliberately do not.
+    structured["window_bounds"] = serde_json::json!({
+        "x":menu.document_bounds.x,"y":menu.document_bounds.y,
+        "width":menu.document_bounds.width,"height":menu.document_bounds.height,
+    });
+    structured["screenshot_scope"] = serde_json::json!("application_menu");
+    structured["screenshot_coordinates_actionable"] = serde_json::json!(false);
+    structured["screenshot_target"] = serde_json::json!("application_menu.visual_target");
+    structured["screenshot_scale"] = serde_json::json!(scale);
+    structured["application_menu"] = serde_json::json!({
+        "host_pid":menu.pid,"host_window_id":menu.document_window_id,
+        "visual_target":{
+            "pid":menu.pid,"window_id":menu.menu_window_id,
+            "window_bounds":{
+                "x":menu.menu_bounds.x,"y":menu.menu_bounds.y,
+                "width":menu.menu_bounds.width,"height":menu.menu_bounds.height,
+            },
+        },
+    });
+}
+
+fn chromium_browser_window(pid: i32) -> bool {
+    let identity = format!(
+        "{} {}",
+        crate::apps::get_app_name_for_pid(pid).unwrap_or_default(),
+        crate::apps::bundle_id_for_pid(pid).unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    identity
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| {
+            matches!(
+                token,
+                "chrome"
+                    | "chromium"
+                    | "brave"
+                    | "edge"
+                    | "vivaldi"
+                    | "opera"
+                    | "arc"
+                    | "thorium"
+                    | "iridium"
+                    | "yandex"
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowSelectionMode {
+    Exact,
+    AppContext,
+}
+
+fn window_selection_mode(args: &Value) -> Result<WindowSelectionMode, ToolResult> {
+    match args
+        .get("window_selection")
+        .and_then(Value::as_str)
+        .unwrap_or("exact")
+    {
+        "exact" => Ok(WindowSelectionMode::Exact),
+        "app_context" => Ok(WindowSelectionMode::AppContext),
+        value => Err(ToolResult::error(format!(
+            "get_window_state: unsupported window_selection '{value}'"
+        ))
+        .with_structured(serde_json::json!({
+            "code": "invalid_window_selection",
+            "effect": "refused",
+            "retryable": false,
+            "window_selection": value,
+        }))),
+    }
+}
+
+fn expected_app_identity(
+    args: &Value,
+) -> Result<crate::ax::app_context::ExpectedAppIdentity, ToolResult> {
+    let non_empty = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let expected = crate::ax::app_context::ExpectedAppIdentity {
+        bundle_id: non_empty("expected_bundle_id"),
+        app_name: non_empty("expected_app_name"),
+    };
+    if expected.bundle_id.is_none() && expected.app_name.is_none() {
+        return Err(ToolResult::error(
+            "get_window_state app_context requires expected_bundle_id or expected_app_name so a recycled pid cannot select another application.",
+        )
+        .with_structured(serde_json::json!({
+            "code": "app_context_identity_required",
+            "effect": "refused",
+            "retryable": true,
+            "suggestion": "Refresh list_apps, then retry with its bundle_id as expected_bundle_id (preferred) or its name as expected_app_name."
+        })));
+    }
+    Ok(expected)
+}
+
+fn process_identity_mismatch_refusal(
+    pid: i32,
+    expected: &crate::ax::app_context::ExpectedAppIdentity,
+    actual: Option<&crate::ax::app_context::RunningAppIdentity>,
+) -> ToolResult {
+    ToolResult::error(format!(
+        "Process {pid} no longer matches the expected application identity. Refresh list_apps before retrying."
+    ))
+    .with_structured(serde_json::json!({
+        "code": "process_identity_mismatch",
+        "effect": "refused",
+        "retryable": true,
+        "pid": pid,
+        "expected_bundle_id": expected.bundle_id,
+        "expected_app_name": expected.app_name,
+        "actual_bundle_id": actual.and_then(|identity| identity.bundle_id.as_deref()),
+        "actual_app_name": actual.and_then(|identity| identity.app_name.as_deref()),
+        "suggestion": "Refresh list_apps and create a new app binding before retrying."
+    }))
+}
+
+fn app_context_resolution_refusal(
+    pid: i32,
+    expected: &crate::ax::app_context::ExpectedAppIdentity,
+    error: &crate::ax::app_context::AppContextResolveError,
+) -> ToolResult {
+    use crate::ax::app_context::AppContextResolveError;
+
+    match error {
+        AppContextResolveError::ProcessNotFound => {
+            process_identity_mismatch_refusal(pid, expected, None)
+        }
+        AppContextResolveError::ProcessIdentityMismatch { actual } => {
+            process_identity_mismatch_refusal(pid, expected, actual.as_ref())
+        }
+        AppContextResolveError::Selection(reason) => ToolResult::error(format!(
+            "The current application window context could not be resolved: {}.",
+            reason.as_str()
+        ))
+        .with_structured(serde_json::json!({
+            "code": "app_context_unresolved",
+            "effect": "refused",
+            "retryable": true,
+            "pid": pid,
+            "reason": reason.as_str(),
+            "suggestion": "Retry after the application settles, or call list_windows and use an explicit window_id."
+        })),
+        AppContextResolveError::WindowServerUnavailable => ToolResult::error(
+            "WindowServer could not validate the selected application window.",
+        )
+        .with_structured(serde_json::json!({
+            "code": "app_context_resolution_failed",
+            "effect": "refused",
+            "retryable": true,
+            "pid": pid,
+        })),
+        AppContextResolveError::SelectedWindowNotFound { window_id } => ToolResult::error(format!(
+            "The selected application window {window_id} disappeared before observation."
+        ))
+        .with_structured(serde_json::json!({
+            "code": "app_context_changed_during_observation",
+            "effect": "refused",
+            "retryable": true,
+            "pid": pid,
+            "selected_window_id": window_id,
+        })),
+        AppContextResolveError::SelectedWindowOwnerMismatch {
+            window_id,
+            owner_pid,
+            owner_app_name,
+        } => app_context_owner_mismatch_refusal(
+            pid,
+            *window_id,
+            *owner_pid,
+            owner_app_name,
+        ),
+    }
+}
+
+fn app_context_owner_mismatch_refusal(
+    host_pid: i32,
+    window_id: u32,
+    owner_pid: i32,
+    owner_app_name: &str,
+) -> ToolResult {
+    if crate::ax::app_context::hide_open_save_panel_from_inventory(owner_pid, owner_app_name) {
+        return super::app_context_delegation_direct_target_refusal();
+    }
+    ToolResult::error(format!(
+        "The selected AX context maps to window {window_id}, which is owned by pid {owner_pid}, not the requested host pid {host_pid}. Automatic cross-process window following is not authorized."
+    ))
+    .with_structured(serde_json::json!({
+        "code": "app_context_cross_process_target_unsupported",
+        "effect": "refused",
+        "retryable": true,
+        "pid": host_pid,
+        "selected_window_id": window_id,
+        "owner_pid": owner_pid,
+        "suggestion": "Refresh list_windows and obtain explicit authorization for the ordinary foreign application's exact pid/window_id."
+    }))
+}
+
+fn app_context_changed_refusal(
+    pid: i32,
+    before_window_id: u32,
+    after_window_id: u32,
+) -> ToolResult {
+    ToolResult::error(format!(
+        "The application's selected window changed from {before_window_id} to {after_window_id} while it was being observed."
+    ))
+    .with_structured(serde_json::json!({
+        "code": "app_context_changed_during_observation",
+        "effect": "refused",
+        "retryable": true,
+        "pid": pid,
+        "before_window_id": before_window_id,
+        "after_window_id": after_window_id,
+        "suggestion": "Retry get_window_state with window_selection:\"app_context\"."
+    }))
+}
+
+fn release_unpublished_tree_result(tree_result: &Option<crate::ax::tree::TreeWalkResult>) {
+    use core_foundation::base::{CFRelease, CFTypeRef};
+
+    let Some(tree) = tree_result else {
+        return;
+    };
+    for node in tree
+        .nodes
+        .iter()
+        .filter(|node| node.element_index.is_some())
+    {
+        unsafe { CFRelease(node.element_ptr as crate::ax::bindings::AXUIElementRef as CFTypeRef) };
+    }
+}
+
+#[async_trait]
+impl Tool for GetWindowStateTool {
+    fn def(&self) -> &ToolDef {
+        def()
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        use cua_driver_core::tool_args::ArgsExt;
+        let requested_pid = match args.require_i32("pid") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let selection_mode = match window_selection_mode(&args) {
+            Ok(mode) => mode,
+            Err(error) => return error,
+        };
+        // The AppKit Open/Save service (and other trusted transient helpers)
+        // is never a public application binding, including when the caller
+        // asks it to select its own app-context window. Only an ordinary host
+        // app_context observation may resolve the helper cross-process.
+        let direct_helper = tokio::task::spawn_blocking(move || {
+            (
+                crate::ax::app_context::looks_like_open_save_panel_process(requested_pid),
+                crate::transient_ui::is_trusted_transient_helper_process(requested_pid),
+            )
+        })
+        .await;
+        match direct_helper {
+            Ok((open_save, trusted_transient)) => {
+                if let Some(refusal) =
+                    direct_observation_target_refusal(requested_pid, open_save, trusted_transient)
+                {
+                    return refusal;
+                }
+            }
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "Could not validate the requested observation target: {error}"
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "transient_ui_resolution_failed",
+                    "effect": "refused",
+                    "retryable": true
+                }))
+            }
+        }
+        // Internal direct-tool mode used by verify_state. Registry ingress
+        // strips underscore-prefixed arguments before public dispatch; only
+        // a trusted direct in-process invocation can enable this mode.
+        let observation_only = args
+            .get("_observation_only")
+            .and_then(|value| value.as_bool())
+            == Some(true);
+        let transient_session = crate::transient_ui::TransientSessionKey::from_args(&args);
+        let mut app_context_observation = None;
+        // Kept alive through final route commit/response construction. Actions
+        // hold the read side of the same gate, so a refresh cannot revoke a
+        // generation after an action resolves it but before input is sent.
+        let mut _app_context_observation_lease = None;
+        // A trusted Open/Save panel is hosted by a process shared across
+        // applications. Hold a second, physical-target writer from the first
+        // successful delegation resolution through capture and commit so a
+        // different host cannot rebind the same helper window underneath us.
+        let mut _app_context_target_observation_lease = None;
+        let mut removed_app_context_targets = Vec::new();
+        let base_target = match selection_mode {
+            WindowSelectionMode::Exact => {
+                let window_id = match args.require_u32("window_id") {
+                    Ok(v) => v,
+                    Err(e) => return e,
+                };
+                crate::ax::app_context::AppContextTarget {
+                    pid: requested_pid,
+                    window_id,
+                }
+            }
+            WindowSelectionMode::AppContext => {
+                if args.get("window_id").is_some() {
+                    return ToolResult::error(
+                        "get_window_state app_context selects its own window; omit window_id.",
+                    )
+                    .with_structured(serde_json::json!({
+                        "code": "app_context_window_id_conflict",
+                        "effect": "refused",
+                        "retryable": false,
+                    }));
+                }
+                let expected = match expected_app_identity(&args) {
+                    Ok(expected) => expected,
+                    Err(error) => return error,
+                };
+                let ticket = if observation_only {
+                    None
+                } else {
+                    let registry = self.state.app_context_delegation_registry.clone();
+                    let lease_session = transient_session.clone();
+                    let lease = match tokio::task::spawn_blocking(move || {
+                        registry.acquire_observation_lease(&lease_session, requested_pid)
+                    })
+                    .await
+                    {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            return ToolResult::error(format!(
+                                "Application-context observation lease failed: {error}"
+                            ))
+                        }
+                    };
+                    // Revoke before every fallible selection/capture step. A
+                    // failed refresh must never leave a previously observed
+                    // panel action capability alive in this session.
+                    let (ticket, removed) = self
+                        .state
+                        .app_context_delegation_registry
+                        .begin_observation(&transient_session, requested_pid);
+                    _app_context_observation_lease = Some(lease);
+                    removed_app_context_targets = removed;
+                    Some(ticket)
+                };
+                let expected_for_resolution = expected.clone();
+                let resolution = tokio::task::spawn_blocking(move || {
+                    crate::ax::app_context::resolve_app_context(
+                        requested_pid,
+                        &expected_for_resolution,
+                    )
+                })
+                .await;
+                let mut resolved = match resolution {
+                    Ok(Ok(resolved)) => resolved,
+                    Ok(Err(error)) => {
+                        if let Err(cleanup_error) = lock_and_invalidate_app_context_targets(
+                            &self.state,
+                            std::mem::take(&mut removed_app_context_targets),
+                        )
+                        .await
+                        {
+                            return cleanup_error;
+                        }
+                        return app_context_resolution_refusal(requested_pid, &expected, &error);
+                    }
+                    Err(error) => {
+                        if let Err(cleanup_error) = lock_and_invalidate_app_context_targets(
+                            &self.state,
+                            std::mem::take(&mut removed_app_context_targets),
+                        )
+                        .await
+                        {
+                            return cleanup_error;
+                        }
+                        return ToolResult::error(format!(
+                            "Application-context selection task failed: {error}"
+                        ))
+                        .with_structured(serde_json::json!({
+                            "code": "app_context_resolution_failed",
+                            "effect": "refused",
+                            "retryable": true,
+                            "pid": requested_pid,
+                        }));
+                    }
+                };
+                if resolved.delegation.is_some()
+                    && !cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite()
+                {
+                    let mut targets = std::mem::take(&mut removed_app_context_targets);
+                    targets.push(resolved.target);
+                    if let Err(cleanup_error) =
+                        lock_and_invalidate_app_context_targets(&self.state, targets).await
+                    {
+                        return cleanup_error;
+                    }
+                    return super::app_context_delegation_policy_refusal();
+                }
+                let mut targets_to_lock = std::mem::take(&mut removed_app_context_targets);
+                if resolved.delegation.is_some() {
+                    targets_to_lock.push(resolved.target);
+                }
+                _app_context_target_observation_lease =
+                    match lock_and_invalidate_app_context_targets(&self.state, targets_to_lock)
+                        .await
+                    {
+                        Ok(leases) => leases,
+                        Err(error) => return error,
+                    };
+                if let (Some(ticket), Some(delegation)) =
+                    (ticket.as_ref(), resolved.delegation.as_ref())
+                {
+                    let target = delegation.target;
+                    let Some(removed) = self
+                        .state
+                        .app_context_delegation_registry
+                        .bind_observation_target(ticket, target)
+                    else {
+                        return ToolResult::error(
+                            "The Open/Save panel changed before its observation could begin. Re-observe the host application.",
+                        )
+                        .with_structured(serde_json::json!({
+                            "code": "app_context_changed_during_observation",
+                            "effect": "refused",
+                            "retryable": true,
+                        }));
+                    };
+                    for previous in removed {
+                        invalidate_observation_target_state(
+                            &self.state,
+                            crate::transient_ui::WindowTarget {
+                                pid: previous.pid,
+                                window_id: previous.window_id,
+                            },
+                        );
+                    }
+
+                    // Resolution may have waited behind an action on this
+                    // shared helper target. Re-prove the complete host→panel
+                    // association only after taking the target writer.
+                    let expected_for_recheck = expected.clone();
+                    let recheck = tokio::task::spawn_blocking(move || {
+                        crate::ax::app_context::resolve_app_context(
+                            requested_pid,
+                            &expected_for_recheck,
+                        )
+                    })
+                    .await;
+                    let refreshed = match recheck {
+                        Ok(Ok(refreshed))
+                            if refreshed.target == resolved.target
+                                && refreshed.delegation == resolved.delegation =>
+                        {
+                            refreshed
+                        }
+                        _ => {
+                            return ToolResult::error(
+                                "The Open/Save panel changed before its observation could begin. Re-observe the host application.",
+                            )
+                            .with_structured(serde_json::json!({
+                                "code": "app_context_changed_during_observation",
+                                "effect": "refused",
+                                "retryable": true,
+                            }));
+                        }
+                    };
+                    resolved = refreshed;
+                }
+                let target = resolved.target;
+                app_context_observation = Some((expected, resolved, ticket));
+                target
+            }
+        };
+        let requested_window_id = base_target.window_id;
+        let source_target = crate::transient_ui::WindowTarget {
+            pid: base_target.pid,
+            window_id: base_target.window_id,
+        };
+        let delegated_panel = app_context_observation
+            .as_ref()
+            .is_some_and(|(_, resolved, _)| resolved.delegation.is_some());
+        let previous_transient_target = if delegated_panel {
+            None
+        } else {
+            begin_transient_observation(
+                &self.state.transient_ui_registry,
+                &transient_session,
+                source_target,
+                observation_only,
+            )
+        };
+        if !observation_only {
+            invalidate_observation_target_state(&self.state, source_target);
+            if let Some(previous) = previous_transient_target {
+                if previous != source_target {
+                    invalidate_observation_target_state(&self.state, previous);
+                }
+            }
+        }
+
+        // Issue #2237: pre-flight the requested window against WindowServer
+        // BEFORE the (up to 20 s) AX walk. An id that no window carries, or
+        // that another process owns, used to fall through the scoped filter and
+        // return the app's MENU BAR as a healthy snapshot of the requested
+        // window — with a screenshot of the requested window beside it. macOS
+        // hosts every sandboxed app's Open/Save panel in
+        // `com.apple.appkit.xpc.openAndSavePanelService`, so the owner-mismatch
+        // shape is routine, and the caller must be told the real owner pid.
+        {
+            let owner = match tokio::task::spawn_blocking(move || {
+                crate::windows::resolve_window_owner(base_target.pid, base_target.window_id)
+            })
+            .await
+            {
+                Ok(owner) => owner,
+                Err(e) => {
+                    return window_owner_resolution_failure(
+                        base_target.pid,
+                        base_target.window_id,
+                        e.to_string(),
+                    )
+                }
+            };
+            if let Some(scope) = crate::ax::window_scope::scope_from_owner(&owner) {
+                if let Some(refusal) =
+                    window_scope_refusal(base_target.pid, base_target.window_id, &scope)
+                {
+                    return refusal;
+                }
+            }
+        }
+
+        // Window-specific capture APIs can composite a same-process child
+        // window over the requested host even though input remains addressed
+        // to the host CGWindowID.  Refuse that split-brain observation and
+        // return one narrowly proven redirect instead.  The caller must make a
+        // second exact get_window_state call for the transient, which keeps the
+        // normal exact-window cache/token contract intact.
+        if !delegated_panel {
+            if let Err(refusal) =
+                super::guard_same_pid_transient_target(base_target.pid, Some(base_target.window_id))
+                    .await
+            {
+                return refusal;
+            }
+        }
+
+        // A modal UI can be rendered by an AppKit/XPC helper while the
+        // public app identity and cached host window remain stable. Resolve
+        // only the explicitly trusted Shortcuts → system WorkflowKit service
+        // pair, then additionally require matching WindowServer name/title,
+        // modal layer, and containment. This does not add the helper to
+        // list_apps.
+        let transient_target = if delegated_panel {
+            None
+        } else {
+            let transient_detection = tokio::task::spawn_blocking(move || {
+                crate::transient_ui::detect_visible_transient_helper(source_target)
+            })
+            .await;
+            match transient_detection {
+                Ok(detection) => match transient_target_from_detection(
+                    detection,
+                    source_target,
+                    cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite(
+                    ),
+                ) {
+                    Ok(target) => target,
+                    Err(refusal) => return refusal,
+                },
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "Could not resolve transient UI for the requested host window: {error}"
+                    ))
+                    .with_structured(serde_json::json!({
+                        "code": "transient_ui_resolution_failed",
+                        "effect": "refused",
+                        "retryable": true
+                    }))
+                }
+            }
+        };
+        let (pid, window_id) = transient_target
+            .map(|target| (target.pid, target.window_id))
+            .unwrap_or((base_target.pid, base_target.window_id));
+
+        let query = args.opt_str("query");
+        let screenshot_out_file = args.opt_str("screenshot_out_file").map(|s| {
+            // Expand ~ prefix.
+            if let Some(relative) = s.strip_prefix("~/") {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{home}/{relative}")
+            } else {
+                s
+            }
+        });
+        // Effective config resolves call-arg > session-override > global. The
+        // daemon injects `_session_id` for named MCP sessions; absent => global.
+        let session_id = args.opt_str("_session_id");
+        let effective_max_dim = {
+            let cfg = self.state.config.read().unwrap();
+            self.state
+                .session_config
+                .effective_max_image_dimension(session_id.as_deref(), &cfg)
+        };
+        // `capture_mode` is DEPRECATED and ignored. The default remains the
+        // cross-checked tree+screenshot observation. `include_elements:false`
+        // is the explicit screenshot-only fast path for a caller that has
+        // already established the surface is canvas/WebGL/custom-drawn.
+        let include_elements = args.get("include_elements").and_then(|v| v.as_bool());
+        let include_screenshot = args.get("include_screenshot").and_then(|v| v.as_bool());
+        let plan = match observation_plan(
+            include_elements,
+            include_screenshot,
+            screenshot_out_file.is_some(),
+        ) {
+            Ok(plan) => plan,
+            Err(message) => {
+                return ToolResult::error(message).with_structured(serde_json::json!({
+                    "code": "empty_observation_requested",
+                    "suggestion": "enable include_elements or include_screenshot"
+                }))
+            }
+        };
+        if transient_target.is_some() && !plan.include_screenshot {
+            return ToolResult::error(
+                "A trusted transient helper is visible, but helper AX elements are intentionally non-actionable. Re-call with include_screenshot:true to observe its visual surface safely.",
+            )
+            .with_structured(serde_json::json!({
+                "code": "transient_ui_requires_visual_observation",
+                "effect": "refused",
+                "pid": requested_pid,
+                "window_id": requested_window_id,
+                "retryable": true,
+                "suggestion": "Call get_window_state again with include_screenshot:true."
+            }));
+        }
+        // Optional caps — when omitted, fall back to the defaults baked into
+        // the AX walker (#22865). minimum:1 keyed in the schema, but defend
+        // against 0 here as well so a misbehaving client can't disable the
+        // walk entirely.
+        let max_elements = args
+            .get("max_elements")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.max(1) as usize)
+            .unwrap_or(crate::ax::tree::DEFAULT_MAX_ELEMENTS);
+        let max_depth = args
+            .get("max_depth")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.max(1) as usize)
+            .unwrap_or(crate::ax::tree::DEFAULT_MAX_DEPTH);
+
+        // The expensive AX walk and screenshot encode are independent after
+        // the exact-window ownership preflight, so start both before awaiting
+        // either. Default latency becomes approximately max(tree, screenshot)
+        // instead of their sum.
+        let tree_branch = async {
+            if !plan.include_elements || transient_target.is_some() {
+                return Ok::<Option<crate::ax::tree::TreeWalkResult>, ToolResult>(None);
+            }
+            let q = query.clone();
+            // Keep the product deadline below the public client's 25-second
+            // deadline so callers receive a structured driver error. The AX
+            // walker also applies a native per-element messaging timeout because
+            // dropping a spawn_blocking JoinHandle cannot cancel a blocked AX call.
+            let walk_future = tokio::task::spawn_blocking(move || {
+                if delegated_panel {
+                    crate::ax::tree::walk_tree_bounded_strict_window(
+                        pid,
+                        window_id,
+                        q.as_deref(),
+                        max_elements,
+                        max_depth,
+                    )
+                } else {
+                    crate::ax::tree::walk_tree_bounded(
+                        pid,
+                        Some(window_id),
+                        q.as_deref(),
+                        max_elements,
+                        max_depth,
+                    )
+                }
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(20), walk_future).await {
+                Ok(Ok(result)) => Ok(Some(result)),
+                Ok(Err(error)) => Err(ToolResult::error(format!("AX tree walk failed: {error}"))),
+                Err(_elapsed) => Err(ToolResult::error(format!(
+                    "AX tree walk for pid={pid} timed out after 20 s. \
+                         The app (likely Arc, Electron, or Safari with many tabs) has a \
+                         pathologically large accessibility tree. \
+                         Workaround: re-call with a depth-limited scan \
+                         (max_elements / max_depth), then act by pixel (x,y) off \
+                         the screenshot if the tree stays unusable."
+                ))),
+            }
+        };
+
+        let screenshot_branch = async {
+            if !plan.include_screenshot {
+                return (None, None, None);
+            }
+            match tokio::task::spawn_blocking(move || {
+                let menu = if !observation_only && transient_target.is_none() && !delegated_panel {
+                    crate::ax::application_menu::active_application_menu(pid, window_id)
+                } else {
+                    None
+                };
+                let capture_id = menu.as_ref().map_or(window_id, |menu| menu.menu_window_id);
+                capture_screenshot(capture_id, effective_max_dim).map(|image| (image, menu))
+            })
+            .await
+            {
+                Ok(Ok((screenshot, menu))) => (Some(screenshot), None, menu),
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        "Screenshot frame could not be verified for window {window_id}: {error:?}"
+                    );
+                    (None, Some(error), None)
+                }
+                Err(error) => {
+                    tracing::warn!("Screenshot task error for window {window_id}: {error}");
+                    (None, None, None)
+                }
+            }
+        };
+
+        let (tree_result, screenshot_result) =
+            join_observation_branches(tree_branch, screenshot_branch).await;
+        let tree_result = match tree_result {
+            Ok(tree) => tree,
+            Err(error) => return error,
+        };
+        let (captured_screenshot, screenshot_frame_error, application_menu) = screenshot_result;
+
+        // App-context observations choose their exact window inside this call.
+        // Re-read the application identity and selection after both observation
+        // branches complete, before publishing pixels, caches, tokens, files, or
+        // PiP state. A focus/main handoff or pid reuse therefore yields a clean
+        // retryable refusal rather than a response labelled as the new context
+        // while carrying the old window's data.
+        if let Some((expected, context, _ticket)) = app_context_observation.as_mut() {
+            let before = context.clone();
+            let expected_for_resolution = expected.clone();
+            let after = tokio::task::spawn_blocking(move || {
+                crate::ax::app_context::resolve_app_context(requested_pid, &expected_for_resolution)
+            })
+            .await;
+            let after = match after {
+                Ok(Ok(after)) => after,
+                Ok(Err(error)) => {
+                    release_unpublished_tree_result(&tree_result);
+                    return app_context_resolution_refusal(requested_pid, expected, &error);
+                }
+                Err(error) => {
+                    release_unpublished_tree_result(&tree_result);
+                    return ToolResult::error(format!(
+                        "Application-context revalidation task failed: {error}"
+                    ))
+                    .with_structured(serde_json::json!({
+                        "code": "app_context_resolution_failed",
+                        "effect": "refused",
+                        "retryable": true,
+                        "pid": requested_pid,
+                    }));
+                }
+            };
+            match crate::ax::app_context::accept_revalidated_app_context(&before, after) {
+                Ok(after) => *context = after,
+                Err(after_context) => {
+                    release_unpublished_tree_result(&tree_result);
+                    return app_context_changed_refusal(
+                        requested_pid,
+                        before.selection.window_id,
+                        after_context.selection.window_id,
+                    );
+                }
+            }
+        }
+
+        if let Some(target) = transient_target {
+            // Re-prove the association before any file, cache, token, resize,
+            // route, or response state is committed. The capture itself is
+            // side-effect free; everything after this point can safely use the
+            // same validated physical surface.
+            let final_detection = tokio::task::spawn_blocking(move || {
+                crate::transient_ui::detect_visible_transient_helper(source_target)
+            })
+            .await;
+            if !matches!(
+                final_detection,
+                Ok(crate::transient_ui::TransientHelperDetection::Unique(current))
+                    if current == target
+            ) {
+                return ToolResult::error(
+                    "The transient helper changed or closed while it was being observed. Re-observe the host app; no foreground input route was retained.",
+                )
+                .with_structured(serde_json::json!({
+                    "code": "transient_ui_changed_during_observation",
+                    "effect": "refused",
+                    "pid": requested_pid,
+                    "window_id": requested_window_id,
+                    "retryable": true,
+                    "suggestion": "Call get_window_state for the host app again."
+                }));
+            }
+        }
+
+        if let Some(menu) = application_menu.as_ref() {
+            let proof = menu.clone();
+            if !tokio::task::spawn_blocking(move || {
+                crate::ax::application_menu::revalidate_menu_image(&proof)
+            })
+            .await
+            .unwrap_or(false)
+            {
+                release_unpublished_tree_result(&tree_result);
+                return ToolResult::error(
+                    "The application menu changed during observation. Re-observe the application; no menu pixels or new AX binding were published.",
+                ).with_structured(serde_json::json!({
+                    "code":"application_menu_changed_during_observation",
+                    "effect":"refused","retryable":true,"pid":pid,"window_id":window_id,
+                }));
+            }
+        }
+
+        // Re-prove the exact native owner after the pixels were captured and
+        // before any image/file-path is returned. A CGWindowID can disappear
+        // or be recycled while the AX walk and screenshot run in parallel;
+        // publishing that frame under the old (pid, window_id) would bind
+        // pixels from a different surface to the caller's target.
+        let captured_screenshot = if let Some(screenshot) = captured_screenshot {
+            let owner = match tokio::task::spawn_blocking(move || {
+                crate::windows::resolve_window_owner(pid, window_id)
+            })
+            .await
+            {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return window_owner_resolution_failure(pid, window_id, error.to_string())
+                }
+            };
+            let scope = crate::ax::window_scope::scope_from_owner(&owner);
+            match publish_after_window_scope_check(pid, window_id, scope.as_ref(), || screenshot) {
+                Ok(screenshot) => Some(screenshot),
+                Err(error) => return error,
+            }
+        } else {
+            None
+        };
+
+        // The window can close, or its CGWindow can be re-parented onto another
+        // process, between the pre-flight and the walk. Re-apply the same
+        // refusals against what the walk actually observed.
+        let window_scope = tree_result.as_ref().and_then(|r| r.window_scope.clone());
+        if let Some(ref scope) = window_scope {
+            if let Some(refusal) = window_scope_refusal(pid, window_id, scope) {
+                return refusal;
+            }
+        }
+        // No AX scope exists on the explicit screenshot-only path; the
+        // WindowServer ownership preflight above remains authoritative there.
+        let scope_matched =
+            !plan.include_elements || window_scope.as_ref().is_none_or(|scope| scope.is_matched());
+
+        if captured_screenshot.is_none() && tree_result.is_none() {
+            if let Some(ref error) = screenshot_frame_error {
+                return ToolResult::error(format!(
+                    "Screenshot frame could not be verified for window {window_id}: {error:?}"
+                ))
+                .with_structured(super::px_frame::error_structured(error));
+            }
+            return ToolResult::error(
+                "No content produced (neither AX tree nor screenshot succeeded)",
+            );
+        }
+
+        // The route commit itself is immediately preceded by a fresh complete
+        // host→helper proof. Everything that can reject the captured AX/pixel
+        // surface has already run, and no file/cache/token has been published.
+        let mut committed_delegation = None;
+        if let Some((expected, context, Some(ticket))) = app_context_observation.as_mut() {
+            if context.delegation.is_some() {
+                let before = context.clone();
+                let expected_for_resolution = expected.clone();
+                let final_resolution = tokio::task::spawn_blocking(move || {
+                    crate::ax::app_context::resolve_app_context(
+                        requested_pid,
+                        &expected_for_resolution,
+                    )
+                })
+                .await;
+                let final_context = match final_resolution {
+                    Ok(Ok(after)) => {
+                        match crate::ax::app_context::accept_revalidated_app_context(&before, after)
+                        {
+                            Ok(after) => after,
+                            Err(_) => {
+                                release_unpublished_tree_result(&tree_result);
+                                return ToolResult::error(
+                                "The Open/Save panel changed before its observation could be committed. Re-observe the host application.",
+                            )
+                            .with_structured(serde_json::json!({
+                                "code": "app_context_changed_during_observation",
+                                "effect": "refused",
+                                "retryable": true,
+                            }));
+                            }
+                        }
+                    }
+                    _ => {
+                        release_unpublished_tree_result(&tree_result);
+                        return ToolResult::error(
+                            "The Open/Save panel changed before its observation could be committed. Re-observe the host application.",
+                        )
+                        .with_structured(serde_json::json!({
+                            "code": "app_context_changed_during_observation",
+                            "effect": "refused",
+                            "retryable": true,
+                        }));
+                    }
+                };
+                *context = final_context;
+                if !self
+                    .state
+                    .app_context_delegation_registry
+                    .commit_observation(ticket, expected.clone(), context)
+                {
+                    release_unpublished_tree_result(&tree_result);
+                    return ToolResult::error(
+                        "The Open/Save panel changed before its observation could be committed. Re-observe the host application.",
+                    )
+                    .with_structured(serde_json::json!({
+                        "code": "app_context_changed_during_observation",
+                        "effect": "refused",
+                        "retryable": true,
+                    }));
+                }
+                committed_delegation = Some(AppContextCommitRollback {
+                    registry: self.state.app_context_delegation_registry.clone(),
+                    state: self.state.clone(),
+                    ticket: ticket.clone(),
+                    target: context.target,
+                    armed: true,
+                });
+            }
+        }
+
+        let screenshot = if let Some((png, width, height, original_width, bounds, scale)) =
+            captured_screenshot
+        {
+            use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+            // Reserve the restrictive pixel scope before writing an output
+            // file. A capacity refusal must not publish menu pixels. If a
+            // later write fails, retaining the restriction is fail-closed.
+            if !observation_only
+                && transient_target.is_none()
+                && application_menu.is_some()
+                && !crate::ax::application_menu::remember_observed_image(
+                    pid,
+                    window_id,
+                    application_menu.as_ref(),
+                )
+            {
+                release_unpublished_tree_result(&tree_result);
+                return ToolResult::error("Application-menu observation capacity is exhausted; no new menu image or action binding was published.")
+                    .with_structured(serde_json::json!({"code":"application_menu_observation_capacity","effect":"refused","retryable":true}));
+            }
+            let (b64, file_path) = if let Some(path) = screenshot_out_file.clone() {
+                if let Err(error) = std::fs::write(&path, &png) {
+                    let frame_error = super::px_frame::PxFrameError::CaptureUnavailable {
+                        window_id,
+                        reason: error.to_string(),
+                    };
+                    return ToolResult::error(format!(
+                        "Screenshot output could not be written for window {window_id}: {frame_error:?}"
+                    ))
+                    .with_structured(super::px_frame::error_structured(&frame_error));
+                }
+                (None, Some(path))
+            } else {
+                (Some(BASE64.encode(&png)), None)
+            };
+            if !observation_only && transient_target.is_none() {
+                if application_menu.is_none() {
+                    // Only a successfully materialized ordinary image can
+                    // restore document-relative pointer authority.
+                    crate::ax::application_menu::remember_observed_image(pid, window_id, None);
+                }
+                if application_menu.is_some() {
+                    self.state.resize_registry.clear_ratio(pid, window_id);
+                } else if let Some(original_width) = original_width {
+                    if width > 0 {
+                        self.state.resize_registry.set_ratio(
+                            pid,
+                            window_id,
+                            original_width as f64 / width as f64,
+                        );
+                    }
+                } else {
+                    self.state.resize_registry.clear_ratio(pid, window_id);
+                }
+            }
+            Some((b64, file_path, width, height, bounds, scale))
+        } else {
+            None
+        };
+
+        // Register before publishing the corresponding cache entry. A token
+        // resolved from the previous observation may be paused in async
+        // preflight; its cache lookup must see either its old generation or a
+        // mismatching new generation, never new rows under the old token.
+        let elem_count_for_snapshot = tree_result
+            .as_ref()
+            .filter(|_| transient_target.is_none())
+            .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
+            .unwrap_or(0);
+        let snapshot_id = if plan.include_elements
+            && scope_matched
+            && !observation_only
+            && transient_target.is_none()
+        {
+            Some(cua_driver_core::element_token::global().register_snapshot(
+                pid,
+                window_id,
+                elem_count_for_snapshot,
+            ))
+        } else {
+            None
+        };
+
+        // Update element cache — ONLY for a resolved window scope. Caching an
+        // unresolved scope's nodes under (pid, window_id) is what turned a
+        // wrong-surface snapshot into a wrong-surface *action*: a follow-up
+        // click(element_index=N) picked whatever the walk happened to return.
+        // For an unresolved scope, replace any prior entry with an empty
+        // snapshot so a stale index map cannot be clicked through either.
+        if !observation_only {
+            if transient_target.is_some() {
+                // A helper screenshot is visual evidence only. Never publish
+                // or retain its AX rows as an actionable surface: callers must
+                // continue using the host target, and the only supported input
+                // is an unaddressed foreground keyboard action.
+                invalidate_observation_target_state(
+                    &self.state,
+                    crate::transient_ui::WindowTarget { pid, window_id },
+                );
+            } else {
+                match tree_result.as_ref() {
+                    Some(result) if scope_matched => {
+                        self.state
+                            .element_cache
+                            .update(pid, window_id, snapshot_id, &result.nodes);
+                    }
+                    _ => {
+                        // A screenshot-only observation intentionally creates no
+                        // new AX binding. Empty the old cache so integer indices
+                        // from an earlier frame cannot be replayed after the UI
+                        // may have changed.
+                        self.state.element_cache.update(pid, window_id, None, &[]);
+                    }
+                }
+            }
+        }
+
+        if screenshot.is_none()
+            && plan.include_screenshot
+            && !observation_only
+            && transient_target.is_none()
+        {
+            self.state.resize_registry.clear_ratio(pid, window_id);
+        }
+
+        // Capture screenshot dimensions before consuming.
+        let screenshot_dims = screenshot.as_ref().map(|(_, _, w, h, _, _)| (*w, *h));
+        let screenshot_file_path = screenshot
+            .as_ref()
+            .and_then(|(_, fp, _, _, _, _)| fp.clone());
+        let screenshot_frame = screenshot
+            .as_ref()
+            .map(|(_, _, _, _, bounds, scale)| (bounds.clone(), *scale));
+
+        // Build response.
+        let mut content: Vec<Content> = Vec::new();
+        let published_tree_result = if transient_target.is_some() {
+            None
+        } else {
+            tree_result.as_ref()
+        };
+
+        if let Some((b64_opt, _file_path, w, h, _bounds, _scale)) = screenshot {
+            if let Some(b64) = b64_opt {
+                content.push(Content::image_png(b64));
+            }
+
+            // Summary text line (matching Swift reference format).
+            let element_count = published_tree_result
+                .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
+                .unwrap_or(0);
+            let target_summary = transient_target.map_or_else(
+                || format!("window_id={window_id} pid={pid}"),
+                |target| {
+                    format!(
+                        "window_id={requested_window_id} pid={requested_pid} \
+                         visual_target_window_id={} visual_target_pid={}",
+                        target.window_id, target.pid
+                    )
+                },
+            );
+            let summary = if let Some(r) = published_tree_result {
+                format!(
+                    "{target_summary} size={}x{} elements={element_count}\n\n{}",
+                    w, h, r.tree_markdown
+                )
+            } else {
+                format!("{target_summary} size={}x{}", w, h)
+            };
+            content.push(Content::text(summary));
+        } else if let Some(r) = published_tree_result {
+            let element_count = r.nodes.iter().filter(|n| n.element_index.is_some()).count();
+            content.push(Content::text(format!(
+                "window_id={window_id} pid={pid} elements={element_count}\n\n{}",
+                r.tree_markdown
+            )));
+        }
+
+        if content.is_empty() {
+            if let Some(ref error) = screenshot_frame_error {
+                return ToolResult::error(format!(
+                    "Screenshot frame could not be verified for window {window_id}: {error:?}"
+                ))
+                .with_structured(super::px_frame::error_structured(error));
+            }
+            return ToolResult::error(
+                "No content produced (neither AX tree nor screenshot succeeded)",
+            );
+        }
+
+        let element_count = published_tree_result
+            .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
+            .unwrap_or(0);
+        let tree_md = published_tree_result
+            .map(|r| r.tree_markdown.clone())
+            .unwrap_or_default();
+
+        // Build the structured `elements` array — one entry per actionable
+        // node, matching the order (and indices) of the markdown rendering.
+        // This is the preferred consumption path; `tree_markdown` is kept
+        // alongside for back-compat with existing text-parsing callers
+        // (Hermes' regex parser, Codex, Claude Code) and is signalled as
+        // preferred-for-back-compat-only via the `_note` field below.
+        let elements_json: Vec<serde_json::Value> = match (snapshot_id, published_tree_result) {
+            (Some(sid), Some(r)) => build_elements_array_with_token(&r.nodes, sid),
+            (None, Some(r)) if scope_matched => build_elements_array(&r.nodes),
+            _ => Vec::new(),
+        };
+        let elements_json = cua_driver_core::element_query::project_elements_for_query(
+            elements_json,
+            query.as_deref(),
+            &tree_md,
+        );
+        let filtered_element_count = elements_json.len();
+        // The structured array intentionally contains only actionable nodes,
+        // and AX child reads can fail independently of the element/depth caps.
+        // Until the walker exposes a proof over the projected search domain,
+        // absence must remain unknown rather than being claimed complete.
+        let elements_complete = false;
+
+        let mut structured = serde_json::json!({
+            "window_id": window_id,
+            "pid": pid,
+            "elements_included": plan.include_elements && transient_target.is_none(),
+            "element_count": element_count,
+            "total_element_count": element_count,
+            "returned_element_count": filtered_element_count,
+            "elements_complete": elements_complete,
+            "tree_markdown": tree_md,
+            "elements": elements_json,
+            "_note": "Prefer `elements` — `tree_markdown` will continue to work \
+                but new fields will only be added to the structured side. \
+                Issue #22865: use `max_elements` / `max_depth` to bound the \
+                AX walk on apps with very large trees."
+        });
+        if let Some((_, context, _)) = app_context_observation.as_ref() {
+            structured["selection"] = context.selection_json(true);
+        }
+        if let Some(target) = transient_target {
+            apply_transient_observation_contract(&mut structured, source_target, target);
+        }
+        if query.is_some() {
+            structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
+        }
+        // Surface 6: an opaque snapshot identifier consumers can log
+        // alongside the per-element tokens for debug correlation. Same value
+        // embedded in every `element_token` emitted in `elements[]` above.
+        // Additive — old consumers ignore it. Absent when no snapshot was
+        // registered (unresolved window scope).
+        if let Some(sid) = snapshot_id {
+            structured["snapshot_id"] =
+                serde_json::json!(cua_driver_core::element_token::token_for(sid, 0)
+                    .trim_end_matches(":0")
+                    .to_string());
+        }
+        // Best-effort-background ladder, rung (2). Both rungs point the agent at
+        // the same next move: an empty AX tree means element_index has nothing
+        // to bind to, so the deliberate action is an element px action — read
+        // the screenshot already in this response and click by pixel (x,y).
+        // macOS can pixel-target in the background, so the recommendation is
+        // `px`, not `foreground`.
+        let degradation = if transient_target.is_some() {
+            Degradation::AxTreeEmpty
+        } else {
+            degradation_for(tree_result.is_some(), element_count, window_scope.as_ref())
+        };
+        match degradation {
+            Degradation::None => {}
+            Degradation::AxTreeEmpty => {
+                structured["degraded"] = serde_json::json!(true);
+                if transient_target.is_some() {
+                    structured["degraded_reason"] = serde_json::json!(
+                        "transient_ui_visual_only: the image belongs to a trusted out-of-process modal helper. Its AX rows and pixel coordinate target are intentionally withheld so they cannot be replayed against the public host target."
+                    );
+                    structured["escalation"] = serde_json::json!({
+                        "recommended": "foreground_keyboard",
+                        "reason": "Use an unaddressed type_text, press_key, or hotkey with delivery_mode:\"foreground\" against the original host pid/window_id."
+                    });
+                } else {
+                    structured["degraded_reason"] = serde_json::json!(
+                        "ax_tree_empty: the AX walk returned no actionable elements. The \
+                         window may be a non-AX surface (canvas/WebGL/custom-drawn) or its \
+                         accessibility tree was not ready (Chromium/Electron require an \
+                         AX-enable + settle). Do not treat element data as authoritative — \
+                         re-snapshot if the app just launched, otherwise switch to the \
+                         visual path."
+                    );
+                    structured["escalation"] = serde_json::json!({
+                        "recommended": "px",
+                        "reason": "non-AX surface — act by pixel (x,y) off the screenshot \
+                                   in this response (an element px action)."
+                    });
+                }
+            }
+            Degradation::AxWindowUnresolved { ax_window_count } => {
+                structured["degraded"] = serde_json::json!(true);
+                if transient_target.is_some() {
+                    // The wrapper's host-window recovery intentionally keys on the
+                    // ordinary `ax_window_unresolved:` prefix.  A view-service
+                    // panel is already the correct visible surface, so do not
+                    // invite a host activation that would steal focus back to
+                    // its previous field.
+                    structured["degraded_reason"] = serde_json::json!(format!(
+                        "transient_ui_ax_unresolved: the associated helper window \
+                         {window_id} is visible under pid {pid}, but none of its \
+                         {ax_window_count} AXWindow element(s) reports this CGWindowID. \
+                         The screenshot is authoritative and the tree is empty on purpose."
+                    ));
+                    structured["escalation"] = serde_json::json!({
+                        "recommended": "foreground_keyboard",
+                        "reason": "Use type_text or press_key with delivery_mode:\"foreground\" \
+                                   against the original host target. The driver will revalidate \
+                                   and route that one keyboard action to this helper."
+                    });
+                } else {
+                    structured["degraded_reason"] = serde_json::json!(format!(
+                        "ax_window_unresolved: window_id {window_id} exists and is owned by \
+                         pid {pid}, but none of the {ax_window_count} AXWindow element(s) \
+                         under that pid reports this CGWindowID. The tree is returned EMPTY \
+                         on purpose: the accessibility elements reachable under this pid \
+                         belong to other surfaces (the menu bar, other windows), not to the \
+                         requested window, so presenting them would misground the next \
+                         action."
+                    ));
+                    structured["escalation"] = serde_json::json!({
+                        "recommended": "foreground",
+                        "reason": "observation-only: the screenshot in this response IS the \
+                                   requested window, but background input (including px) is \
+                                   refused while its AX surface is unresolved — events could \
+                                   reach a same-process sibling window. Re-snapshot after the \
+                                   app settles, or act with delivery_mode:\"foreground\"."
+                    });
+                }
+            }
+        }
+        // Additive read-only `background_input` capability section (macOS
+        // background input v1): the same fresh facts that gate every
+        // background mutation, reported per route so an agent can choose
+        // before acting. Every action still revalidates — this is advisory,
+        // not a promise. Old consumers ignore the extra field.
+        if plan.include_elements && transient_target.is_none() {
+            let capture_available = screenshot_dims.is_some();
+            let report = tokio::task::spawn_blocking(move || {
+                let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
+                cua_driver_core::background_input::background_input_capability_report(
+                    cua_driver_core::background_input::ExactWindowTarget { pid, window_id },
+                    &facts,
+                    Some(capture_available),
+                )
+            })
+            .await;
+            if let Ok(report) = report {
+                structured["background_input"] = report;
+            }
+        }
+        if let Some((sw, sh)) = screenshot_dims {
+            structured["screenshot_width"] = serde_json::json!(sw);
+            structured["screenshot_height"] = serde_json::json!(sh);
+            // Surface 7: emit an explicit `screenshot_mime_type` on the
+            // structured payload so consumers don't have to sniff the magic
+            // bytes off the base64 PNG (`iVBOR` = PNG, `/9j/` = JPEG) to
+            // know what they're holding. `Content::image_png` already carries
+            // `mimeType` on the protocol image part — this mirrors it onto
+            // the structured side. Additive: keeps every existing field.
+            structured["screenshot_mime_type"] = serde_json::json!("image/png");
+            if transient_target.is_some() {
+                structured["transient_ui"]["visual_target"]["screenshot_width"] =
+                    serde_json::json!(sw);
+                structured["transient_ui"]["visual_target"]["screenshot_height"] =
+                    serde_json::json!(sh);
+                structured["transient_ui"]["visual_target"]["screenshot_mime_type"] =
+                    serde_json::json!("image/png");
+            }
+        }
+        if let Some((bounds, scale)) = screenshot_frame {
+            let frame = serde_json::json!({
+                "x": bounds.x,
+                "y": bounds.y,
+                "width": bounds.width,
+                "height": bounds.height
+            });
+            if transient_target.is_some() {
+                structured["transient_ui"]["visual_target"]["window_bounds"] = frame;
+                structured["transient_ui"]["visual_target"]["screenshot_scale"] =
+                    serde_json::json!(scale);
+            } else if let Some(menu) = application_menu.as_ref() {
+                apply_application_menu_metadata(&mut structured, menu, scale);
+            } else {
+                structured["window_bounds"] = frame;
+                structured["screenshot_scale"] = serde_json::json!(scale);
+            }
+            structured["screenshot_frame_valid"] = serde_json::json!(true);
+        }
+        if let Some(error) = screenshot_frame_error {
+            structured["screenshot_frame_valid"] = serde_json::json!(false);
+            structured["screenshot_error"] = super::px_frame::error_structured(&error);
+        }
+        if let Some(ref fp) = screenshot_file_path {
+            structured["screenshot_file_path"] = serde_json::json!(fp);
+            if transient_target.is_some() {
+                structured["transient_ui"]["visual_target"]["screenshot_file_path"] =
+                    serde_json::json!(fp);
+            }
+        }
+        cua_driver_core::window_inspection::mark_browser_chrome_capture_coverage(
+            &mut structured,
+            chromium_browser_window(pid).then_some(
+                cua_driver_core::window_inspection::BrowserChromeCaptureCoverage::MayBeIncomplete,
+            ),
+        );
+        if let Some(target) = transient_target {
+            // Keep the authorization hand-off adjacent to the route commit as
+            // well as before state publication above. If the modal disappears
+            // during response construction, never leave a route that the
+            // caller could consume on its next foreground keyboard action.
+            let commit_detection = tokio::task::spawn_blocking(move || {
+                crate::transient_ui::detect_visible_transient_helper(source_target)
+            })
+            .await;
+            if !matches!(
+                commit_detection,
+                Ok(crate::transient_ui::TransientHelperDetection::Unique(current))
+                    if current == target
+            ) {
+                return ToolResult::error(
+                    "The transient helper changed or closed before its observation could be committed. Re-observe the host app; no foreground input route was retained.",
+                )
+                .with_structured(serde_json::json!({
+                    "code": "transient_ui_changed_during_observation",
+                    "effect": "refused",
+                    "pid": requested_pid,
+                    "window_id": requested_window_id,
+                    "retryable": true,
+                    "suggestion": "Call get_window_state for the host app again."
+                }));
+            }
+            commit_transient_observation(
+                &self.state.transient_ui_registry,
+                &transient_session,
+                source_target,
+                target,
+                observation_only,
+            );
+        }
+        if let Some(mut guard) = committed_delegation.take() {
+            guard.disarm();
+        }
+        ToolResult {
+            content,
+            is_error: None,
+            structured_content: Some(structured),
+            action_record: None,
+        }
+    }
+}
+
+fn direct_observation_target_refusal(
+    requested_pid: i32,
+    open_save_helper: bool,
+    trusted_transient_helper: bool,
+) -> Option<ToolResult> {
+    if open_save_helper {
+        Some(super::app_context_delegation_direct_target_refusal())
+    } else if trusted_transient_helper {
+        Some(super::transient_ui_direct_target_refusal(
+            requested_pid,
+            None,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Turn an unresolvable window scope into a structured refusal, or `None` when
+/// the scope is one the caller can still be served (issue #2237).
+///
+/// Refusing is the point: the pre-fix behaviour returned the app's menu bar
+/// under the requested `window_id`, which reads as a healthy snapshot and gets
+/// clicked by `element_index`. Both refusals name the exact retry, matching the
+/// remedy-in-the-refusal shape the rest of the driver uses.
+///
+/// Ordinary foreign owners are reported, not followed: `element_cache`, the
+/// element-token registry and `ResizeRegistry` are keyed on the caller pid.
+/// The shared AppKit Open/Save helper is different: it is deliberately not a
+/// public target, so its identity is redacted and the caller is directed back
+/// through the original host's app-context observation.
+fn window_scope_refusal(
+    pid: i32,
+    window_id: u32,
+    scope: &crate::ax::WindowScope,
+) -> Option<ToolResult> {
+    use crate::ax::WindowScope;
+    match scope {
+        // Resolved, or resolvable-as-degraded — the caller gets a response.
+        WindowScope::Matched | WindowScope::AxUnresolved { .. } => None,
+        WindowScope::NotFound => Some(
+            ToolResult::error(format!(
+                "window_id {window_id} is not a live window (closed, or the id is stale). \
+                 Refusing to return an accessibility tree, because the elements reachable \
+                 under pid {pid} belong to other surfaces — not to the window you asked \
+                 for. Call list_windows for current window_ids."
+            ))
+            .with_structured(serde_json::json!({
+                "code": "window_id_not_found",
+                "pid": pid,
+                "window_id": window_id,
+                "suggestion": "call list_windows for current window_ids; the window may have closed"
+            })),
+        ),
+        WindowScope::OwnerPidMismatch {
+            owner_pid,
+            owner_app_name,
+        } if owner_looks_like_open_save_panel(*owner_pid, owner_app_name) => {
+            Some(super::app_context_delegation_direct_target_refusal())
+        }
+        WindowScope::OwnerPidMismatch {
+            owner_pid,
+            owner_app_name,
+        } => Some(
+            ToolResult::error(format!(
+                "window_id {window_id} is owned by pid {owner_pid} (\"{owner_app_name}\"), \
+                 not pid {pid}. macOS hosts a sandboxed app's Open/Save panel \
+                 out-of-process, so the panel's CGWindowID belongs to the panel service \
+                 rather than the app that opened it. Refusing to return pid {pid}'s \
+                 accessibility tree for it. Re-call get_window_state with pid={owner_pid} \
+                 and the same window_id."
+            ))
+            .with_structured(serde_json::json!({
+                "code": "window_owner_pid_mismatch",
+                "pid": pid,
+                "window_id": window_id,
+                "owner_pid": owner_pid,
+                "owner_app_name": owner_app_name,
+                "suggestion": format!(
+                    "window_id {window_id} is owned by pid {owner_pid}, not pid {pid} \
+                     (macOS hosts sandboxed Open/Save panels out-of-process). Re-call \
+                     get_window_state with pid={owner_pid} and the same window_id."
+                )
+            })),
+        ),
+    }
+}
+
+fn owner_looks_like_open_save_panel(owner_pid: i32, owner_app_name: &str) -> bool {
+    crate::ax::app_context::looks_like_open_save_panel_process(owner_pid)
+        || matches!(
+            owner_app_name,
+            "Open and Save Panel Service" | "com.apple.appkit.xpc.openAndSavePanelService"
+        )
+}
+
+/// Gate screenshot publication on a second exact ownership proof.
+///
+/// Tree-only observations have no pixels to publish, so they do not need this
+/// second check. A same-pid owner is represented by `None` because
+/// `scope_from_owner(WindowOwner::SamePid)` deliberately defers to AX only for
+/// tree scoping; for screenshot publication it is the successful outcome.
+fn publish_after_window_scope_check<T>(
+    pid: i32,
+    window_id: u32,
+    owner_scope: Option<&crate::ax::WindowScope>,
+    publish: impl FnOnce() -> T,
+) -> Result<T, ToolResult> {
+    if let Some(refusal) = owner_scope.and_then(|scope| window_scope_refusal(pid, window_id, scope))
+    {
+        return Err(refusal);
+    }
+    Ok(publish())
+}
+
+fn window_owner_resolution_failure(
+    pid: i32,
+    window_id: u32,
+    reason: impl Into<String>,
+) -> ToolResult {
+    let reason = reason.into();
+    ToolResult::error(format!(
+        "could not resolve owner for window_id {window_id}: {reason}"
+    ))
+    .with_structured(serde_json::json!({
+        "code": "window_target_resolution_failed",
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "reason": reason,
+    }))
+}
+
+/// Which degradation rung a snapshot lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Degradation {
+    /// Clean snapshot — no `degraded` field is emitted.
+    None,
+    /// A walk ran and produced no actionable elements.
+    AxTreeEmpty,
+    /// The requested window is live and owned by this pid, but no AXWindow
+    /// claims its CGWindowID, so the walk deliberately covered nothing.
+    AxWindowUnresolved { ax_window_count: usize },
+}
+
+/// Decide the degradation rung. Pure: `walk_attempted` is false in the
+/// screenshot-only path (an empty tree is expected there, not degraded), and
+/// the unresolved-scope rung outranks the generic empty-tree rung because it
+/// explains *why* the tree is empty.
+fn degradation_for(
+    walk_attempted: bool,
+    element_count: usize,
+    scope: Option<&crate::ax::WindowScope>,
+) -> Degradation {
+    if !walk_attempted {
+        return Degradation::None;
+    }
+    if let Some(crate::ax::WindowScope::AxUnresolved { ax_window_count }) = scope {
+        return Degradation::AxWindowUnresolved {
+            ax_window_count: *ax_window_count,
+        };
+    }
+    if element_count == 0 {
+        return Degradation::AxTreeEmpty;
+    }
+    Degradation::None
+}
+
+/// Render the actionable nodes from the AX walk into the
+/// `structuredContent.elements` array shape described on the tool: one entry
+/// per node with an `element_index`, carrying role, label (built from
+/// title/description/value/identifier), frame, parent_index, depth, and —
+/// Surface 6 — an opaque `element_token` for the same row.
+///
+/// Order matches the markdown rendering exactly (DFS, same indices). Only
+/// nodes that received an `element_index` (i.e. are addressable via
+/// click(element_index=N)) appear — non-actionable display-only rows are
+/// omitted to match the contract on the tool description.
+pub(crate) fn build_elements_array_with_token(
+    nodes: &[crate::ax::tree::AXNode],
+    snapshot_id: u32,
+) -> Vec<serde_json::Value> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let idx = node.element_index?;
+            // `label` is a best-effort human-readable string: title first,
+            // then description, then value, then identifier. Mirrors what
+            // a human reading the markdown row would call this element.
+            let label = node
+                .title
+                .clone()
+                .or_else(|| node.description.clone())
+                .or_else(|| node.value.clone())
+                .or_else(|| node.identifier.clone());
+            let frame = node
+                .frame
+                .map(|[x, y, w, h]| serde_json::json!({ "x": x, "y": y, "w": w, "h": h }));
+            let mut entry = serde_json::json!({
+                "element_index": idx,
+                // Surface 6: opaque token paired to the integer index.
+                // Tools accept either; the token has explicit validity
+                // (invalidated when the next snapshot supersedes this
+                // one in the per-pid LRU). See cua-driver-core's
+                // `element_token` module.
+                "element_token": cua_driver_core::element_token::token_for(snapshot_id, idx),
+                "role": node.role,
+                "depth": node.depth,
+            });
+            if let Some(label) = label {
+                entry["label"] = serde_json::Value::String(label);
+            }
+            // Surface the element's AXValue separately from `label`. `label`
+            // collapses title→description→value→identifier into one display
+            // string, so on a control that has BOTH a title/description AND a
+            // value (e.g. a "Compose message" text field holding typed text),
+            // the value is shadowed and invisible to a caller reading the
+            // structured side — it only showed up in `tree_markdown`, forcing a
+            // markdown grep to verify what landed. Emit it explicitly so the
+            // verify-then-escalate loop can read the typed text structurally.
+            // `value_state` widens the string-only AXValue read to all CF
+            // types (CFNumber sliders → "8", CFBoolean checkboxes/radios →
+            // "1"/"0") — controls whose state was previously invisible here.
+            // Falls back to `value` so the field never regresses for
+            // string-valued elements.
+            if let Some(value) = node
+                .value_state
+                .clone()
+                .or_else(|| node.value.clone())
+                .filter(|v| !v.is_empty())
+            {
+                entry["value"] = serde_json::Value::String(value);
+            }
+            if let Some(desc) = node.value_description.clone() {
+                entry["value_description"] = serde_json::Value::String(desc);
+            }
+            // Only surface a real range: WebKit reports AXMinValue/AXMaxValue
+            // as 0.0/0.0 on non-range controls (checkboxes, radios), which
+            // would be pure noise on every two-state element.
+            if let (Some(min), Some(max)) = (node.min_value, node.max_value) {
+                if max > min {
+                    entry["min"] = serde_json::json!(min);
+                    entry["max"] = serde_json::json!(max);
+                }
+            }
+            if let Some(enabled) = node.enabled {
+                entry["enabled"] = serde_json::Value::Bool(enabled);
+            }
+            let selected = node.selected.or_else(|| {
+                let role = node.role.to_ascii_lowercase();
+                if role.contains("checkbox") || role.contains("radiobutton") {
+                    node.value_state.as_deref().and_then(|value| match value {
+                        "1" | "true" | "on" => Some(true),
+                        "0" | "false" | "off" => Some(false),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            });
+            if let Some(selected) = selected {
+                entry["selected"] = serde_json::Value::Bool(selected);
+            }
+            if node.in_web_content {
+                entry["in_web_content"] = serde_json::Value::Bool(true);
+            }
+            if let Some(frame) = frame {
+                entry["frame"] = frame;
+            }
+            if let Some(parent) = node.parent_element_index {
+                entry["parent_index"] = serde_json::json!(parent);
+            }
+            Some(entry)
+        })
+        .collect()
+}
+
+/// Back-compat wrapper for callers that don't yet have a snapshot id
+/// to pass through. Emits the same fields as the token-aware builder
+/// minus `element_token`. New call sites should prefer
+/// `build_elements_array_with_token`.
+#[allow(dead_code)]
+pub(crate) fn build_elements_array(nodes: &[crate::ax::tree::AXNode]) -> Vec<serde_json::Value> {
+    // Use a snapshot_id of 0 only to satisfy the signature; tokens
+    // built from id=0 are not registered and would fail the registry's
+    // stale check — but since this entry point is only kept for
+    // pre-existing callers (none in production after Surface 6), it
+    // strips the token field after rendering.
+    let mut out = build_elements_array_with_token(nodes, 0);
+    for entry in &mut out {
+        if let Some(obj) = entry.as_object_mut() {
+            obj.remove("element_token");
+        }
+    }
+    out
+}
+
+/// Keep the structured response aligned with a query-filtered markdown tree.
+///
+/// The AX walker deliberately keeps the complete node/cache snapshot so the
+/// original element indices remain valid. The rendered markdown already holds
+/// the exact matching rows and ancestor chain, so use its indices as the
+/// projection source of truth instead of duplicating query matching over the
+/// structured fields.
+#[cfg(test)]
+mod window_scope_contract_tests {
+    use super::*;
+    use crate::ax::WindowScope;
+
+    fn panel_mismatch() -> WindowScope {
+        WindowScope::OwnerPidMismatch {
+            owner_pid: 900,
+            owner_app_name: "Open and Save Panel Service".into(),
+        }
+    }
+
+    fn ordinary_mismatch() -> WindowScope {
+        WindowScope::OwnerPidMismatch {
+            owner_pid: 901,
+            owner_app_name: "Other Editor".into(),
+        }
+    }
+
+    fn structured(result: ToolResult) -> serde_json::Value {
+        assert_eq!(result.is_error, Some(true), "must be an error result");
+        result
+            .structured_content
+            .expect("refusals carry structured content")
+    }
+
+    #[test]
+    fn public_observation_revokes_old_route_before_any_possible_failure() {
+        let registry = crate::transient_ui::TransientUiRegistry::new();
+        let session = crate::transient_ui::TransientSessionKey::Session(
+            "failed-observation-session".to_owned(),
+        );
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let target = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        registry.record(&session, source, Some(target));
+
+        let cleared = begin_transient_observation(&registry, &session, source, false);
+        assert_eq!(cleared, Some(target));
+        // Simulate any later early-return: no commit occurs.
+        assert_eq!(registry.recorded_target(&session, source), None);
+    }
+
+    #[test]
+    fn only_successful_public_observation_commits_and_internal_probe_is_inert() {
+        let registry = crate::transient_ui::TransientUiRegistry::new();
+        let session = crate::transient_ui::TransientSessionKey::Session(
+            "successful-observation-session".to_owned(),
+        );
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let old_target = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let new_target = crate::transient_ui::WindowTarget {
+            pid: 30,
+            window_id: 300,
+        };
+        registry.record(&session, source, Some(old_target));
+
+        let _ = begin_transient_observation(&registry, &session, source, true);
+        commit_transient_observation(&registry, &session, source, new_target, true);
+        assert_eq!(
+            registry.recorded_target(&session, source),
+            Some(old_target),
+            "internal observation-only probes must not mutate public authorization"
+        );
+
+        let _ = begin_transient_observation(&registry, &session, source, false);
+        commit_transient_observation(&registry, &session, source, new_target, false);
+        assert_eq!(registry.recorded_target(&session, source), Some(new_target));
+    }
+
+    #[test]
+    fn transient_contract_keeps_host_public_and_nests_non_actionable_visual_target() {
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let target = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let mut structured = serde_json::json!({
+            "pid": target.pid,
+            "window_id": target.window_id,
+            "elements": [],
+        });
+        apply_transient_observation_contract(&mut structured, source, target);
+
+        assert_eq!(structured["pid"], source.pid);
+        assert_eq!(structured["window_id"], source.window_id);
+        assert_eq!(
+            structured["transient_ui"]["visual_target"]["pid"],
+            target.pid
+        );
+        assert_eq!(
+            structured["transient_ui"]["visual_target"]["window_id"],
+            target.window_id
+        );
+        assert_eq!(
+            structured["transient_ui"]["visual_target"]["pixel_actions_supported"],
+            false
+        );
+        assert!(structured["transient_ui"].get("pid").is_none());
+        assert!(structured["transient_ui"].get("window_id").is_none());
+    }
+
+    #[test]
+    fn ambiguous_or_policy_blocked_transient_detection_never_falls_back_to_host() {
+        let source = crate::transient_ui::WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let target = crate::transient_ui::WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let ambiguous = transient_target_from_detection(
+            crate::transient_ui::TransientHelperDetection::Ambiguous,
+            source,
+            true,
+        )
+        .expect_err("ambiguous helper detection must fail closed");
+        assert_eq!(
+            ambiguous.structured_content.unwrap()["code"],
+            "transient_ui_ambiguous"
+        );
+
+        let policy = transient_target_from_detection(
+            crate::transient_ui::TransientHelperDetection::Unique(target),
+            source,
+            false,
+        )
+        .expect_err("exact policy must refuse post-authorization target substitution");
+        assert_eq!(
+            policy.structured_content.unwrap()["code"],
+            "transient_ui_target_reauthorization_required"
+        );
+    }
+
+    #[test]
+    fn invalidating_visual_target_state_stales_old_tokens_and_resize_mapping() {
+        let state = ToolState::new(false, true, None);
+        let target = crate::transient_ui::WindowTarget {
+            pid: 91_337,
+            window_id: 73_119,
+        };
+        let snapshot = cua_driver_core::element_token::global().register_snapshot(
+            target.pid,
+            target.window_id,
+            1,
+        );
+        let token = cua_driver_core::element_token::token_for(snapshot, 0);
+        state
+            .resize_registry
+            .set_ratio(target.pid, target.window_id, 2.0);
+        assert!(cua_driver_core::element_token::global()
+            .resolve(target.pid, &token)
+            .is_ok());
+
+        invalidate_observation_target_state(&state, target);
+
+        assert_eq!(
+            cua_driver_core::element_token::global()
+                .resolve(target.pid, &token)
+                .unwrap_err(),
+            cua_driver_core::element_token::STALE_TOKEN_ERROR
+        );
+        assert_eq!(
+            state
+                .resize_registry
+                .ratio(target.pid, Some(target.window_id)),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_window_id_is_a_structured_not_found() {
+        let s = structured(
+            window_scope_refusal(800, 67340, &WindowScope::NotFound).expect("must refuse"),
+        );
+        assert_eq!(s["code"], "window_id_not_found");
+        assert_eq!(s["pid"], 800);
+        assert_eq!(s["window_id"], 67340);
+        assert!(s["suggestion"].as_str().unwrap().contains("list_windows"));
+    }
+
+    #[test]
+    fn open_save_helper_is_refused_before_either_window_selection_mode() {
+        for _selection_mode in [WindowSelectionMode::Exact, WindowSelectionMode::AppContext] {
+            let refusal = direct_observation_target_refusal(900, true, true)
+                .expect("helper must be refused before mode-specific selection");
+            let value = structured(refusal);
+            assert_eq!(
+                value["code"],
+                "app_context_auxiliary_direct_target_unsupported"
+            );
+            assert!(value.get("pid").is_none());
+            assert!(value.get("window_id").is_none());
+        }
+    }
+
+    #[test]
+    fn dropping_a_committed_observation_guard_revokes_unpublished_authority() {
+        use crate::ax::app_context::{
+            AppContextDelegation, AppContextSelection, AppContextSelectionReason,
+            AppContextSnapshot, AppContextTarget, AxWindowEvidence, AxWindowsEvidence,
+            ExpectedAppIdentity, OpenSavePanelKind, ResolvedAppContext, RunningAppIdentity,
+        };
+
+        let state = Arc::new(ToolState::default());
+        let registry = state.app_context_delegation_registry.clone();
+        let session = crate::transient_ui::TransientSessionKey::Session(
+            "app-context-publication-rollback".into(),
+        );
+        let target = AppContextTarget {
+            pid: 98_900,
+            window_id: 98_977,
+        };
+        let expected = ExpectedAppIdentity {
+            bundle_id: Some("com.example.host".into()),
+            app_name: Some("Host".into()),
+        };
+        let context = ResolvedAppContext {
+            identity: RunningAppIdentity {
+                bundle_id: expected.bundle_id.clone(),
+                app_name: expected.app_name.clone(),
+            },
+            snapshot: AppContextSnapshot {
+                focused: AxWindowEvidence::Resolved(target.window_id),
+                main: AxWindowEvidence::NotQueried,
+                windows: AxWindowsEvidence::NotQueried,
+            },
+            selection: AppContextSelection {
+                window_id: target.window_id,
+                reason: AppContextSelectionReason::FocusedWindow,
+            },
+            target,
+            delegation: Some(AppContextDelegation {
+                host_pid: 98_742,
+                target,
+                panel_kind: OpenSavePanelKind::Open,
+            }),
+        };
+        let (ticket, _) = registry.begin_observation(&session, 98_742);
+        let _target_lease = registry.acquire_target_observation_leases(vec![target]);
+        assert!(registry.bind_observation_target(&ticket, target).is_some());
+        assert!(registry.commit_observation(&ticket, expected, &context));
+        {
+            let _rollback = AppContextCommitRollback {
+                registry: registry.clone(),
+                state,
+                ticket: ticket.clone(),
+                target,
+                armed: true,
+            };
+        }
+        assert_eq!(
+            registry.resolve_live(&session, target),
+            crate::ax::app_context::DelegationRouteResolution::None
+        );
+    }
+
+    /// Ordinary foreign windows still name their owner so callers can correct
+    /// an accidental pid/window pairing without an implicit redirect.
+    #[test]
+    fn owner_pid_mismatch_names_the_owner_and_the_retry() {
+        let refusal = window_scope_refusal(800, 67340, &ordinary_mismatch()).expect("must refuse");
+        let text = format!("{:?}", refusal.content);
+        let s = structured(refusal);
+        assert_eq!(s["code"], "window_owner_pid_mismatch");
+        assert_eq!(s["owner_pid"], 901);
+        assert_eq!(s["owner_app_name"], "Other Editor");
+        assert_eq!(s["pid"], 800, "the requested pid is echoed, not replaced");
+        assert!(
+            s["suggestion"].as_str().unwrap().contains("pid=901"),
+            "the retry must name the owner pid: {}",
+            s["suggestion"]
+        );
+        assert!(
+            !text.contains("AXMenuBar"),
+            "the refusal must never carry menu-bar content"
+        );
+    }
+
+    #[test]
+    fn open_save_helper_owner_is_redacted_and_routes_back_through_host() {
+        let refusal = window_scope_refusal(800, 67340, &panel_mismatch()).expect("must refuse");
+        let s = structured(refusal);
+        assert_eq!(s["code"], "app_context_auxiliary_direct_target_unsupported");
+        let serialized = serde_json::to_string(&s).unwrap();
+        for forbidden in ["800", "900", "67340", "owner_pid", "window_id", "/System/"] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+        assert!(s["suggestion"]
+            .as_str()
+            .is_some_and(|value| value.contains("original host application")));
+
+        let unresolved_helper = structured(app_context_owner_mismatch_refusal(
+            800,
+            67340,
+            2_000_000,
+            "Open and Save Panel Service",
+        ));
+        assert_eq!(
+            unresolved_helper["code"],
+            "app_context_auxiliary_direct_target_unsupported"
+        );
+        assert!(unresolved_helper.get("owner_pid").is_none());
+        assert!(unresolved_helper.get("selected_window_id").is_none());
+    }
+
+    #[test]
+    fn helper_name_redacts_owner_when_process_identity_is_unavailable() {
+        let expected = crate::ax::app_context::ExpectedAppIdentity {
+            bundle_id: Some("com.example.host".into()),
+            app_name: Some("Host".into()),
+        };
+        let refusal = app_context_resolution_refusal(
+            800,
+            &expected,
+            &crate::ax::app_context::AppContextResolveError::SelectedWindowOwnerMismatch {
+                window_id: 67_340,
+                owner_pid: 2_000_000,
+                owner_app_name: "Open and Save Panel Service".into(),
+            },
+        );
+        let structured = structured(refusal);
+        assert_eq!(
+            structured["code"],
+            "app_context_auxiliary_direct_target_unsupported"
+        );
+        assert!(structured.get("owner_pid").is_none());
+        assert!(structured.get("selected_window_id").is_none());
+        assert!(structured.get("owner_app_name").is_none());
+    }
+
+    #[test]
+    fn post_capture_revalidation_refuses_stale_or_reowned_windows() {
+        let mut published = false;
+        let stale =
+            publish_after_window_scope_check(800, 67340, Some(&WindowScope::NotFound), || {
+                published = true
+            })
+            .expect_err("a captured frame must not be published after its window disappeared");
+        assert!(!published);
+        assert_eq!(structured(stale)["code"], "window_id_not_found");
+
+        let mut published = false;
+        let mismatch =
+            publish_after_window_scope_check(800, 67340, Some(&panel_mismatch()), || {
+                published = true
+            })
+            .expect_err("a captured frame must not be published after its window was re-owned");
+        assert!(!published);
+        assert_eq!(
+            structured(mismatch)["code"],
+            "app_context_auxiliary_direct_target_unsupported"
+        );
+
+        publish_after_window_scope_check(800, 67340, None, || published = true).unwrap();
+        assert!(published);
+    }
+
+    #[test]
+    fn owner_lookup_failure_is_not_misreported_as_not_found() {
+        let failure = structured(window_owner_resolution_failure(
+            800,
+            67340,
+            "probe task panicked",
+        ));
+        assert_eq!(failure["code"], "window_target_resolution_failed");
+    }
+
+    #[test]
+    fn resolvable_scopes_are_not_refused() {
+        assert!(window_scope_refusal(800, 11, &WindowScope::Matched).is_none());
+        assert!(
+            window_scope_refusal(800, 11, &WindowScope::AxUnresolved { ax_window_count: 2 })
+                .is_none(),
+            "a live same-pid window degrades; it does not error"
+        );
+    }
+
+    /// The reported failure signature: a wrong-surface walk returns a healthy
+    /// non-zero element count, so the pre-fix `element_count == 0` rung stayed
+    /// silent. An unresolved scope now degrades on its own evidence.
+    #[test]
+    fn unresolved_scope_degrades_with_its_own_reason() {
+        assert_eq!(
+            degradation_for(
+                true,
+                0,
+                Some(&WindowScope::AxUnresolved { ax_window_count: 3 })
+            ),
+            Degradation::AxWindowUnresolved { ax_window_count: 3 }
+        );
+    }
+
+    #[test]
+    fn empty_tree_still_degrades_as_ax_tree_empty() {
+        // Back-compat with the pre-existing rung.
+        assert_eq!(
+            degradation_for(true, 0, Some(&WindowScope::Matched)),
+            Degradation::AxTreeEmpty
+        );
+    }
+
+    #[test]
+    fn resolved_window_with_elements_is_not_degraded() {
+        assert_eq!(
+            degradation_for(true, 42, Some(&WindowScope::Matched)),
+            Degradation::None
+        );
+    }
+
+    #[test]
+    fn screenshot_only_path_does_not_degrade() {
+        assert_eq!(degradation_for(false, 0, None), Degradation::None);
+    }
+
+    #[test]
+    fn schema_advertises_the_window_scope_error_codes() {
+        let description = def().description.clone();
+        for code in [
+            "window_id_not_found",
+            "window_owner_pid_mismatch",
+            "ax_window_unresolved",
+        ] {
+            assert!(
+                description.contains(code),
+                "tool description must advertise {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_advertises_screenshot_only_fast_path() {
+        let include_elements = &def().input_schema["properties"]["include_elements"];
+        assert_eq!(include_elements["type"], "boolean");
+        assert!(include_elements["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("screenshot-only")));
+    }
+
+    #[test]
+    fn schema_supports_explicit_app_context_selection_without_window_id() {
+        assert_eq!(
+            def().input_schema["properties"]["window_selection"]["enum"],
+            serde_json::json!(["exact", "app_context"])
+        );
+        assert_eq!(
+            def().input_schema["required"],
+            serde_json::json!(["pid"]),
+            "window_id is conditionally required only for exact selection"
+        );
+        assert_eq!(
+            def().input_schema["properties"]["expected_bundle_id"]["type"],
+            "string"
+        );
+        assert_eq!(
+            def().input_schema["properties"]["expected_app_name"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn app_context_requires_a_cached_application_identity() {
+        let refusal = expected_app_identity(&serde_json::json!({
+            "pid": 42,
+            "window_selection": "app_context"
+        }))
+        .unwrap_err();
+        assert_eq!(
+            refusal.structured_content.unwrap()["code"],
+            "app_context_identity_required"
+        );
+    }
+
+    #[test]
+    fn process_identity_mismatch_uses_the_plugin_stale_cache_code() {
+        let expected = crate::ax::app_context::ExpectedAppIdentity {
+            bundle_id: Some("com.apple.calculator".into()),
+            app_name: Some("Calculator".into()),
+        };
+        let actual = crate::ax::app_context::RunningAppIdentity {
+            bundle_id: Some("com.example.other-app".into()),
+            app_name: Some("OtherApp".into()),
+        };
+        let refusal = process_identity_mismatch_refusal(42, &expected, Some(&actual));
+        let structured = refusal.structured_content.unwrap();
+        assert_eq!(structured["code"], "process_identity_mismatch");
+        assert_eq!(structured["effect"], "refused");
+        assert_eq!(structured["retryable"], true);
+        assert_eq!(structured["expected_bundle_id"], "com.apple.calculator");
+        assert_eq!(structured["actual_bundle_id"], "com.example.other-app");
+    }
+
+    #[test]
+    fn observation_plan_defaults_to_tree_and_screenshot() {
+        assert_eq!(
+            observation_plan(None, None, false),
+            Ok(ObservationPlan {
+                include_elements: true,
+                include_screenshot: true,
+            })
+        );
+    }
+
+    #[test]
+    fn observation_plan_supports_screenshot_only_and_tree_only() {
+        assert_eq!(
+            observation_plan(Some(false), None, false),
+            Ok(ObservationPlan {
+                include_elements: false,
+                include_screenshot: true,
+            })
+        );
+        assert_eq!(
+            observation_plan(None, Some(false), false),
+            Ok(ObservationPlan {
+                include_elements: true,
+                include_screenshot: false,
+            })
+        );
+    }
+
+    #[test]
+    fn observation_plan_rejects_an_empty_response() {
+        assert_eq!(
+            observation_plan(Some(false), Some(false), false),
+            Err(NO_OBSERVATION_CONTENT)
+        );
+        assert_eq!(
+            observation_plan(Some(false), Some(false), true),
+            Ok(ObservationPlan {
+                include_elements: false,
+                include_screenshot: true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_branches_are_polled_concurrently() {
+        let (tree_started_tx, tree_started_rx) = tokio::sync::oneshot::channel();
+        let (screenshot_started_tx, screenshot_started_rx) = tokio::sync::oneshot::channel();
+
+        let tree = async move {
+            tree_started_tx.send(()).unwrap();
+            screenshot_started_rx.await.unwrap();
+            "tree"
+        };
+        let screenshot = async move {
+            screenshot_started_tx.send(()).unwrap();
+            tree_started_rx.await.unwrap();
+            "screenshot"
+        };
+
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            join_observation_branches(tree, screenshot),
+        )
+        .await
+        .expect("both branches must be polled instead of awaiting one before the other");
+
+        assert_eq!(joined, ("tree", "screenshot"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ax::tree::AXNode;
+    use cua_driver_core::element_query::project_elements_for_query;
+
+    fn node(
+        idx: Option<usize>,
+        role: &str,
+        title: Option<&str>,
+        depth: usize,
+        parent: Option<usize>,
+        frame: Option<[f64; 4]>,
+    ) -> AXNode {
+        AXNode {
+            element_index: idx,
+            role: role.into(),
+            title: title.map(|s| s.to_string()),
+            value: None,
+            description: None,
+            identifier: None,
+            help: None,
+            actions: vec![],
+            element_ptr: 0,
+            depth,
+            parent_element_index: parent,
+            frame,
+            value_state: None,
+            value_description: None,
+            min_value: None,
+            max_value: None,
+            enabled: None,
+            selected: None,
+            in_web_content: false,
+        }
+    }
+
+    #[test]
+    fn elements_match_indexed_node_count() {
+        // Mix of indexed + non-indexed nodes; only indexed should surface.
+        let nodes = vec![
+            node(
+                Some(0),
+                "AXWindow",
+                Some("Doc"),
+                0,
+                None,
+                Some([0.0, 0.0, 800.0, 600.0]),
+            ),
+            node(None, "AXStaticText", Some("hint"), 1, Some(0), None),
+            node(
+                Some(1),
+                "AXButton",
+                Some("OK"),
+                1,
+                Some(0),
+                Some([10.0, 20.0, 60.0, 24.0]),
+            ),
+            node(
+                Some(2),
+                "AXButton",
+                Some("Cancel"),
+                1,
+                Some(0),
+                Some([80.0, 20.0, 60.0, 24.0]),
+            ),
+        ];
+        let elements = build_elements_array(&nodes);
+        assert_eq!(
+            elements.len(),
+            3,
+            "non-actionable rows must be filtered out"
+        );
+        let indices: Vec<u64> = elements
+            .iter()
+            .map(|e| e["element_index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            indices,
+            vec![0, 1, 2],
+            "ordering must match DFS / element_index assignment"
+        );
+    }
+
+    #[test]
+    fn query_projection_keeps_only_rendered_actionable_rows() {
+        let nodes = vec![
+            node(Some(0), "AXWindow", Some("Document"), 0, None, None),
+            node(Some(1), "AXMenuItem", Some("Window"), 1, Some(0), None),
+            node(
+                Some(2),
+                "AXMenuItem",
+                Some("Move & Resize"),
+                2,
+                Some(1),
+                None,
+            ),
+            node(Some(3), "AXMenuItem", Some("Left"), 3, Some(2), None),
+            node(Some(4), "AXButton", Some("Unrelated"), 1, Some(0), None),
+        ];
+        let elements = build_elements_array(&nodes);
+        let filtered_markdown = concat!(
+            "- [0] AXWindow \"Document\"\n",
+            "  - [1] AXMenuItem \"Window\"\n",
+            "    - [2] AXMenuItem \"Move & Resize\"\n",
+            "      - [3] AXMenuItem \"Left\"\n",
+        );
+
+        let projected = project_elements_for_query(elements, Some("Left"), filtered_markdown);
+        let indices: Vec<u64> = projected
+            .iter()
+            .map(|entry| entry["element_index"].as_u64().unwrap())
+            .collect();
+
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn query_projection_returns_no_elements_when_markdown_has_no_match() {
+        let nodes = vec![node(Some(0), "AXButton", Some("Unrelated"), 0, None, None)];
+        let elements = build_elements_array(&nodes);
+
+        let projected = project_elements_for_query(elements, Some("zoomLeft"), "");
+
+        assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn unfiltered_projection_preserves_every_element() {
+        let nodes = vec![
+            node(Some(0), "AXButton", Some("One"), 0, None, None),
+            node(Some(1), "AXButton", Some("Two"), 0, None, None),
+        ];
+        let elements = build_elements_array(&nodes);
+
+        let projected = project_elements_for_query(elements, None, "");
+
+        assert_eq!(projected.len(), 2);
+    }
+
+    #[test]
+    fn elements_shape_carries_role_label_frame_parent_depth() {
+        let nodes = vec![node(
+            Some(7),
+            "AXButton",
+            Some("Go"),
+            3,
+            Some(2),
+            Some([1.5, 2.5, 33.0, 44.0]),
+        )];
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(entry["element_index"], 7);
+        assert_eq!(entry["role"], "AXButton");
+        assert_eq!(entry["label"], "Go");
+        assert_eq!(entry["depth"], 3);
+        assert_eq!(entry["parent_index"], 2);
+        let frame = &entry["frame"];
+        assert_eq!(frame["x"], 1.5);
+        assert_eq!(frame["y"], 2.5);
+        assert_eq!(frame["w"], 33.0);
+        assert_eq!(frame["h"], 44.0);
+    }
+
+    #[test]
+    fn elements_surface_value_separately_from_label() {
+        // A field with BOTH a title and a value (e.g. WhatsApp's "Compose
+        // message" box holding typed text): label is the title, but the typed
+        // value must ALSO be exposed so the caller can verify what landed.
+        let mut nodes = vec![node(
+            Some(0),
+            "AXTextArea",
+            Some("Compose message"),
+            1,
+            None,
+            None,
+        )];
+        nodes[0].value = Some("i love u".into());
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(entry["label"], "Compose message", "label stays the title");
+        assert_eq!(
+            entry["value"], "i love u",
+            "value must be surfaced separately"
+        );
+    }
+
+    #[test]
+    fn elements_surface_control_state_fields() {
+        // A slider whose AXValue is a CFNumber: `value` comes from the
+        // coerced value_state, alongside value_description, min/max,
+        // enabled, and selected.
+        let mut nodes = vec![node(
+            Some(0),
+            "AXSlider",
+            Some("Stationary noise suppression"),
+            1,
+            None,
+            None,
+        )];
+        nodes[0].value_state = Some("8".into());
+        nodes[0].value_description = Some("8 dB".into());
+        nodes[0].min_value = Some(2.0);
+        nodes[0].max_value = Some(8.0);
+        nodes[0].enabled = Some(true);
+        nodes[0].selected = Some(false);
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(
+            entry["value"], "8",
+            "numeric AXValue surfaces via value_state"
+        );
+        assert_eq!(entry["value_description"], "8 dB");
+        assert_eq!(entry["min"], 2.0);
+        assert_eq!(entry["max"], 8.0);
+        assert_eq!(entry["enabled"], true);
+        assert_eq!(entry["selected"], false);
+    }
+
+    #[test]
+    fn elements_surface_inherited_web_content_trust_marker() {
+        let mut nodes = vec![node(
+            Some(0),
+            "AXButton",
+            Some("Renderer button"),
+            2,
+            None,
+            None,
+        )];
+        nodes[0].in_web_content = true;
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(entry["in_web_content"], true);
+    }
+
+    #[test]
+    fn checkbox_value_state_normalizes_to_selected() {
+        let mut nodes = vec![node(Some(0), "AXCheckBox", Some("I agree"), 0, None, None)];
+        nodes[0].value_state = Some("0".into());
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(entry["selected"], false);
+    }
+
+    #[test]
+    fn elements_control_state_fields_omitted_when_absent() {
+        // Stock behaviour is unchanged for elements without control state.
+        let nodes = vec![node(Some(0), "AXButton", Some("OK"), 0, None, None)];
+        let entry = &build_elements_array(&nodes)[0];
+        for key in ["value_description", "min", "max", "enabled", "selected"] {
+            assert!(entry.get(key).is_none(), "{key} must be omitted");
+        }
+    }
+
+    #[test]
+    fn elements_omit_degenerate_min_max_range() {
+        // WebKit reports AXMinValue/AXMaxValue as 0.0/0.0 on non-range
+        // controls (checkboxes, radios) — a degenerate range is omitted.
+        let mut nodes = vec![node(Some(0), "AXCheckBox", Some("On"), 0, None, None)];
+        nodes[0].min_value = Some(0.0);
+        nodes[0].max_value = Some(0.0);
+        let entry = &build_elements_array(&nodes)[0];
+        assert!(entry.get("min").is_none(), "degenerate min must be omitted");
+        assert!(entry.get("max").is_none(), "degenerate max must be omitted");
+    }
+
+    #[test]
+    fn elements_value_state_falls_back_to_string_value() {
+        // String-valued elements keep their `value` even with no value_state.
+        let mut nodes = vec![node(Some(0), "AXComboBox", None, 0, None, None)];
+        nodes[0].value = Some("Search".into());
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(entry["value"], "Search");
+    }
+
+    #[test]
+    fn elements_omit_empty_value() {
+        // An empty AXValue must not emit a `value` field (matches the other
+        // optional fields' omit-when-absent contract).
+        let mut nodes = vec![node(Some(0), "AXButton", Some("OK"), 0, None, None)];
+        nodes[0].value = Some(String::new());
+        let entry = &build_elements_array(&nodes)[0];
+        assert!(entry.get("value").is_none(), "empty value must be omitted");
+    }
+
+    #[test]
+    fn elements_omit_optional_fields_when_missing() {
+        let nodes = vec![node(Some(0), "AXUnknown", None, 0, None, None)];
+        let entry = &build_elements_array(&nodes)[0];
+        assert!(
+            entry.get("label").is_none(),
+            "label must be omitted when title/value/desc/id are all empty"
+        );
+        assert!(
+            entry.get("frame").is_none(),
+            "frame must be omitted when no rect was captured"
+        );
+        assert!(
+            entry.get("parent_index").is_none(),
+            "parent_index must be omitted at the root"
+        );
+        assert_eq!(entry["role"], "AXUnknown");
+        assert_eq!(entry["depth"], 0);
+    }
+
+    #[test]
+    fn elements_label_fallback_chain() {
+        // title missing → description → value → identifier
+        let nodes = vec![
+            node(Some(0), "AXButton", None, 0, None, None),
+            node(Some(1), "AXButton", None, 0, None, None),
+            node(Some(2), "AXButton", None, 0, None, None),
+        ];
+        let mut nodes = nodes;
+        nodes[0].description = Some("from-desc".into());
+        nodes[1].value = Some("from-val".into());
+        nodes[2].identifier = Some("from-id".into());
+        let elements = build_elements_array(&nodes);
+        assert_eq!(elements[0]["label"], "from-desc");
+        assert_eq!(elements[1]["label"], "from-val");
+        assert_eq!(elements[2]["label"], "from-id");
+    }
+
+    /// Every element entry carries a non-empty snapshot-bound
+    /// `element_token` alongside its numeric `element_index`.
+    #[test]
+    fn build_elements_array_with_token_emits_element_token_per_row() {
+        let reg = cua_driver_core::element_token::global();
+        let pid = 0x6abc_0001_i32;
+        let sid = reg.register_snapshot(pid, /* window_id = */ 9, 3);
+        let nodes = vec![
+            node(Some(0), "AXButton", Some("A"), 1, None, None),
+            node(Some(1), "AXButton", Some("B"), 1, None, None),
+            node(Some(2), "AXButton", Some("C"), 1, None, None),
+        ];
+        let entries = build_elements_array_with_token(&nodes, sid);
+        assert_eq!(entries.len(), 3);
+        // Every entry must have BOTH fields (additive contract).
+        for e in &entries {
+            assert!(
+                e.get("element_index").is_some(),
+                "element_index must remain"
+            );
+            let tok = e
+                .get("element_token")
+                .and_then(|v| v.as_str())
+                .expect("element_token must be a string");
+            assert!(tok.starts_with('s'), "token must use the 's' prefix: {tok}");
+            assert!(tok.contains(':'), "token must be `s{{hex}}:{{idx}}`: {tok}");
+        }
+        // Each token must resolve through the registry to the same
+        // (window_id, element_index) the integer field reports.
+        for e in &entries {
+            let idx = e["element_index"].as_u64().unwrap() as usize;
+            let tok = e["element_token"].as_str().unwrap();
+            let (wid, resolved_idx) = reg.resolve(pid, tok).expect("token must resolve");
+            assert_eq!(wid, 9);
+            assert_eq!(resolved_idx, idx);
+        }
+    }
+
+    /// Back-compat: `build_elements_array` (the old shim) must NOT emit
+    /// `element_token` — older callers that never plumb a snapshot id
+    /// through get a clean shape.
+    #[test]
+    fn build_elements_array_shim_skips_element_token() {
+        let nodes = vec![node(Some(0), "AXButton", Some("A"), 1, None, None)];
+        let entries = build_elements_array(&nodes);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].get("element_token").is_none(),
+            "back-compat shim must NOT emit element_token; got: {}",
+            entries[0]
+        );
+    }
+
+    #[test]
+    fn walk_tree_bounded_signature_accepts_caps_no_panic() {
+        // Regression guard for #22865: the bounded variant must accept
+        // arbitrary cap values without panicking, even against a pid that
+        // has no AX tree to walk. Returns a TreeWalkResult either way.
+        // Use pid that won't be a real process. Don't assume tree is empty
+        // (CI may have process re-use) — only assert that the call returns
+        // and the result struct shape is intact.
+        let r1 = crate::ax::tree::walk_tree_bounded(i32::MAX, None, None, 5, 2);
+        // Cap of 5 is the contract test from the task: when this many
+        // visible nodes existed, the walker must stop early. The dead pid
+        // exercises the early-return path; the assertion is that the call
+        // honors the cap without overflowing or panicking.
+        assert!(r1.nodes.len() <= 5, "max_elements=5 must cap nodes ≤ 5");
+        assert!(
+            r1.nodes.iter().all(|n| n.depth <= 2),
+            "max_depth=2 must cap depth ≤ 2"
+        );
+        // And the uncapped variant — same dead-pid path, just validating
+        // walk_tree(...) (which delegates to walk_tree_bounded with
+        // DEFAULT_MAX_*) returns the same empty/safe shape.
+        let r2 = crate::ax::tree::walk_tree(i32::MAX, None, None);
+        assert_eq!(
+            r1.nodes.len(),
+            r2.nodes.len(),
+            "no-pid case: both bounded and unbounded must agree on the empty result"
+        );
+    }
+
+    #[test]
+    fn application_menu_metadata_keeps_document_action_anchor_and_withholds_pixels() {
+        let mut structured = serde_json::json!({"pid":42,"window_id":7,"screenshot_width":406,"screenshot_height":234});
+        let menu = crate::ax::application_menu::ApplicationMenuImage {
+            pid: 42,
+            document_window_id: 7,
+            menu_window_id: 9,
+            document_bounds: crate::windows::WindowBounds {
+                x: 504.0,
+                y: 63.0,
+                width: 700.0,
+                height: 892.0,
+            },
+            menu_bounds: crate::windows::WindowBounds {
+                x: 215.0,
+                y: 34.0,
+                width: 203.0,
+                height: 117.0,
+            },
+        };
+        apply_application_menu_metadata(&mut structured, &menu, 2.0);
+        assert_eq!(structured["window_id"], 7);
+        assert_eq!(structured["pid"], 42);
+        assert_eq!(structured["window_bounds"]["x"], 504.0);
+        assert_eq!(structured["screenshot_scope"], "application_menu");
+        assert_eq!(structured["screenshot_coordinates_actionable"], false);
+        assert_eq!(
+            structured["screenshot_target"],
+            "application_menu.visual_target"
+        );
+        assert_eq!(structured["application_menu"]["host_window_id"], 7);
+        assert_eq!(
+            structured["application_menu"]["visual_target"]["window_id"],
+            9
+        );
+        assert_eq!(
+            structured["application_menu"]["visual_target"]["window_bounds"]["x"],
+            215.0
+        );
+        assert_eq!(structured["screenshot_width"], 406);
+        assert_eq!(structured["screenshot_scale"], 2.0);
+    }
+}
