@@ -1278,7 +1278,7 @@ fn launch_daemon_with_state_and_wait(
     let app_path = crate::bundle::app_bundle_path();
     let pass_socket = socket_path != crate::serve::default_socket_path();
     let open_args = daemon_launch_arguments(
-        app_name,
+        &app_path,
         socket_path,
         state,
         experimental_history,
@@ -1316,7 +1316,7 @@ fn launch_daemon_with_state_and_wait(
         return Err(LaunchDaemonError {
             kind: LaunchDaemonErrorKind::Failed,
             message: format!(
-                "`open -n -g -a {app_name} --args serve{}` exited {:?}. \
+                "`open -n -g -a {app_path:?} --args serve{}` exited {:?}. \
              Check that `{app_path}` is installed.",
                 if pass_socket {
                     format!(" --socket {socket_path}")
@@ -1586,7 +1586,7 @@ fn restart_managed_daemon_if_present(_executable: &std::path::Path) -> bool {
 
 #[cfg(target_os = "macos")]
 fn daemon_launch_arguments(
-    app_name: &str,
+    app_path: &str,
     socket_path: &str,
     state: &crate::history_runtime::DaemonLaunchState,
     experimental_history: bool,
@@ -1596,7 +1596,7 @@ fn daemon_launch_arguments(
         "-n".to_owned(),
         "-g".to_owned(),
         "-a".to_owned(),
-        app_name.to_owned(),
+        app_path.to_owned(),
         "--args".to_owned(),
         "serve".to_owned(),
     ];
@@ -1724,6 +1724,7 @@ where
         #[cfg(target_os = "macos")]
         {
             let app_name = crate::bundle::app_name();
+            let app_path = crate::bundle::app_bundle_path();
             let socket_suffix = if socket_path != crate::serve::default_socket_path() {
                 format!(" --socket {socket_path}")
             } else {
@@ -1741,7 +1742,7 @@ where
             };
             eprintln!(
                 "{}: mcp launched without {app_name}.app's TCC grants; \
-                 auto-launching the daemon via `open -n -g -a {app_name} --args serve{socket_suffix}{pip_suffix}{async_cursor_suffix}` \
+                 auto-launching the daemon via `open -n -g -a {app_path:?} --args serve{socket_suffix}{pip_suffix}{async_cursor_suffix}` \
                  and proxying MCP requests through it.",
                 crate::bundle::cli_name()
             );
@@ -4945,6 +4946,19 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         let disabled = daemon_process_arguments("pip-test.sock", &state, false, false);
         assert!(!disabled.contains(&"--experimental-pip".to_owned()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn renamed_app_launch_uses_exact_path_as_one_argument() {
+        let app = "/Users/developer/My Apps/cua.app";
+        let state = crate::history_runtime::DaemonLaunchState::default();
+        let launch = daemon_launch_arguments(app, "/tmp/cua.sock", &state, false, true);
+        assert_eq!(&launch[..6], &["-n", "-g", "-a", app, "--args", "serve"]);
+        assert!(launch
+            .windows(2)
+            .any(|pair| pair == ["--socket", "/tmp/cua.sock"]));
+        assert!(launch.contains(&"--experimental-pip".to_owned()));
     }
 
     #[test]

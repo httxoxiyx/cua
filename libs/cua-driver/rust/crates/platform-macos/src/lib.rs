@@ -7,6 +7,8 @@
 //! - CGWindow / ScreenCaptureKit for window enumeration and screenshots
 
 #[cfg(target_os = "macos")]
+pub mod app_identity;
+#[cfg(target_os = "macos")]
 pub mod apps;
 #[cfg(target_os = "macos")]
 pub mod ax;

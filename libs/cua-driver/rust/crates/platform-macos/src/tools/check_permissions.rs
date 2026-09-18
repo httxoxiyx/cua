@@ -41,13 +41,8 @@ pub async fn request_from_launchservices_host(probe_direct_capture: bool) -> Too
 }
 
 fn driver_bundle_id_for_executable(executable: &str) -> Option<&'static str> {
-    if executable.contains("/CuaDriverLocal.app/Contents/MacOS/") {
-        Some("com.trycua.driver.local")
-    } else if executable.contains("/CuaDriver.app/Contents/MacOS/") {
-        Some("com.trycua.driver")
-    } else {
-        None
-    }
+    crate::app_identity::driver_app_for_executable(Path::new(executable))
+        .map(|identity| identity.bundle_id)
 }
 
 fn current_executable() -> String {
@@ -63,10 +58,18 @@ fn direct_capture_evidence_store_for_identity(
     home: &Path,
     attribution: Option<&str>,
 ) -> Option<DirectCaptureEvidenceStore> {
+    let bundle_id = driver_bundle_id_for_executable(executable)?;
+    direct_capture_evidence_store_for_bundle(bundle_id, home, attribution)
+}
+
+fn direct_capture_evidence_store_for_bundle(
+    bundle_id: &str,
+    home: &Path,
+    attribution: Option<&str>,
+) -> Option<DirectCaptureEvidenceStore> {
     if attribution != Some("driver-daemon") {
         return None;
     }
-    let bundle_id = driver_bundle_id_for_executable(executable)?;
     let state_directory = match bundle_id {
         "com.trycua.driver.local" => ".cua-driver-local",
         "com.trycua.driver" => ".cua-driver",
@@ -254,9 +257,10 @@ fn permission_source(
                      the driver never raises its own prompt.",
         });
     }
-    // The trustworthy, non-spoofable signal is the executable path: a caller
-    // can't run from inside the code-signed `CuaDriver.app` bundle without
-    // controlling that install. The disclaim env var is caller-controlled, so
+    // Identify the canonical executable's enclosing Driver bundle using its
+    // metadata, not its folder name. This labels the permission observation;
+    // macOS still owns the actual signature-based TCC grant. The disclaim env
+    // var is caller-controlled, so
     // it is treated only as a corroborating signal that explains why a
     // bundle-resident daemon has `ppid != 1` (it re-exec'd itself with
     // responsibility disclaim, so launchd is no longer its parent). On its own
@@ -527,28 +531,44 @@ mod tests {
     }
 
     fn release_evidence_store(home: &Path) -> DirectCaptureEvidenceStore {
-        direct_capture_evidence_store_for_identity(
-            "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
-            home,
-            Some("driver-daemon"),
-        )
-        .expect("release store")
+        direct_capture_evidence_store_for_bundle("com.trycua.driver", home, Some("driver-daemon"))
+            .expect("release store")
     }
 
     #[test]
     fn recognizes_release_and_local_driver_bundles() {
-        assert_eq!(
-            driver_bundle_id_for_executable(
-                "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+        let root = tempfile::tempdir().unwrap();
+        for (name, bundle_id, executable) in [
+            ("renamed.app", "com.trycua.driver", "cua-driver"),
+            ("cua.app", "com.trycua.driver.local", "cua-driver-local"),
+            (
+                "CuaDriverLocal.app",
+                "org.example.unrelated",
+                "cua-driver-local",
             ),
-            Some("com.trycua.driver")
-        );
-        assert_eq!(
-            driver_bundle_id_for_executable(
-                "/Applications/CuaDriverLocal.app/Contents/MacOS/cua-driver-local"
-            ),
-            Some("com.trycua.driver.local")
-        );
+        ] {
+            let contents = root.path().join(name).join("Contents");
+            std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+            let path = contents.join("MacOS").join(executable);
+            std::fs::write(&path, b"fixture").unwrap();
+            std::fs::write(contents.join("Info.plist"), format!(
+                "<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>{bundle_id}</string>\
+                 <key>CFBundleExecutable</key><string>{executable}</string>\
+                 <key>CFBundlePackageType</key><string>APPL</string></dict></plist>"
+            )).unwrap();
+            let actual = driver_bundle_id_for_executable(path.to_str().unwrap());
+            if bundle_id == "org.example.unrelated" {
+                assert_eq!(actual, None);
+            } else {
+                assert_eq!(actual, Some(bundle_id));
+                assert!(direct_capture_evidence_store_for_identity(
+                    path.to_str().unwrap(),
+                    root.path(),
+                    Some("driver-daemon")
+                )
+                .is_some());
+            }
+        }
         assert_eq!(
             driver_bundle_id_for_executable("/Users/test/.local/bin/cua-driver-local"),
             None
@@ -560,8 +580,8 @@ mod tests {
         let home =
             std::env::temp_dir().join(format!("cua-direct-capture-test-{}", uuid::Uuid::new_v4()));
         let release = release_evidence_store(&home);
-        let local = direct_capture_evidence_store_for_identity(
-            "/Applications/CuaDriverLocal.app/Contents/MacOS/cua-driver-local",
+        let local = direct_capture_evidence_store_for_bundle(
+            "com.trycua.driver.local",
             &home,
             Some("driver-daemon"),
         )
@@ -577,8 +597,8 @@ mod tests {
         )
         .is_none());
         for attribution in [Some("caller"), Some("host"), None] {
-            assert!(direct_capture_evidence_store_for_identity(
-                "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
+            assert!(direct_capture_evidence_store_for_bundle(
+                "com.trycua.driver",
                 &home,
                 attribution,
             )
