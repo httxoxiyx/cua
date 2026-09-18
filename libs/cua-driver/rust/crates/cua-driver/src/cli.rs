@@ -1276,9 +1276,14 @@ fn launch_daemon_with_state_and_wait(
     // shorter `open` argv (and matches Swift's invocation byte-for-byte).
     let app_name = crate::bundle::app_name();
     let app_path = crate::bundle::app_bundle_path();
+    let app_target = daemon_launch_target(
+        app_name,
+        &app_path,
+        crate::bundle::is_executable_inside_cuadriver_app(),
+    );
     let pass_socket = socket_path != crate::serve::default_socket_path();
     let open_args = daemon_launch_arguments(
-        &app_path,
+        &app_target,
         socket_path,
         state,
         experimental_history,
@@ -1316,7 +1321,7 @@ fn launch_daemon_with_state_and_wait(
         return Err(LaunchDaemonError {
             kind: LaunchDaemonErrorKind::Failed,
             message: format!(
-                "`open -n -g -a {app_path:?} --args serve{}` exited {:?}. \
+                "`open -n -g -a {app_target:?} --args serve{}` exited {:?}. \
              Check that `{app_path}` is installed.",
                 if pass_socket {
                     format!(" --socket {socket_path}")
@@ -1585,6 +1590,14 @@ fn restart_managed_daemon_if_present(_executable: &std::path::Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn daemon_launch_target(app_name: &str, app_path: &str, inside_bundle: bool) -> String {
+    // A bundled CLI (including a symlink to it) must launch that exact app.
+    // A bare CLI retains LaunchServices discovery by name, including installs
+    // outside /Applications. It has no enclosing app path to pin.
+    if inside_bundle { app_path } else { app_name }.to_owned()
+}
+
+#[cfg(target_os = "macos")]
 fn daemon_launch_arguments(
     app_path: &str,
     socket_path: &str,
@@ -1725,6 +1738,11 @@ where
         {
             let app_name = crate::bundle::app_name();
             let app_path = crate::bundle::app_bundle_path();
+            let app_target = daemon_launch_target(
+                app_name,
+                &app_path,
+                crate::bundle::is_executable_inside_cuadriver_app(),
+            );
             let socket_suffix = if socket_path != crate::serve::default_socket_path() {
                 format!(" --socket {socket_path}")
             } else {
@@ -1742,7 +1760,7 @@ where
             };
             eprintln!(
                 "{}: mcp launched without {app_name}.app's TCC grants; \
-                 auto-launching the daemon via `open -n -g -a {app_path:?} --args serve{socket_suffix}{pip_suffix}{async_cursor_suffix}` \
+                 auto-launching the daemon via `open -n -g -a {app_target:?} --args serve{socket_suffix}{pip_suffix}{async_cursor_suffix}` \
                  and proxying MCP requests through it.",
                 crate::bundle::cli_name()
             );
@@ -4952,6 +4970,11 @@ mod tests {
     #[test]
     fn renamed_app_launch_uses_exact_path_as_one_argument() {
         let app = "/Users/developer/My Apps/cua.app";
+        assert_eq!(daemon_launch_target("CuaDriverLocal", app, true), app);
+        assert_eq!(
+            daemon_launch_target("CuaDriverLocal", app, false),
+            "CuaDriverLocal"
+        );
         let state = crate::history_runtime::DaemonLaunchState::default();
         let launch = daemon_launch_arguments(app, "/tmp/cua.sock", &state, false, true);
         assert_eq!(&launch[..6], &["-n", "-g", "-a", app, "--args", "serve"]);
