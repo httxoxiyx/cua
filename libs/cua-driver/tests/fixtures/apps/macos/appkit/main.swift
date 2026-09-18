@@ -61,7 +61,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     let window: NSWindow
     let counterLabel = NSTextField(labelWithString: "counter=0")
     var counterValue = 0
-    let textInput = NSTextField(string: "")
+    let textInput = ClickObservedTextField(string: "")
     let textInputMirror = NSTextField(labelWithString: "")
     let textInputCommit = NSTextField(labelWithString: "committed=none")
     let lastActionLabel = NSTextField(labelWithString: "last_action=none")
@@ -629,7 +629,10 @@ struct CuaAppKitHarness {
         }
         app.activate(ignoringOtherApps: true)
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)
-        DispatchQueue.main.async { prepareKeyboardSelectionProbe() }
+        DispatchQueue.main.async {
+            prepareKeyboardSelectionProbe()
+            controller.textInput.prepareClickOracle()
+        }
         app.run()
         _ = matrixWindows
     }

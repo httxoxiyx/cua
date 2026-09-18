@@ -2,8 +2,9 @@
 //!
 //! Two addressing modes:
 //!
-//! * **AX path** (`element_index` + `window_id`): performs AXAction on the cached
-//!   element. Fires via AX RPC — the target app never needs to be frontmost.
+//! * **Element path** (`element_index` + `window_id`): normally performs AXAction
+//!   on the cached element. Plain text-input clicks without AXPress instead use
+//!   one exact-window pointer route, selected before any actuator runs.
 //!   Extra behaviors vs. the naive dispatch:
 //!   - AXTextField / AXTextArea AXPress: at least 100 ms best-effort focus
 //!     settle after dispatch completes, including window-report time, without
@@ -27,8 +28,9 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_action_names, copy_bool_attr, copy_children, copy_string_attr, element_at_screen_position,
-    element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction, AXUIElementRef,
+    copy_action_names, copy_bool_attr, copy_children, copy_element_attr, copy_string_attr,
+    element_at_screen_position, element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction,
+    AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
@@ -66,6 +68,125 @@ struct SelectionPixelTarget {
     screen_y: f64,
     window_x: f64,
     window_y: f64,
+}
+
+/// Choose one actuator before the exact-target gate. A pointer-selected text
+/// input must never enter the generic AX click/fallback implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElementClickRoute {
+    AxSemantic,
+    TextInputPointer,
+}
+
+fn element_click_route(
+    action: &str,
+    button: &str,
+    has_modifiers: bool,
+    role: &str,
+    advertised_actions: &[String],
+    selectable_ancestry: bool,
+    auxiliary_surface: bool,
+) -> ElementClickRoute {
+    if (action.eq_ignore_ascii_case("press") || action.eq_ignore_ascii_case("click"))
+        && button == "left"
+        && !has_modifiers
+        && matches!(role, "AXTextField" | "AXTextArea")
+        && !advertised_actions.iter().any(|action| action == "AXPress")
+        && !selectable_ancestry
+        && !auxiliary_surface
+    {
+        ElementClickRoute::TextInputPointer
+    } else {
+        ElementClickRoute::AxSemantic
+    }
+}
+
+/// The host-attached classifier deliberately excludes directly addressed
+/// popover windows. Neither case is part of the text-input pointer route.
+fn text_input_pointer_has_auxiliary_window(element_ptr: usize) -> bool {
+    unsafe {
+        let Some(window) = copy_element_attr(element_ptr as AXUIElementRef, "AXWindow") else {
+            return false;
+        };
+        let role = copy_string_attr(window, "AXRole");
+        CFRelease(window as _);
+        matches!(role.as_deref(), Some("AXPopover" | "AXMenu" | "AXMenuBar"))
+    }
+}
+
+/// AX and WindowServer geometry are both logical screen points, not capture
+/// pixels. Refuse a missing/changed frame or a center outside that exact window;
+/// never clamp it or reinterpret it as a desktop coordinate.
+fn text_input_pointer_target(
+    element_rect: Option<[f64; 4]>,
+    captured_bounds: &crate::windows::WindowBounds,
+    live_bounds: Option<&crate::windows::WindowBounds>,
+) -> Option<SelectionPixelTarget> {
+    let [x, y, width, height] = element_rect?;
+    let live = live_bounds?;
+    let bounds = captured_bounds;
+    if ![
+        x,
+        y,
+        width,
+        height,
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+        || width <= 0.0
+        || height <= 0.0
+        || bounds.width <= 0.0
+        || bounds.height <= 0.0
+        || [bounds.x, bounds.y, bounds.width, bounds.height]
+            != [live.x, live.y, live.width, live.height]
+    {
+        return None;
+    }
+    let screen_x = x + width / 2.0;
+    let screen_y = y + height / 2.0;
+    let window_x = screen_x - bounds.x;
+    let window_y = screen_y - bounds.y;
+    if !screen_x.is_finite()
+        || !screen_y.is_finite()
+        || !(0.0..bounds.width).contains(&window_x)
+        || !(0.0..bounds.height).contains(&window_y)
+    {
+        return None;
+    }
+    Some(SelectionPixelTarget {
+        screen_x,
+        screen_y,
+        window_x,
+        window_y,
+    })
+}
+
+fn element_click_result(
+    fronted: bool,
+    used_pixel: bool,
+    selection_verified: bool,
+    suspected_noop: bool,
+) -> Value {
+    serde_json::json!({
+        "path": match (used_pixel, fronted) {
+            (true, true) => "cgevent_fg",
+            (true, false) => "cgevent",
+            (false, true) => "ax_fg",
+            (false, false) => "ax",
+        },
+        "verified": selection_verified,
+        "effect": if selection_verified {
+            "confirmed"
+        } else if suspected_noop {
+            "suspected_noop"
+        } else {
+            "unverifiable"
+        },
+    })
 }
 
 fn selection_readback_confirms(
@@ -135,14 +256,16 @@ fn def() -> &'static ToolDef {
         name: "click".into(),
         description:
             "Click against a target pid. **Prefer `element_token` over pixel \
-             coordinates** — the token works on backgrounded / minimized / hidden / \
-             off-Space windows, identifies one exact snapshot element, and tells \
+             coordinates** — semantic actions can work on backgrounded / minimized / hidden / \
+             off-Space windows. The token identifies one exact snapshot element and tells \
              you what you're clicking via the cached element's role + label. Reach for \
              `x, y` only when the target is a canvas / video / WebGL / custom-drawn surface \
              that doesn't appear in the AX tree.\n\n\
              Two addressing modes:\n\n\
-             - element_token, or element_index + snapshot_id (from get_window_state): AX action path. \
-               Works on backgrounded/hidden windows. No cursor move, no focus steal. \
+             - element_token, or element_index + snapshot_id (from get_window_state): normally AX delivery. \
+               A plain unmodified primary click on a text input without AXPress uses exact-window \
+               pointer delivery instead and requires a live, visible window frame. Background delivery \
+               does not authorize foreground activation. \
                The snapshot cache is scoped per (pid, window_id) and is replaced by the \
                next snapshot of the same window — re-snapshot every turn before clicking.\n\n\
              - x, y (window-local screenshot pixels, top-left origin of the PNG returned \
@@ -182,7 +305,7 @@ fn def() -> &'static ToolDef {
                     "enum": ["left", "right", "middle"],
                     "description": "Mouse button. Default: \"left\" — omit for legacy left-click behaviour. Pixel path uses the matching CGEvent primitive; AX path maps \"right\" to AXShowMenu and falls back to a pixel middle-click at the element's center for \"middle\"."
                 },
-                "count":         { "type": "integer", "description": "Click count (pixel path only). Default 1." },
+                "count":         { "type": "integer", "description": "Click count for pointer delivery, including text inputs without AXPress. Default 1." },
                 "modifier": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -489,43 +612,83 @@ impl Tool for ClickTool {
                 return super::app_context_delegation_stale_refusal();
             }
 
-            // Application-menu elements observed alongside this window do
-            // not acquire document ancestry. Only their isolated semantic
-            // route can use the stronger live application-menu proof.
-            let background_menu = !delivery_mode.is_foreground()
-                && button_str != "middle"
-                && tokio::task::spawn_blocking(move || unsafe {
+            // Right-click is still the semantic AXShowMenu request. Only a
+            // plain primary click on a non-selectable text input without
+            // AXPress chooses pointer delivery; AXConfirm/AXShowMenu are not
+            // substitutes for a click, and a failed AX attempt is not retried.
+            let effective_action = if button_str == "right" && action == "press" {
+                "show_menu".to_string()
+            } else {
+                action.clone()
+            };
+            let foreground = delivery_mode.is_foreground();
+            let primary_press = (effective_action.eq_ignore_ascii_case("press")
+                || effective_action.eq_ignore_ascii_case("click"))
+                && button_str == "left"
+                && modifiers.is_empty();
+            let inspect_background_surface = !foreground && button_str != "middle";
+            let selection_action = effective_action == "press" && button_str != "middle";
+            let (background_menu, background_popover, selectable_ancestry, element_route) =
+                match tokio::task::spawn_blocking(move || unsafe {
                     let element = element_ptr as AXUIElementRef;
-                    copy_string_attr(element, "AXRole").is_some_and(|role| {
-                        crate::ax::application_menu::is_actionable_menu_role(&role)
-                    }) && crate::ax::exact_target::element_window_id(element).is_none()
+                    let role = if inspect_background_surface || primary_press {
+                        copy_string_attr(element, "AXRole").unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    // These isolated semantic surfaces never gain pointer
+                    // authority from being observed alongside a host window.
+                    let menu = inspect_background_surface
+                        && crate::ax::application_menu::is_actionable_menu_role(&role)
+                        && crate::ax::exact_target::element_window_id(element).is_none();
+                    let popover = inspect_background_surface
+                        && !menu
+                        && crate::ax::attached_popover::has_displaced_popover_window(element, wid);
+                    let pointer_candidate = primary_press
+                        && matches!(role.as_str(), "AXTextField" | "AXTextArea")
+                        && !menu
+                        && !popover;
+                    // Preserve the old collection-selection lookup condition.
+                    // Additional ancestry queries are only for text-pointer
+                    // candidates, not confirm/show-menu or middle-click calls.
+                    let selectable = ((selection_action && !menu && !popover) || pointer_candidate)
+                        && crate::input::ax_actions::nearest_container_selection_state(element_ptr)
+                            .is_some();
+                    let route = if pointer_candidate && !selectable {
+                        let actions = copy_action_names(element);
+                        let auxiliary = !actions.iter().any(|action| action == "AXPress")
+                            && (text_input_pointer_has_auxiliary_window(element_ptr)
+                                || (foreground
+                                    && crate::ax::attached_popover::has_displaced_popover_window(
+                                        element, wid,
+                                    )));
+                        element_click_route(
+                            "press", "left", false, &role, &actions, false, auxiliary,
+                        )
+                    } else {
+                        ElementClickRoute::AxSemantic
+                    };
+                    (menu, popover, selectable, route)
                 })
                 .await
-                .unwrap_or(false);
-
-            // Popover controls retain their own physical CGWindowID. Their
-            // isolated AX-only route requires a reciprocal attachment proof;
-            // it grants no pointer, keyboard, focus or value-write authority.
-            let background_popover = !delivery_mode.is_foreground()
-                && button_str != "middle"
-                && !background_menu
-                && tokio::task::spawn_blocking(move || unsafe {
-                    crate::ax::attached_popover::has_displaced_popover_window(
-                        element_ptr as AXUIElementRef,
-                        wid,
-                    )
-                })
-                .await
-                .unwrap_or(false);
+                {
+                    Ok(facts) => facts,
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "Element click route lookup failed: {error}. No input was sent."
+                        ))
+                    }
+                };
 
             // ── Exact-target background gate (macOS background input v1) ──
-            // The element branch is semantic AX delivery, except button=middle
-            // which falls back to a routed pixel click at the element's center
-            // and is therefore held to the stricter WindowPointer rung. Gate
+            // Text-input pointer delivery and button=middle both require the
+            // stricter WindowPointer rung with the retained element proof. Gate
             // BEFORE any cursor/dispatch work so a stale or sibling-owned
             // target refuses instead of acting on the wrong window.
             let _mutation_lease = if !delivery_mode.is_foreground() {
-                let gate_action = if button_str == "middle" {
+                let gate_action = if button_str == "middle"
+                    || element_route == ElementClickRoute::TextInputPointer
+                {
                     cua_driver_core::background_input::BackgroundAction::WindowPointer
                 } else if background_menu {
                     cua_driver_core::background_input::BackgroundAction::ApplicationMenuSemantic
@@ -542,15 +705,6 @@ impl Tool for ClickTool {
                 }
             } else {
                 None
-            };
-
-            // Surface 5: button=right on the AX path → AXShowMenu (the same surface
-            // the dedicated `right_click` tool dispatches). Threads through the
-            // identical perform_ax_click code path with the action remapped.
-            let effective_action = if button_str == "right" && action == "press" {
-                "show_menu".to_string()
-            } else {
-                action.clone()
             };
 
             // Animate cursor to element center BEFORE firing AX action,
@@ -657,17 +811,10 @@ impl Tool for ClickTool {
             // verified coordinate frame only for those collection-like
             // elements so perform_ax_click can cross that one failed semantic
             // rung internally and confirm the result by AX read-back.
-            let selection_candidate =
-                if effective_action == "press" && !background_menu && !background_popover {
-                    tokio::task::spawn_blocking(move || {
-                        crate::input::ax_actions::nearest_container_selection_state(element_ptr)
-                            .is_some()
-                    })
-                    .await
-                    .unwrap_or(false)
-                } else {
-                    false
-                };
+            let selection_candidate = effective_action == "press"
+                && !background_menu
+                && !background_popover
+                && selectable_ancestry;
             let mut selection_pixel = if selection_candidate {
                 if let Some((cx, cy)) = center {
                     super::px_frame::resolve_or_refuse(wid)
@@ -706,7 +853,10 @@ impl Tool for ClickTool {
                 selection_pixel = None;
             }
 
-            if background_menu || background_popover {
+            if background_menu
+                || background_popover
+                || element_route == ElementClickRoute::TextInputPointer
+            {
                 // Cursor feedback may have yielded while a dialog opened.
                 // Keep the original modal/helper guards immediately before
                 // the separate semantic menu dispatch as well.
@@ -764,7 +914,17 @@ impl Tool for ClickTool {
                                 element_ptr as AXUIElementRef,
                             )?;
                         }
-                        if foreground {
+                        if element_route == ElementClickRoute::TextInputPointer {
+                            perform_text_input_pointer_click(
+                                element_ptr,
+                                idx,
+                                pid,
+                                wid,
+                                count,
+                                foreground,
+                                ax_app_context_route,
+                            )
+                        } else if foreground {
                             let mut outcome = None;
                             let has_modifiers = !selection_modifiers.is_empty();
                             let action = || {
@@ -857,7 +1017,7 @@ impl Tool for ClickTool {
                         needs_text_input_settle,
                         suspected_noop,
                         selection_verified,
-                        selection_via_pixel,
+                        used_pixel,
                     ),
                     fronted,
                 ))) => {
@@ -880,23 +1040,12 @@ impl Tool for ClickTool {
                     //     so the press likely did nothing → cross to vision/pixel.
                     //   * unverifiable — dispatched fine, driver just can't confirm;
                     //     the caller verifies via screenshot.
-                    let mut structured = serde_json::json!({
-                        "path": if selection_via_pixel {
-                            if fronted { "cgevent_fg" } else { "cgevent" }
-                        } else if fronted {
-                            "ax_fg"
-                        } else {
-                            "ax"
-                        },
-                        "verified": selection_verified,
-                        "effect": if selection_verified {
-                            "confirmed"
-                        } else if suspected_noop {
-                            "suspected_noop"
-                        } else {
-                            "unverifiable"
-                        },
-                    });
+                    let mut structured = element_click_result(
+                        fronted,
+                        used_pixel,
+                        selection_verified,
+                        suspected_noop,
+                    );
                     if selection_verified {
                         structured["evidence"] = serde_json::json!([
                             { "kind": "accessibility_readback" }
@@ -913,10 +1062,17 @@ impl Tool for ClickTool {
                     }
                     ToolResult::text(msg).with_structured(structured)
                 }
-                Ok(Err(e)) => match e.downcast_ref::<ApplicationMenuRefusal>() {
-                    Some(refusal) => super::background_refusal_result(pid, wid, &refusal.0),
-                    None => ToolResult::error(format!("AX action failed: {e}")),
-                },
+                Ok(Err(e)) => {
+                    if let Some(refusal) = e.downcast_ref::<ApplicationMenuRefusal>() {
+                        super::background_refusal_result(pid, wid, &refusal.0)
+                    } else if let Some(refusal) = e.downcast_ref::<ElementPointerRefusal>() {
+                        refusal.result(pid, wid)
+                    } else if element_route == ElementClickRoute::TextInputPointer {
+                        ToolResult::error(format!("Element pointer click failed: {e}"))
+                    } else {
+                        ToolResult::error(format!("AX action failed: {e}"))
+                    }
+                }
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             }
         } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
@@ -1375,6 +1531,209 @@ impl Tool for ClickTool {
 
 // ── AX click implementation (blocking) ───────────────────────────────────────
 
+#[derive(Debug)]
+enum ElementPointerRefusal {
+    Frame(super::px_frame::PxFrameError),
+    Target(&'static str),
+}
+
+impl ElementPointerRefusal {
+    fn result(&self, pid: i32, window_id: u32) -> ToolResult {
+        match self {
+            Self::Frame(error) => {
+                let mut result = super::px_frame::refusal(error);
+                if let Some(structured) = result.structured_content.as_mut() {
+                    structured["effect"] = serde_json::json!("refused");
+                }
+                result
+            }
+            Self::Target(reason) => ToolResult::error(format!(
+                "Element pointer click refused: {reason}. No pointer input was sent."
+            ))
+            .with_structured(serde_json::json!({
+                "code": "element_pointer_unavailable",
+                "effect": "refused",
+                "pid": pid,
+                "window_id": window_id,
+                "reason": reason,
+            })),
+        }
+    }
+}
+
+impl std::fmt::Display for ElementPointerRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Frame(error) => {
+                write!(formatter, "text-input pointer frame unavailable: {error:?}")
+            }
+            Self::Target(reason) => formatter.write_str(reason),
+        }
+    }
+}
+impl std::error::Error for ElementPointerRefusal {}
+
+/// Re-read the retained element and its exact window, not a cached coordinate
+/// or hit-test substitute. The selected route may become unavailable but may
+/// not change actuators after selection, focus preparation, or dispatch.
+fn live_text_input_pointer_target(
+    element_ptr: usize,
+    pid: i32,
+    window_id: u32,
+    frame: &super::px_frame::WindowPxFrame,
+    foreground: bool,
+    delegation: Option<&crate::ax::app_context::AppContextDelegationRoute>,
+) -> anyhow::Result<SelectionPixelTarget> {
+    use cua_driver_core::background_input::{
+        decide_background_input, BackgroundAction, BackgroundInputDecision, ElementAncestry,
+        ExactWindowTarget, WindowServerOwnership,
+    };
+    super::ensure_app_context_delegation_live(delegation)?;
+    let element = element_ptr as AXUIElementRef;
+    unsafe { super::ensure_app_context_element_window(delegation, element)? };
+    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+    let advertised = unsafe { copy_action_names(element) };
+    let selectable =
+        crate::input::ax_actions::nearest_container_selection_state(element_ptr).is_some();
+    if element_click_route(
+        "press",
+        "left",
+        false,
+        &role,
+        &advertised,
+        selectable,
+        text_input_pointer_has_auxiliary_window(element_ptr),
+    ) != ElementClickRoute::TextInputPointer
+    {
+        return Err(ElementPointerRefusal::Target(
+            "the retained element no longer qualifies for the selected text-input route",
+        )
+        .into());
+    }
+    if unsafe { copy_bool_attr(element, "AXEnabled") } != Some(true) {
+        return Err(ElementPointerRefusal::Target(
+            "the text input is disabled or its enabled state is unproven",
+        )
+        .into());
+    }
+    let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, Some(element_ptr));
+    if foreground {
+        if facts.window_server != WindowServerOwnership::SamePid
+            || facts.element != ElementAncestry::ProvenDescendant
+        {
+            return Err(ElementPointerRefusal::Target(
+                "live ownership and element ancestry do not prove the exact requested window",
+            )
+            .into());
+        }
+    } else if let BackgroundInputDecision::Refuse(refusal) = decide_background_input(
+        ExactWindowTarget { pid, window_id },
+        &facts,
+        BackgroundAction::WindowPointer,
+    ) {
+        return Err(ApplicationMenuRefusal(refusal).into());
+    }
+    let live_bounds = crate::windows::window_bounds_by_id(window_id);
+    text_input_pointer_target(
+        unsafe { element_screen_rect(element) },
+        &frame.bounds,
+        live_bounds.as_ref(),
+    )
+    .ok_or_else(|| {
+        ElementPointerRefusal::Target(
+            "the element center is unavailable/outside its window or the window frame changed",
+        )
+        .into()
+    })
+}
+
+/// Dispatch exactly one requested pointer gesture. This helper is reached only
+/// after route selection and runs inside the shared focus-suppression lifetime.
+/// Neither a preparation failure nor a native dispatch failure reaches AXPress.
+fn perform_text_input_pointer_click(
+    element_ptr: usize,
+    idx: usize,
+    pid: i32,
+    window_id: u32,
+    count: usize,
+    foreground: bool,
+    delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
+) -> anyhow::Result<((String, bool, bool, bool, bool), bool)> {
+    let frame = super::px_frame::resolve_window_px_frame(window_id)
+        .map_err(ElementPointerRefusal::Frame)?;
+    // Refuse invalid/disabled targets before even preparing synthetic focus or
+    // using the caller-authorized foreground activation helper.
+    live_text_input_pointer_target(
+        element_ptr,
+        pid,
+        window_id,
+        &frame,
+        foreground,
+        delegation.as_ref(),
+    )?;
+    if foreground {
+        crate::input::skylight::with_foreground_hid_activation_delegated(
+            pid as libc::pid_t,
+            window_id,
+            delegation.clone(),
+            || {
+                let target = live_text_input_pointer_target(
+                    element_ptr,
+                    pid,
+                    window_id,
+                    &frame,
+                    true,
+                    delegation.as_ref(),
+                )?;
+                crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
+                    target.screen_x,
+                    target.screen_y,
+                    count,
+                    "left",
+                    &[],
+                )
+            },
+        )?;
+    } else {
+        let focus_context = crate::input::mouse::prepare_background_pixel_click(pid, window_id)?;
+        // Preparation may yield to the target application. Re-prove the exact
+        // retained ancestry, enabled state, and frame immediately before input.
+        let target = live_text_input_pointer_target(
+            element_ptr,
+            pid,
+            window_id,
+            &frame,
+            false,
+            delegation.as_ref(),
+        )?;
+        crate::input::mouse::click_at_xy_with_window_local(
+            pid,
+            target.screen_x,
+            target.screen_y,
+            target.window_x,
+            target.window_y,
+            window_id,
+            count,
+            &[],
+            crate::input::mouse::WindowClickDelivery::Background,
+            focus_context,
+        )?;
+    }
+    Ok((
+        (
+            format!(
+                "Posted primary pointer click (count {count}) to text input [{idx}] in window \
+                 {window_id}; not driver-verified — confirm via a fresh state snapshot."
+            ),
+            true,
+            false,
+            false,
+            true,
+        ),
+        foreground,
+    ))
+}
+
 /// Preserve a late pre-dispatch refusal as a typed no-effect result.
 #[derive(Debug)]
 struct ApplicationMenuRefusal(cua_driver_core::background_input::BackgroundRefusal);
@@ -1715,7 +2074,13 @@ fn perform_ax_click(
     let _ = pid;
     let _ = window_id; // used by caller context
 
-    Ok((summary, needs_text_input_settle, suspected_noop, false, false))
+    Ok((
+        summary,
+        needs_text_input_settle,
+        suspected_noop,
+        false,
+        false,
+    ))
 }
 
 #[cfg(test)]
@@ -1757,6 +2122,215 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unadvertised_text_input_primary_click_selects_pointer_before_dispatch() {
+        let actions = ["AXShowMenu".to_owned(), "AXConfirm".to_owned()];
+        for role in ["AXTextField", "AXTextArea"] {
+            for action in ["press", "click", "PRESS"] {
+                assert_eq!(
+                    element_click_route(action, "left", false, role, &actions, false, false),
+                    ElementClickRoute::TextInputPointer,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn advertised_press_and_other_roles_keep_semantic_route() {
+        assert_eq!(
+            element_click_route(
+                "press",
+                "left",
+                false,
+                "AXTextField",
+                &["AXPress".to_owned(), "AXConfirm".to_owned()],
+                false,
+                false,
+            ),
+            ElementClickRoute::AxSemantic,
+        );
+        for role in [
+            "AXStaticText",
+            "AXButton",
+            "AXRow",
+            "AXCell",
+            "AXWebArea",
+            "",
+        ] {
+            assert_eq!(
+                element_click_route("press", "left", false, role, &[], false, false),
+                ElementClickRoute::AxSemantic,
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_semantics_buttons_modifiers_and_selection_never_choose_text_pointer() {
+        for action in [
+            "confirm",
+            "show_menu",
+            "right_click",
+            "pick",
+            "cancel",
+            "open",
+            "unknown",
+        ] {
+            assert_eq!(
+                element_click_route(action, "left", false, "AXTextField", &[], false, false),
+                ElementClickRoute::AxSemantic,
+            );
+        }
+        for (button, modifiers, selectable, auxiliary) in [
+            ("right", false, false, false),
+            ("middle", false, false, false),
+            ("left", true, false, false),
+            ("left", false, true, false),
+            ("left", false, false, true),
+        ] {
+            assert_eq!(
+                element_click_route(
+                    "press",
+                    button,
+                    modifiers,
+                    "AXTextField",
+                    &[],
+                    selectable,
+                    auxiliary,
+                ),
+                ElementClickRoute::AxSemantic,
+            );
+        }
+    }
+
+    fn pointer_test_bounds() -> crate::windows::WindowBounds {
+        crate::windows::WindowBounds {
+            x: -300.0,
+            y: 100.0,
+            width: 200.0,
+            height: 160.0,
+        }
+    }
+
+    #[test]
+    fn text_pointer_center_uses_logical_points_and_supports_negative_screen_origins() {
+        let bounds = pointer_test_bounds();
+        let target =
+            text_input_pointer_target(Some([-280.0, 120.0, 100.0, 20.0]), &bounds, Some(&bounds))
+                .expect("live in-window element");
+        assert_eq!((target.screen_x, target.screen_y), (-230.0, 130.0));
+        assert_eq!((target.window_x, target.window_y), (70.0, 30.0));
+    }
+
+    #[test]
+    fn text_pointer_refuses_missing_changed_and_invalid_window_frames() {
+        let bounds = pointer_test_bounds();
+        let element = Some([-280.0, 120.0, 100.0, 20.0]);
+        assert!(text_input_pointer_target(None, &bounds, Some(&bounds)).is_none());
+        assert!(text_input_pointer_target(element, &bounds, None).is_none());
+        for live in [
+            crate::windows::WindowBounds {
+                x: -299.0,
+                ..bounds.clone()
+            },
+            crate::windows::WindowBounds {
+                y: 101.0,
+                ..bounds.clone()
+            },
+            crate::windows::WindowBounds {
+                width: 201.0,
+                ..bounds.clone()
+            },
+            crate::windows::WindowBounds {
+                height: 161.0,
+                ..bounds.clone()
+            },
+        ] {
+            assert!(text_input_pointer_target(element, &bounds, Some(&live)).is_none());
+        }
+        for invalid in [
+            crate::windows::WindowBounds {
+                x: f64::NAN,
+                ..bounds.clone()
+            },
+            crate::windows::WindowBounds {
+                y: f64::INFINITY,
+                ..bounds.clone()
+            },
+            crate::windows::WindowBounds {
+                width: 0.0,
+                ..bounds.clone()
+            },
+            crate::windows::WindowBounds {
+                height: -1.0,
+                ..bounds.clone()
+            },
+            crate::windows::WindowBounds {
+                width: f64::INFINITY,
+                ..bounds.clone()
+            },
+        ] {
+            assert!(text_input_pointer_target(element, &invalid, Some(&invalid)).is_none());
+        }
+    }
+
+    #[test]
+    fn text_pointer_refuses_nonfinite_degenerate_and_outside_element_centers() {
+        let bounds = pointer_test_bounds();
+        for element in [
+            [f64::NAN, 120.0, 100.0, 20.0],
+            [-280.0, f64::INFINITY, 100.0, 20.0],
+            [-280.0, 120.0, f64::INFINITY, 20.0],
+            [-280.0, 120.0, 100.0, 0.0],
+            [-280.0, 120.0, -1.0, 20.0],
+            [-400.0, 120.0, 10.0, 20.0],
+            [-280.0, 50.0, 100.0, 20.0],
+            [-110.0, 120.0, 20.0, 20.0], // center on the exclusive right edge
+            [-280.0, 250.0, 100.0, 20.0], // center on the exclusive bottom edge
+        ] {
+            assert!(text_input_pointer_target(Some(element), &bounds, Some(&bounds)).is_none());
+        }
+    }
+
+    #[test]
+    fn element_result_labels_actual_transport_without_inventing_verification() {
+        for (fronted, used_pixel, expected_path) in [
+            (false, false, "ax"),
+            (true, false, "ax_fg"),
+            (false, true, "cgevent"),
+            (true, true, "cgevent_fg"),
+        ] {
+            let result = element_click_result(fronted, used_pixel, false, false);
+            assert_eq!(result["path"], expected_path);
+            assert_eq!(result["verified"], false);
+            assert_eq!(result["effect"], "unverifiable");
+            assert!(result.get("evidence").is_none());
+        }
+        let selection = element_click_result(false, true, true, false);
+        assert_eq!(selection["verified"], true);
+        assert_eq!(selection["effect"], "confirmed");
+        assert_eq!(
+            element_click_result(false, false, false, true)["effect"],
+            "suspected_noop",
+        );
+    }
+
+    #[test]
+    fn text_pointer_preflight_refusals_are_not_reported_as_dispatch_success() {
+        for refusal in [
+            ElementPointerRefusal::Target("target no longer live"),
+            ElementPointerRefusal::Frame(super::super::px_frame::PxFrameError::WindowNotFound {
+                window_id: 42,
+            }),
+        ] {
+            let result = refusal.result(7, 42);
+            assert_eq!(result.is_error, Some(true));
+            let structured = result.structured_content.expect("structured refusal");
+            assert_eq!(structured["effect"], "refused");
+            assert!(structured.get("path").is_none());
+            assert!(structured.get("verified").is_none());
+        }
+    }
+
+    #[test]
     fn text_input_focus_settle_applies_only_to_text_input_ax_press() {
         for role in ["AXTextField", "AXTextArea"] {
             assert!(needs_text_input_focus_settle(role, "AXPress"));
@@ -1771,7 +2345,10 @@ mod tests {
 
     #[test]
     fn text_input_focus_settle_has_small_budget() {
-        assert_eq!(TEXT_INPUT_FOCUS_SETTLE, std::time::Duration::from_millis(100));
+        assert_eq!(
+            TEXT_INPUT_FOCUS_SETTLE,
+            std::time::Duration::from_millis(100)
+        );
     }
 
     #[test]

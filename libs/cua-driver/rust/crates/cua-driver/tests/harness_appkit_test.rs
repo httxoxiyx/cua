@@ -66,6 +66,10 @@ impl Harness {
     }
 
     fn launch_with_command_oracle(command_oracle: Option<&Path>) -> Self {
+        Self::launch_with_oracle("CUA_APPKIT_COMMAND_ORACLE", command_oracle)
+    }
+
+    fn launch_with_oracle(variable: &str, oracle: Option<&Path>) -> Self {
         let exe = harness_exe();
         assert!(
             exe.exists(),
@@ -76,8 +80,8 @@ impl Harness {
         // window via NSApp.run().
         let mut command = Command::new(&exe);
         command.stdout(Stdio::null()).stderr(Stdio::null());
-        if let Some(path) = command_oracle {
-            command.env("CUA_APPKIT_COMMAND_ORACLE", path);
+        if let Some(path) = oracle {
+            command.env(variable, path);
         }
         let app = command
             .spawn()
@@ -1016,9 +1020,9 @@ fn harness_appkit_type_text_background() {
             let idx = element_index_by_id(snap_pre.tree_text(), "txt-input")
                 .expect("txt-input element_index not found");
 
-            // Address the field through type_text itself. AXTextField does not
-            // advertise AXPress, so a preparatory click would test an invalid
-            // action and fail before the keyboard/value delivery path runs.
+            // Keep direct element-targeted typing coverage independent of
+            // click routing. The indexed text-field click has its own mouse
+            // and field-editor oracle below.
             let resp = driver.call(
                 "type_text",
                 serde_json::json!({
@@ -1039,6 +1043,95 @@ fn harness_appkit_type_text_background() {
             );
         },
     );
+}
+
+/// A primary indexed click must reach the native text field even though it
+/// does not advertise AXPress. Merely setting AXFocused cannot satisfy this
+/// fixture-owned mouse oracle. Generic typing follows only after that proof.
+#[test]
+#[ignore]
+fn harness_appkit_indexed_text_click_background() {
+    let case = native_background_case(
+        "appkit",
+        "indexed_text_click",
+        Targeting::Ax,
+        DriverRoute::MacosCgEventPid,
+    );
+    let cell_id = case.cell_id.clone();
+    execute_case(case, |evidence| {
+        let mut driver = McpDriver::spawn_macos_daemon_proxy_named(&cell_id)
+            .expect("start qualified macOS daemon proxy");
+        *evidence = recording_evidence(driver.recording_dir());
+        let directory = tempfile::tempdir().expect("create text-click oracle directory");
+        let oracle = directory.path().join("text-click.jsonl");
+        let harness = Harness::launch_with_oracle("CUA_APPKIT_TEXT_CLICK_ORACLE", Some(&oracle));
+        let ready = wait_for_keyboard_oracle(&oracle, "ready");
+        assert_eq!(ready["mouse_down_count"], 0);
+        assert_eq!(ready["editor_is_first_responder"], false);
+        assert_eq!(ready["text"], "");
+        let (wid, _) = driver
+            .find_window(harness.pid as i64, "CuaTestHarness AppKit")
+            .expect("AppKit main window not found");
+        let (_, passed) = run_with_background_oracles(
+            &mut driver,
+            TargetWindow {
+                pid: harness.pid,
+                native_id: wid,
+            },
+            |driver| {
+                let before = snapshot_elements(driver, harness.pid, wid);
+                let pristine: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&oracle).expect("read click oracle"))
+                        .expect("parse click oracle");
+                assert_eq!(pristine["event"], "ready", "unexpected pre-test click");
+                let clicked = driver.call(
+                    "click",
+                    serde_json::json!({
+                        "pid": harness.pid, "window_id": wid,
+                        "element_token": element_token_by_id(&before, "txt-input"),
+                        "delivery_mode": "background"
+                    }),
+                );
+                assert!(
+                    !clicked.is_error(),
+                    "indexed text click failed: {}",
+                    clicked.raw
+                );
+                assert_eq!(clicked.structured()["path"], "cgevent");
+                assert_eq!(clicked.structured()["verified"], false);
+                assert_eq!(clicked.structured()["effect"], "unverifiable");
+                let observed = wait_for_keyboard_oracle(&oracle, "text_field_mouse_down");
+                assert_eq!(observed["pid"].as_u64(), Some(harness.pid as u64));
+                assert_eq!(observed["window_id"].as_u64(), Some(wid));
+                assert_eq!(observed["mouse_down_count"], 1);
+                assert_eq!(observed["click_count"], 1);
+                assert_eq!(observed["editor_is_first_responder"], true);
+                assert_eq!(observed["text"], "");
+                // No element argument: typing must use the field selected by
+                // the click, not independently focus the target as a workaround.
+                let typed = driver.call(
+                    "type_text",
+                    serde_json::json!({
+                        "pid": harness.pid, "window_id": wid,
+                        "text": "indexed click 中文", "delivery_mode": "background"
+                    }),
+                );
+                assert!(
+                    !typed.is_error(),
+                    "typing after click failed: {}",
+                    typed.raw
+                );
+                let after = snapshot_elements(driver, harness.pid, wid);
+                assert!(
+                    after.tree_text().contains("indexed click 中文"),
+                    "{}",
+                    after.raw
+                );
+            },
+        )
+        .unwrap_or_else(|error| panic!("background desktop contract failed: {error}"));
+        Observation::delivered_with_fixture_state(passed)
+    });
 }
 
 #[test]
