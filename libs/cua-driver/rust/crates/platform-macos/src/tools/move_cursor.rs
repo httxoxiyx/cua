@@ -62,9 +62,10 @@ impl Tool for MoveCursorTool {
             };
             let (x, y) = (input.x, input.y);
             let (x, y) = super::desktop_screenshot_point(x, y).await;
-            let result =
-                tokio::task::spawn_blocking(move || crate::input::mouse::move_cursor_desktop(x, y))
-                    .await;
+            let result = crate::foreground_activity::spawn_blocking(move || {
+                crate::input::mouse::move_cursor_desktop(x, y)
+            })
+            .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "Moved the real desktop pointer to ({x:.1}, {y:.1})."

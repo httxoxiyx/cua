@@ -314,15 +314,18 @@ impl Tool for SetWindowFrameTool {
                 Ok(input) => input,
                 Err(result) => return result,
             };
-        let outcome = match tokio::task::spawn_blocking(move || mutate_and_verify(&input)).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => return ToolResult::error(format!("set_window_frame: {error}")),
-            Err(error) => {
-                return ToolResult::error(format!(
-                    "set_window_frame: blocking task failed: {error}"
-                ));
-            }
-        };
+        let outcome =
+            match crate::foreground_activity::spawn_blocking(move || mutate_and_verify(&input))
+                .await
+            {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => return ToolResult::error(format!("set_window_frame: {error}")),
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "set_window_frame: blocking task failed: {error}"
+                    ));
+                }
+            };
         ToolResult::text(if outcome.confirmed {
             "Set and verified the requested window frame."
         } else if outcome.observed.is_none() {

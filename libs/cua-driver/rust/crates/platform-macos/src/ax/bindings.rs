@@ -685,7 +685,38 @@ pub unsafe fn set_bool_attr_true(element: AXUIElementRef, attr_name: &str) -> AX
 ///
 /// `app_element` must be a valid, live application `AXUIElementRef`.
 pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> bool {
-    let manual = set_bool_attr_true(app_element, "AXManualAccessibility");
+    enable_chromium_accessibility_with_setter(|attribute| unsafe {
+        set_bool_attr_true(app_element, attribute)
+    })
+}
+
+/// Instrument only the existing setter calls. The caller owns the trace scope;
+/// no AX reads, retries, additional writes or status coercion are introduced.
+///
+/// # Safety
+/// `app_element` must be a valid, live application AX element.
+pub(crate) unsafe fn enable_chromium_accessibility_traced(
+    app_element: AXUIElementRef,
+    trace: &crate::input::return_trace::Trace,
+) -> bool {
+    enable_chromium_accessibility_with_setter(|attribute| {
+        let write = trace.begin(attribute);
+        let status = unsafe { set_bool_attr_true(app_element, attribute) };
+        write.finish(status == kAXErrorSuccess);
+        trace.event(match (attribute, status) {
+            ("AXManualAccessibility", kAXErrorSuccess) => "manual_success",
+            ("AXManualAccessibility", kAXErrorAttributeUnsupported) => "manual_unsupported",
+            ("AXManualAccessibility", _) => "manual_failed",
+            (_, kAXErrorSuccess) => "enhanced_success",
+            (_, kAXErrorAttributeUnsupported) => "enhanced_unsupported",
+            (_, _) => "enhanced_failed",
+        });
+        status
+    })
+}
+
+fn enable_chromium_accessibility_with_setter(mut set: impl FnMut(&'static str) -> AXError) -> bool {
+    let manual = set("AXManualAccessibility");
     if manual == kAXErrorSuccess {
         return true;
     }
@@ -695,7 +726,7 @@ pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> bool
         // fallback, and don't claim enablement happened.
         return false;
     }
-    set_bool_attr_true(app_element, "AXEnhancedUserInterface") == kAXErrorSuccess
+    set("AXEnhancedUserInterface") == kAXErrorSuccess
 }
 
 /// Get the CGWindowID of an AX window element via the private `_AXUIElementGetWindow` SPI.
@@ -794,6 +825,47 @@ mod tests {
     use core_foundation::{
         array::CFArray, base::TCFType, boolean::CFBoolean, number::CFNumber, string::CFString,
     };
+
+    #[test]
+    fn chromium_enablement_manual_result_preserves_single_write() {
+        for status in [
+            kAXErrorSuccess,
+            kAXErrorFailure,
+            kAXErrorInvalidUIElement,
+            kAXErrorCannotComplete,
+            kAXErrorNoValue,
+            kAXErrorAPIDisabled,
+        ] {
+            let mut calls = Vec::new();
+            let enabled = enable_chromium_accessibility_with_setter(|attribute| {
+                calls.push(attribute);
+                status
+            });
+            assert_eq!(enabled, status == kAXErrorSuccess);
+            assert_eq!(calls, ["AXManualAccessibility"]);
+        }
+    }
+
+    #[test]
+    fn chromium_enablement_falls_back_once_only_after_manual_unsupported() {
+        for status in [
+            kAXErrorSuccess,
+            kAXErrorAttributeUnsupported,
+            kAXErrorFailure,
+        ] {
+            let mut calls = Vec::new();
+            let enabled = enable_chromium_accessibility_with_setter(|attribute| {
+                calls.push(attribute);
+                if calls.len() == 1 {
+                    kAXErrorAttributeUnsupported
+                } else {
+                    status
+                }
+            });
+            assert_eq!(enabled, status == kAXErrorSuccess);
+            assert_eq!(calls, ["AXManualAccessibility", "AXEnhancedUserInterface"]);
+        }
+    }
 
     #[test]
     fn non_ax_array_member_marks_window_snapshot_incomplete() {

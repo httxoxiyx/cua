@@ -166,8 +166,9 @@ impl Tool for DoubleClickTool {
             // advertises AXOpen uses the exact semantic route; all other
             // elements require the stricter routed-pointer proof. Do not let a
             // failed AXOpen silently cross into an ungated pointer fallback.
-            let has_ax_open = tokio::task::spawn_blocking(move || unsafe {
-                copy_action_names(element_ptr as AXUIElementRef)
+            let inspection_element = element_guard.clone();
+            let has_ax_open = crate::foreground_activity::spawn_blocking(move || unsafe {
+                copy_action_names(inspection_element.as_ptr() as AXUIElementRef)
                     .iter()
                     .any(|action| action == "AXOpen")
             })
@@ -196,7 +197,9 @@ impl Tool for DoubleClickTool {
                 prior_front,
                 "double_click.AX",
                 || async move {
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                    crate::foreground_activity::spawn_blocking(move || -> anyhow::Result<String> {
+                        let element_ptr = element_guard.as_ptr();
+                        crate::foreground_activity::check_request()?;
                         super::ensure_app_context_delegation_live(
                             ax_app_context_route.as_ref(),
                         )?;
@@ -354,7 +357,7 @@ impl Tool for DoubleClickTool {
             prior_front,
             "double_click.pixel",
             || async move {
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                crate::foreground_activity::spawn_blocking(move || -> anyhow::Result<()> {
                     super::ensure_app_context_delegation_live(pixel_app_context_route.as_ref())?;
                     let do_click = move || -> anyhow::Result<()> {
                         if let Some(wid) = window_id {
@@ -424,6 +427,7 @@ fn ax_double_click(
 
     // Try AXOpen first (Finder items, openable list rows, document cells).
     if has_ax_open {
+        crate::foreground_activity::check_request()?;
         let err = unsafe { perform_action(element, "AXOpen") };
         if err == kAXErrorSuccess {
             return Ok(format!("AXOpen performed on element [{idx}]."));

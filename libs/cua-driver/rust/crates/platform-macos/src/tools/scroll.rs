@@ -147,7 +147,7 @@ impl Tool for ScrollTool {
                 ScrollDirection::Left => (0, step),
             };
             let (x, y) = super::desktop_screenshot_point(x, y).await;
-            let result = tokio::task::spawn_blocking(move || {
+            let result = crate::foreground_activity::spawn_blocking(move || {
                 crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount)
             })
             .await;
@@ -313,8 +313,8 @@ impl Tool for ScrollTool {
                 let by_for_ax = by.clone();
                 let foreground = delivery_mode.is_foreground();
                 let ax_app_context_route = app_context_route.clone();
-                let ax_result =
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, bool)> {
+                let ax_result = crate::foreground_activity::spawn_blocking(
+                    move || -> anyhow::Result<(bool, bool)> {
                         super::ensure_app_context_delegation_live(ax_app_context_route.as_ref())?;
                         let Some(element_guard) = native_element_guard else {
                             return Ok((false, false));
@@ -358,8 +358,9 @@ impl Tool for ScrollTool {
                                 false,
                             ))
                         }
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 match ax_result {
                     Ok(Ok((true, fronted))) => {
                         return ToolResult::text(format!(
@@ -455,7 +456,12 @@ impl Tool for ScrollTool {
             // Retina scaling is needed here.
             let wid = window_id;
             let reveal_app_context_route = app_context_route.clone();
-            let target_task = tokio::task::spawn_blocking(move || {
+            let reveal_element = pre_focus_guard.clone();
+            let target_task = crate::foreground_activity::spawn_blocking(move || {
+                let _retained = reveal_element;
+                crate::foreground_activity::check_request().map_err(|error| {
+                    ToolResult::error(format!("Scroll target preparation stopped: {error}"))
+                })?;
                 if super::ensure_app_context_delegation_live(reveal_app_context_route.as_ref())
                     .is_err()
                 {
@@ -629,7 +635,7 @@ impl Tool for ScrollTool {
                 prior_front,
                 "scroll.CGScrollWheel",
                 || async move {
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    crate::foreground_activity::spawn_blocking(move || -> anyhow::Result<()> {
                         super::ensure_app_context_delegation_live(
                             wheel_app_context_route.as_ref(),
                         )?;
@@ -750,8 +756,10 @@ impl Tool for ScrollTool {
                 let pre_focus_app_context_route = app_context_route.clone();
                 // Pre-focus the element while the snapshot lease is active so
                 // its side-effects remain covered.
-                if let Some(element_ptr) = pre_focus_ptr {
-                    let focus_result = tokio::task::spawn_blocking(move || {
+                if let Some(element_ptr) = pre_focus_ptr.filter(|_| !foreground) {
+                    let focus_element = pre_focus_guard.clone();
+                    let focus_result = crate::foreground_activity::spawn_blocking(move || {
+                        let _retained = focus_element;
                         super::ensure_app_context_delegation_live(
                             pre_focus_app_context_route.as_ref(),
                         )?;
@@ -764,13 +772,16 @@ impl Tool for ScrollTool {
                         crate::input::ax_actions::focus_element(element_ptr)
                     })
                     .await;
-                    if let Ok(Err(error)) = focus_result {
-                        return Ok(Err(error));
+                    match focus_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Ok(Err(error)),
+                        Err(error) => return Err(error),
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 }
 
-                tokio::task::spawn_blocking(move || {
+                crate::foreground_activity::spawn_blocking(move || {
+                    let pre_focus_ptr = pre_focus_guard.as_ref().map(|element| element.as_ptr());
                     super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
                     if let Some(element_ptr) = pre_focus_ptr {
                         unsafe {
@@ -781,6 +792,11 @@ impl Tool for ScrollTool {
                         }
                     }
                     let send_keys = || {
+                        if foreground {
+                            if let Some(element_ptr) = pre_focus_ptr {
+                                crate::input::ax_actions::focus_element(element_ptr)?;
+                            }
+                        }
                         for _ in 0..amount {
                             if foreground {
                                 crate::input::keyboard::press_key_global(&key, &[])?;
@@ -871,6 +887,9 @@ unsafe fn scroll_native_text_area(
     let mut delivered = false;
     if let Some(target) = buttons.get(index).copied() {
         for _ in 0..amount.max(1) {
+            if crate::foreground_activity::check_request().is_err() {
+                break;
+            }
             if perform_action(target, "AXPress") != kAXErrorSuccess {
                 break;
             }

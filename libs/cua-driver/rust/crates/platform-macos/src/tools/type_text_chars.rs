@@ -150,7 +150,7 @@ impl Tool for TypeTextCharsTool {
         // Pre-focus element if requested.
         if !type_chars_only {
             if let Some(element_ptr) = element_ptr {
-                let _ = tokio::task::spawn_blocking(move || {
+                let _ = crate::foreground_activity::spawn_blocking(move || {
                     crate::input::ax_actions::focus_element(element_ptr)
                 })
                 .await;
@@ -160,7 +160,7 @@ impl Tool for TypeTextCharsTool {
         drop(element_guard);
 
         let text_len = text.chars().count();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::foreground_activity::spawn_blocking(move || {
             crate::input::keyboard::type_text_with_delay(pid, &text, delay_ms)
         })
         .await;

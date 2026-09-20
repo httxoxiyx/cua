@@ -442,15 +442,22 @@ fn history_admission_requested(explicit: bool, persisted: bool) -> bool {
 enum MacosAppKitHost {
     CursorOverlay,
     PipOnly,
+    ReturnOnly,
     None,
 }
 
 #[cfg(target_os = "macos")]
-fn macos_appkit_host(cursor_enabled: bool, pip_enabled: bool) -> MacosAppKitHost {
+fn macos_appkit_host(
+    cursor_enabled: bool,
+    pip_enabled: bool,
+    return_host_enabled: bool,
+) -> MacosAppKitHost {
     if cursor_enabled {
         MacosAppKitHost::CursorOverlay
     } else if pip_enabled {
         MacosAppKitHost::PipOnly
+    } else if return_host_enabled {
+        MacosAppKitHost::ReturnOnly
     } else {
         MacosAppKitHost::None
     }
@@ -479,16 +486,32 @@ mod macos_appkit_host_tests {
 
     #[test]
     fn cursor_renderer_owns_the_shared_appkit_loop_when_pip_is_also_enabled() {
+        for return_host_enabled in [false, true] {
+            assert_eq!(
+                macos_appkit_host(true, true, return_host_enabled),
+                MacosAppKitHost::CursorOverlay
+            );
+            assert_eq!(
+                macos_appkit_host(true, false, return_host_enabled),
+                MacosAppKitHost::CursorOverlay
+            );
+            assert_eq!(
+                macos_appkit_host(false, true, return_host_enabled),
+                MacosAppKitHost::PipOnly
+            );
+        }
+    }
+
+    #[test]
+    fn return_host_requires_opt_in_and_does_not_enable_observer_ui() {
         assert_eq!(
-            macos_appkit_host(true, true),
-            MacosAppKitHost::CursorOverlay
+            macos_appkit_host(false, false, false),
+            MacosAppKitHost::None
         );
         assert_eq!(
-            macos_appkit_host(true, false),
-            MacosAppKitHost::CursorOverlay
+            macos_appkit_host(false, false, true),
+            MacosAppKitHost::ReturnOnly
         );
-        assert_eq!(macos_appkit_host(false, true), MacosAppKitHost::PipOnly);
-        assert_eq!(macos_appkit_host(false, false), MacosAppKitHost::None);
     }
 }
 
@@ -821,16 +844,35 @@ fn main() {
             // choosing the PiP-only loop while cursor support is enabled would
             // leave physical actions waiting forever for cursor arrival. PiP
             // windows use the same NSApplication loop through main-queue
-            // callbacks, so the cursor host can service both surfaces.
-            match macos_appkit_host(cursor_cfg.enabled, pip_cfg.enabled) {
+            // callbacks, so the cursor host can service both surfaces. The
+            // experimental Return constructor also needs the real main queue
+            // for TIS/TSM character readback, but never creates an observer UI.
+            use platform_macos::input::return_main_thread;
+            match macos_appkit_host(
+                cursor_cfg.enabled,
+                pip_cfg.enabled,
+                return_main_thread::experiment_enabled(),
+            ) {
                 MacosAppKitHost::CursorOverlay => {
                     if pip_cfg.enabled {
                         platform_macos::pip::prepare_for_shared_appkit_main_loop();
                     }
+                    return_main_thread::host_ready_on_main();
                     platform_macos::cursor::overlay::run_on_main_thread();
+                    return_main_thread::clear_host_ready_on_main();
                     let _ = serve_handle.join();
                 }
-                MacosAppKitHost::PipOnly => platform_macos::pip::run_appkit_main_loop(),
+                MacosAppKitHost::PipOnly => {
+                    return_main_thread::host_ready_on_main();
+                    platform_macos::pip::run_appkit_main_loop();
+                    return_main_thread::clear_host_ready_on_main();
+                }
+                MacosAppKitHost::ReturnOnly => {
+                    if let Err(error) = return_main_thread::headless_main_loop() {
+                        eprintln!("[cua-driver] experimental Return main-thread host: {error}");
+                    }
+                    let _ = serve_handle.join();
+                }
                 MacosAppKitHost::None => {
                     let _ = serve_handle.join();
                 }

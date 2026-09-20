@@ -197,9 +197,9 @@ impl Tool for SetValueTool {
         };
 
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-        let center_ptr = element_ptr as usize;
-        if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
-            crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
+        let center_element = element_guard.clone();
+        if let Ok(Some((screen_x, screen_y))) = crate::foreground_activity::spawn_blocking(move || unsafe {
+            crate::ax::bindings::element_screen_center(center_element.as_ptr() as AXUIElementRef)
         })
         .await
         {
@@ -239,7 +239,9 @@ impl Tool for SetValueTool {
             prior_front,
             "set_value.AXValue",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                crate::foreground_activity::spawn_blocking(move || {
+                    let element_ptr = element_guard.as_ptr();
+                    crate::foreground_activity::check_request()?;
                     super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
                     unsafe {
                         super::ensure_app_context_element_window(
@@ -355,12 +357,14 @@ fn set_value_blocking(
         // Read the value before writing so an unchanged field can be reported as
         // idempotent rather than silently indistinguishable from a fresh write.
         let before = unsafe { copy_string_attr(element, "AXValue") };
+        crate::foreground_activity::check_request()?;
         let err = match numeric_target {
             Some(n) => {
                 let e = unsafe { set_number_attr(element, "AXValue", n) };
                 if e == kAXErrorSuccess {
                     e
                 } else {
+                    crate::foreground_activity::check_request()?;
                     unsafe { set_string_attr(element, "AXValue", value) }
                 }
             }
@@ -477,6 +481,9 @@ fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
 
     // Hard cap to prevent runaway on a control that never quite converges.
     for _ in 0..500 {
+        if crate::foreground_activity::check_request().is_err() {
+            return false;
+        }
         if (current - target).abs() <= step_radius {
             return true;
         }
@@ -544,14 +551,17 @@ fn select_popup_option(
             let child = children[i];
             let opt_title =
                 unsafe { copy_string_attr(child, "AXTitle") }.unwrap_or_else(|| value.to_string());
-            let err = unsafe { perform_action(child, "AXPress") };
-            if err == kAXErrorSuccess {
+            let dispatch = crate::foreground_activity::check_request()
+                .map(|()| unsafe { perform_action(child, "AXPress") });
+            if let Err(error) = dispatch {
+                Err(error)
+            } else if matches!(dispatch, Ok(code) if code == kAXErrorSuccess) {
                 Ok(format!(
                     "✅ Selected '{opt_title}' in AXPopUpButton [{element_index}] \
                      \"{element_title}\" via AX child AXPress."
                 ))
             } else {
-                anyhow::bail!("AXPress on child option failed with error {err}")
+                Err(anyhow::anyhow!("AXPress on child option failed"))
             }
         } else {
             let avail = available
@@ -630,7 +640,8 @@ fn set_select_via_js(
     // Spawn osascript with a 10-second deadline. A stuck Safari permission
     // prompt or unresponsive renderer can cause wait() to block indefinitely,
     // which would stall the MCP tool handler permanently.
-    let mut child = std::process::Command::new("osascript")
+    crate::foreground_activity::check_request()?;
+    let child = std::process::Command::new("osascript")
         .arg("-e")
         .arg(&apple_script)
         .stdout(std::process::Stdio::piped())
@@ -638,23 +649,11 @@ fn set_select_via_js(
         .spawn()
         .map_err(|e| anyhow::anyhow!("osascript launch failed: {e}"))?;
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    anyhow::bail!("osascript timed out after 10 seconds");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => anyhow::bail!("osascript wait error: {e}"),
-        }
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| anyhow::anyhow!("osascript output error: {e}"))?;
+    let out = wait_for_owned_script(
+        child,
+        std::time::Duration::from_secs(10),
+        crate::foreground_activity::check_request,
+    )?;
 
     let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
@@ -676,6 +675,80 @@ fn set_select_via_js(
             "JavaScript returned unexpected output: {}",
             &raw[..raw.len().min(200)]
         )
+    }
+}
+
+/// The helper is part of this native operation, not a detached GUI actor.
+/// Stop and reap it before reporting cancellation/error; Drop covers unwinding
+/// without introducing an input retry or changing any application permission.
+struct OwnedScriptChild(Option<std::process::Child>);
+
+impl OwnedScriptChild {
+    fn stop_and_reap(&mut self) -> anyhow::Result<()> {
+        let Some(child) = self.0.as_mut() else {
+            return Ok(());
+        };
+        // The process can exit between the poll and kill. A successful wait is
+        // the authoritative settlement proof even when kill reports that race.
+        let _ = child.kill();
+        child.wait().map_err(|error| {
+            crate::foreground_activity::mark_native_cleanup_unconfirmed();
+            anyhow::anyhow!("osascript cleanup could not confirm child exit: {error}")
+        })?;
+        self.0.take();
+        Ok(())
+    }
+}
+
+impl Drop for OwnedScriptChild {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop_and_reap() {
+            // Preserve the settlement failure even during unwinding; callers
+            // must not mistake a later ordinary ToolResult for safe cleanup.
+            crate::foreground_activity::mark_native_cleanup_unconfirmed();
+            tracing::error!("owned script cleanup failed: {error}");
+        }
+    }
+}
+
+fn wait_for_owned_script(
+    child: std::process::Child,
+    timeout: std::time::Duration,
+    mut check_request: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<std::process::Output> {
+    let mut owned = OwnedScriptChild(Some(child));
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let stop = check_request().err().or_else(|| {
+            (std::time::Instant::now() >= deadline)
+                .then(|| anyhow::anyhow!("osascript timed out before completing"))
+        });
+        if let Some(error) = stop {
+            owned.stop_and_reap()?;
+            return Err(error);
+        }
+        match owned
+            .0
+            .as_mut()
+            .expect("owned child is present until exit")
+            .try_wait()
+        {
+            Ok(Some(_)) => {
+                // try_wait has already reaped the child. Output collection can
+                // now fail without leaving a live helper behind.
+                return owned
+                    .0
+                    .take()
+                    .expect("exited child is present")
+                    .wait_with_output()
+                    .map_err(|error| anyhow::anyhow!("osascript output error: {error}"));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(error) => {
+                owned.stop_and_reap()?;
+                return Err(anyhow::anyhow!("osascript wait error: {error}"));
+            }
+        }
     }
 }
 
@@ -708,6 +781,55 @@ fn hex_digit(n: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::{apply_surface_trust, apply_verification_label, classify_write, SetValueOutcome};
+
+    fn script_fixture() -> std::process::Child {
+        std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn non-GUI owned-child fixture")
+    }
+
+    fn assert_reaped(pid: u32) {
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn owned_script_child_is_reaped_before_cancel_or_timeout_returns() {
+        for cancelled in [true, false] {
+            let child = script_fixture();
+            let pid = child.id();
+            let result = super::wait_for_owned_script(child, std::time::Duration::ZERO, || {
+                if cancelled {
+                    anyhow::bail!("test request cancelled");
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert_reaped(pid);
+        }
+    }
+
+    #[test]
+    fn owned_script_child_is_reaped_during_unwind() {
+        let child = script_fixture();
+        let pid = child.id();
+        let panic = std::panic::catch_unwind(|| {
+            let _owned = super::OwnedScriptChild(Some(child));
+            panic!("test native task unwind");
+        });
+        assert!(panic.is_err());
+        assert_reaped(pid);
+    }
 
     #[test]
     fn unreadable_value_reports_neither_verified_nor_changed() {

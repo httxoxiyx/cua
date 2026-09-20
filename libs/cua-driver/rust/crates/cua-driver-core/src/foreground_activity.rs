@@ -6,6 +6,7 @@
 
 pub const IDLE_REQUIRED_MS: u64 = 5_000;
 pub const MAX_HEARTBEAT_GAP_MS: u64 = 250;
+pub const MAX_EPISODE_MS: u64 = 120_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -27,6 +28,83 @@ pub struct Snapshot {
     pub state: State,
     pub idle_ms: u64,
     pub generation: u64,
+}
+
+/// Immutable evidence for one synchronous foreground operation. Fresh idle
+/// evidence after an interruption cannot revive an earlier operation.
+#[derive(Clone, Copy, Debug)]
+pub struct EpisodeLease {
+    generation: u64,
+    started_ms: u64,
+}
+
+impl EpisodeLease {
+    pub fn begin(now_ms: u64, snapshot: Snapshot) -> Option<Self> {
+        (snapshot.reliable && snapshot.state == State::Idle && snapshot.idle_ms >= IDLE_REQUIRED_MS)
+            .then_some(Self {
+                generation: snapshot.generation,
+                started_ms: now_ms,
+            })
+    }
+
+    pub fn permits(&self, now_ms: u64, snapshot: Snapshot) -> bool {
+        now_ms >= self.started_ms
+            && now_ms - self.started_ms < MAX_EPISODE_MS
+            && snapshot.reliable
+            && snapshot.state == State::Idle
+            && snapshot.idle_ms >= IDLE_REQUIRED_MS
+            && snapshot.generation == self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputControl {
+    Key(u16),
+    Mouse(u8),
+}
+
+/// Only controls whose down transition belongs to this operation may be
+/// released by its cleanup. Store a preallocated release before posting down;
+/// teardown must neither allocate native events nor release unrelated input.
+pub struct PressedInputs<R> {
+    entries: Vec<(InputControl, R)>,
+}
+
+impl<R> Default for PressedInputs<R> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<R> PressedInputs<R> {
+    pub fn press(&mut self, control: InputControl, release: R) -> Result<(), R> {
+        if self.entries.iter().any(|(held, _)| *held == control) {
+            return Err(release);
+        }
+        self.entries.push((control, release));
+        Ok(())
+    }
+
+    pub fn update_release(&mut self, control: InputControl, release: R) {
+        if let Some((_, current)) = self.entries.iter_mut().find(|(held, _)| *held == control) {
+            *current = release;
+        }
+    }
+
+    pub fn release(&mut self, control: InputControl) -> Option<R> {
+        let index = self.entries.iter().position(|(held, _)| *held == control)?;
+        Some(self.entries.remove(index).1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn drain_reversed(&mut self) -> impl Iterator<Item = R> + '_ {
+        self.entries.drain(..).rev().map(|(_, release)| release)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -170,5 +248,67 @@ mod tests {
         assert_eq!(activity.snapshot(5_000).state, State::Unknown);
         activity.health(5_001, true);
         assert_ne!(activity.snapshot(10_000).state, State::Idle);
+    }
+
+    #[test]
+    fn foreground_episode_never_revives_or_extends_its_deadline() {
+        let mut activity = Activity::default();
+        healthy_through(&mut activity, 0, 5_000);
+        let lease = EpisodeLease::begin(5_000, activity.snapshot(5_000)).unwrap();
+        assert!(lease.permits(5_000, activity.snapshot(5_000)));
+        assert!(!lease.permits(4_999, activity.snapshot(5_000)));
+        healthy_through(&mut activity, 5_100, 125_000);
+        assert!(!lease.permits(125_000, activity.snapshot(125_000)));
+        activity.event(125_000, Source::Unknown);
+        healthy_through(&mut activity, 125_100, 130_000);
+        assert!(EpisodeLease::begin(130_000, activity.snapshot(130_000)).is_some());
+        assert!(!lease.permits(130_000, activity.snapshot(130_000)));
+    }
+
+    #[test]
+    fn foreground_episode_requires_reliable_idle_not_just_elapsed_time() {
+        for (reliable, state, idle_ms) in [
+            (false, State::Idle, 5_000),
+            (true, State::Active, 5_000),
+            (true, State::Unknown, 5_000),
+            (true, State::Idle, 4_999),
+        ] {
+            assert!(EpisodeLease::begin(
+                5_000,
+                Snapshot {
+                    reliable,
+                    state,
+                    idle_ms,
+                    generation: 0
+                }
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn cleanup_releases_only_posted_controls_once_in_reverse_order() {
+        let mut held = PressedInputs::default();
+        assert!(held.release(InputControl::Key(55)).is_none());
+        held.press(InputControl::Key(55), "cmd-up").unwrap();
+        held.press(InputControl::Key(56), "shift-up").unwrap();
+        held.press(InputControl::Key(36), "return-up").unwrap();
+        assert!(held.press(InputControl::Key(36), "duplicate-up").is_err());
+        assert_eq!(held.release(InputControl::Key(36)), Some("return-up"));
+        assert_eq!(held.release(InputControl::Key(36)), None);
+        assert_eq!(
+            held.drain_reversed().collect::<Vec<_>>(),
+            ["shift-up", "cmd-up"]
+        );
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn interrupted_drag_cleanup_uses_last_dispatched_point() {
+        let mut held = PressedInputs::default();
+        held.press(InputControl::Mouse(0), (1, 2)).unwrap();
+        held.update_release(InputControl::Mouse(0), (3, 4));
+        held.update_release(InputControl::Mouse(1), (99, 99));
+        assert_eq!(held.drain_reversed().collect::<Vec<_>>(), [(3, 4)]);
     }
 }

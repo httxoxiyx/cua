@@ -284,6 +284,8 @@ const DESKTOP_INPUT_OPERATIONS: &[&str] = &[
     "set_value",
     "bring_to_front",
     "set_window_frame",
+    "begin_foreground_segment",
+    "end_foreground_segment",
 ];
 const DESKTOP_INPUT_SCOPE_KEYS: &[&str] = &[
     "daemon_generation",
@@ -893,6 +895,8 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "launch_app"
         | "bring_to_front"
         | "set_window_frame"
+        | "begin_foreground_segment"
+        | "end_foreground_segment"
         | "start_session"
         | "end_session"
         | "set_agent_cursor_enabled"
@@ -1189,6 +1193,8 @@ fn enforce_hard_invariants(
             | "set_value"
             | "kill_app"
             | "bring_to_front"
+            | "begin_foreground_segment"
+            | "end_foreground_segment"
             | "get_accessibility_tree"
             | "get_window_state"
             | "verify_state"
@@ -1901,6 +1907,15 @@ mod tests {
             ids("set_window_frame", serde_json::json!({})),
             vec!["desktop_input"]
         );
+        for tool in ["begin_foreground_segment", "end_foreground_segment"] {
+            assert_eq!(ids(tool, serde_json::json!({})), vec!["desktop_input"]);
+            assert_eq!(advertised_risk_for(tool).class, RiskClass::R1);
+            assert!(enforce_hard_invariants(
+                tool,
+                &serde_json::json!({"pid": std::process::id(), "window_id": 1})
+            )
+            .is_err());
+        }
         assert_eq!(
             ids("replay_trajectory", serde_json::json!({})),
             vec!["desktop_input", "file_transfer_and_output"]

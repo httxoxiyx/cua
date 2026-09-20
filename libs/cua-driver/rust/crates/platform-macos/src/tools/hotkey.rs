@@ -198,7 +198,7 @@ impl Tool for HotkeyTool {
                 );
             };
             let display = raw_keys.join("+");
-            let result = tokio::task::spawn_blocking(move || {
+            let result = crate::foreground_activity::spawn_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_bare_global(&key, &modifier_refs)
             })
@@ -418,37 +418,42 @@ impl Tool for HotkeyTool {
         // ladder for web areas. The request remains snapshot-bound AX
         // targeting; only the focus transport falls back through a hit-test
         // and, on the explicit foreground rung, a real click when required.
-        let web_ax_focus_xy =
-            if let (Some(ptr), Some(wid), Some(index)) = (element_ptr, window_id, element_index) {
-                let is_web = tokio::task::spawn_blocking(move || {
-                    super::type_text::target_in_web_area(pid, Some((ptr, Some(index))), Some(wid))
-                })
-                .await
-                .unwrap_or(true);
-                if is_web {
-                    tokio::task::spawn_blocking(move || unsafe {
-                        let (screen_x, screen_y) = crate::ax::bindings::element_screen_center(
-                            ptr as crate::ax::bindings::AXUIElementRef,
-                        )?;
-                        let frame = super::px_frame::resolve_window_px_frame(wid).ok()?;
-                        Some((
-                            (screen_x - frame.bounds.x) * frame.scale,
-                            (screen_y - frame.bounds.y) * frame.scale,
-                        ))
-                    })
-                    .await
-                    .unwrap_or(None)
-                } else {
-                    None
+        let web_ax_focus_xy = if let (Some(element), Some(wid), Some(index)) =
+            (element_guard.clone(), window_id, element_index)
+        {
+            match crate::foreground_activity::spawn_blocking(move || {
+                let ptr = element.as_ptr();
+                if !super::type_text::target_in_web_area(pid, Some((ptr, Some(index))), Some(wid)) {
+                    return None;
                 }
-            } else {
-                None
-            };
+                unsafe {
+                    let (screen_x, screen_y) = crate::ax::bindings::element_screen_center(
+                        ptr as crate::ax::bindings::AXUIElementRef,
+                    )?;
+                    let frame = super::px_frame::resolve_window_px_frame(wid).ok()?;
+                    Some((
+                        (screen_x - frame.bounds.x) * frame.scale,
+                        (screen_y - frame.bounds.y) * frame.scale,
+                    ))
+                }
+            })
+            .await
+            {
+                Ok(position) => position,
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "Hotkey target lookup failed: {error}. No input was sent."
+                    ))
+                }
+            }
+        } else {
+            None
+        };
 
-        // PX form, plus the web-content AX fallback above: focus the field
-        // before sending the combo. Foreground delivery still needs to front
-        // the target for the chord itself because the focus helper restores
-        // the previous app before returning.
+        // Foreground focus is prepared without mutation, then consumed inside
+        // the same activation Episode as the chord. AX-derived points already
+        // use native pixels and must not inherit screenshot downscaling again.
+        let mut foreground_pixel_focus = None;
         let coordinate_focus = {
             let focus_xy = match ((px, py), web_ax_focus_xy) {
                 ((Some(cx), Some(cy)), _) => Some((cx, cy)),
@@ -460,13 +465,37 @@ impl Tool for HotkeyTool {
                     .get("from_zoom")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if let Err(e) = super::focus_by_pixel(
+                if fg {
+                    let plan = if px.is_some() && py.is_some() {
+                        super::prepare_foreground_pixel_focus(
+                            &self.state,
+                            pid,
+                            window_id,
+                            cx,
+                            cy,
+                            from_zoom,
+                        )
+                        .await
+                    } else {
+                        super::prepare_foreground_native_pixel_focus(
+                            pid,
+                            window_id.expect("AX center requires an exact window"),
+                            cx,
+                            cy,
+                        )
+                        .await
+                    };
+                    match plan {
+                        Ok(plan) => foreground_pixel_focus = Some(plan),
+                        Err(error) => return error,
+                    }
+                } else if let Err(e) = super::focus_by_pixel(
                     &self.state,
                     pid,
                     window_id,
                     cx,
                     cy,
-                    fg,
+                    false,
                     args.opt_str("session"),
                     args.opt_str("_session_id"),
                     from_zoom,
@@ -503,7 +532,11 @@ impl Tool for HotkeyTool {
             prior_front,
             "hotkey.CGEvent",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                crate::foreground_activity::spawn_blocking(move || {
+                    // Cancellation drops the async owner but does not stop a
+                    // blocking worker. The worker must own its target retain.
+                    let _element_guard = element_guard;
+                    let element_ptr = _element_guard.as_ref().map(|element| element.as_ptr());
                     super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
                     if let Some(element_ptr) = element_ptr {
                         unsafe {
@@ -527,7 +560,11 @@ impl Tool for HotkeyTool {
                                 true,
                                 transient_route,
                                 app_context_route.clone(),
-                                || crate::input::keyboard::press_key_global(&key, &m),
+                                || super::with_prepared_foreground_element_focus(
+                                    foreground_pixel_focus,
+                                    _element_guard.as_ref(),
+                                    || crate::input::keyboard::press_key_global(&key, &m),
+                                ),
                             )?;
                             Ok(())
                         }

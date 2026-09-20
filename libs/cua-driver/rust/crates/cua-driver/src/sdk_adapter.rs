@@ -302,6 +302,16 @@ impl SdkAdapter {
         )
     }
 
+    pub(crate) fn transport_owner(
+        &self,
+        transport_session: &str,
+    ) -> Arc<cua_driver_core::session::TransportOwner> {
+        cua_driver_core::session::TransportOwner::new(format!(
+            "{}{}",
+            self.runtime_prefix, transport_session
+        ))
+    }
+
     pub fn renew_transport_sessions(&self, transport_session: &str) -> usize {
         let owner = format!("{}{}", self.runtime_prefix, transport_session);
         cua_driver_core::session::touch_sessions_for_owner(&owner)

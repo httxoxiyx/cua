@@ -13,6 +13,8 @@ mod background_keyboard;
 pub mod interactive;
 pub mod keyboard;
 pub mod mouse;
+pub mod return_main_thread;
+pub(crate) mod return_trace;
 pub mod skylight;
 
 pub use ax_actions::perform_ax_action;

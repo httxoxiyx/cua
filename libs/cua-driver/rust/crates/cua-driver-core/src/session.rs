@@ -72,6 +72,84 @@ pub enum SessionEndReason {
     Unknown,
 }
 
+/// Private live capability for one transport connection. The trusted adapter
+/// supplies the runtime-prefixed owner; public arguments cannot manufacture
+/// this capability. A closed owner is retained only by its in-flight calls,
+/// so rejecting late admission requires no process-lifetime tombstone set.
+#[doc(hidden)]
+pub struct TransportOwner {
+    owner_transport: String,
+    live: Mutex<bool>,
+}
+
+tokio::task_local! {
+    static DISPATCH_TRANSPORT_OWNER: Arc<TransportOwner>;
+}
+
+impl TransportOwner {
+    /// Construct only at a trusted transport boundary with its canonical,
+    /// runtime-private owner identity, never from the caller's public label.
+    pub fn new(owner_transport: String) -> Arc<Self> {
+        Arc::new(Self {
+            owner_transport,
+            live: Mutex::new(true),
+        })
+    }
+
+    pub fn is_live(&self) -> bool {
+        *self.live.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Carry connection identity across ordinary SDK/registry awaits without
+    /// holding any mutex. Lifecycle admission below rechecks under the lock.
+    pub async fn scope<F: std::future::Future>(self: &Arc<Self>, work: F) -> F::Output {
+        DISPATCH_TRANSPORT_OWNER.scope(Arc::clone(self), work).await
+    }
+
+    /// Revoke before enumerating sessions. Admission holds this same mutex
+    /// until record insertion: it is either seen by cleanup or refused.
+    pub fn close(&self, reason: SessionEndReason) -> usize {
+        {
+            let mut live = self.live.lock().unwrap_or_else(|error| error.into_inner());
+            if !*live {
+                return 0;
+            }
+            *live = false;
+        }
+        end_sessions_for_owner(&self.owner_transport, reason)
+    }
+
+    fn admit(
+        &self,
+        owner_transport: &str,
+    ) -> Result<std::sync::MutexGuard<'_, bool>, &'static str> {
+        let live = self.live.lock().unwrap_or_else(|error| error.into_inner());
+        if !*live {
+            return Err("transport owner has ended");
+        }
+        if self.owner_transport != owner_transport {
+            return Err("session is not available to this transport");
+        }
+        Ok(live)
+    }
+}
+
+fn current_transport_owner() -> Option<Arc<TransportOwner>> {
+    DISPATCH_TRANSPORT_OWNER.try_with(Arc::clone).ok()
+}
+
+/// Borrow the live, non-forgeable connection capability installed by the
+/// trusted adapter. A caller's session label or segment token is not enough.
+/// The expected identity must be the registry's runtime-prefixed transport
+/// value. Native multi-call work retains this Arc and rechecks `is_live()` at
+/// each preparation/input boundary, including after asynchronous hand-offs.
+#[doc(hidden)]
+pub fn current_transport_owner_for(owner_transport: &str) -> Option<Arc<TransportOwner>> {
+    let owner = current_transport_owner()?;
+    let admitted = owner.admit(owner_transport).is_ok();
+    admitted.then_some(owner)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureModality {
     Window,
@@ -456,6 +534,11 @@ fn begin_session_dispatch_inner(
     if !is_trackable(session_id) {
         return Err("session has ended");
     }
+    let owner = current_transport_owner();
+    let _admission = owner
+        .as_ref()
+        .map(|owner| owner.admit(owner_transport))
+        .transpose()?;
     let now = Instant::now();
     {
         // Keep tombstone admission and live-record insertion in one critical
@@ -551,6 +634,11 @@ fn activate_session_inner(
     client_kind: SessionClientKind,
     idle_ttl: Option<Duration>,
 ) -> Result<(), &'static str> {
+    let owner = current_transport_owner();
+    let _admission = owner
+        .as_ref()
+        .map(|owner| owner.admit(owner_transport))
+        .transpose()?;
     let now = Instant::now();
     {
         let mut records = lifecycle_records().lock().unwrap();
@@ -626,6 +714,13 @@ pub fn activate_or_revive_session_for_owner(
         return Err("session cleanup is incomplete; retry end_session before revival");
     }
 
+    // Cleanup hooks run without the owner lock. Recheck afterwards and keep
+    // this admission guard through tombstone removal and live-record binding.
+    let owner = current_transport_owner();
+    let _admission = owner
+        .as_ref()
+        .map(|owner| owner.admit(owner_transport))
+        .transpose()?;
     let now = Instant::now();
     let revived = {
         let mut ended = ended_sessions().lock().unwrap();
@@ -1328,6 +1423,20 @@ pub fn is_session_ended(session_id: &str) -> bool {
     ended_sessions().lock().unwrap().contains_key(session_id)
 }
 
+/// Whether native input must stop even while an in-flight dispatch is still
+/// settling. Teardown waits for that dispatch before publishing the ended
+/// tombstone, but this must not authorize further key/button-down events.
+/// This is a stop signal, not proof that an unknown session is authorized.
+pub fn is_session_ending_or_ended(session_id: &str) -> bool {
+    let ended = ended_sessions().lock().unwrap();
+    ended.contains_key(session_id)
+        || lifecycle_records()
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .is_some_and(|record| record.pending_end.is_some())
+}
+
 /// Revive a previously-ended session id by clearing its tombstone, so a fresh
 /// `start_session` with a recycled id works as a caller would expect: the id
 /// becomes live again and its actions stop being rejected by the resurrection
@@ -1392,6 +1501,11 @@ pub fn revive_session_for_owner(
 
     // Recheck after cleanup because another thread may have completed the
     // revival while callbacks were running.
+    let owner = current_transport_owner();
+    let _admission = owner
+        .as_ref()
+        .map(|owner| owner.admit(owner_transport))
+        .transpose()?;
     let mut ended = ended_sessions().lock().unwrap();
     let Some(ended_owner) = ended.get(session_id) else {
         return Ok(false);
@@ -1821,6 +1935,232 @@ mod tests {
         assert!(revive_session_for_owner(sid, owner_b).is_err());
         assert!(is_session_ended(sid));
         assert_eq!(revive_session_for_owner(sid, owner_a), Ok(true));
+    }
+
+    #[test]
+    fn input_stop_is_visible_before_inflight_session_teardown_settles() {
+        let sid = "test-inflight-input-stop-F9A7B2";
+        let other = "test-inflight-input-stop-other-F9A7B2";
+        let owner = "test-inflight-input-stop-owner-F9A7B2";
+        let guard = begin_session_dispatch(
+            sid,
+            None,
+            owner,
+            true,
+            SessionTransport::McpStdio,
+            SessionClientKind::Mcp,
+        )
+        .unwrap();
+        assert!(!is_session_ending_or_ended(sid));
+        assert!(end_session_for_owner(sid, owner));
+        assert!(
+            !is_session_ended(sid),
+            "cleanup still waits for this dispatch"
+        );
+        assert!(
+            is_session_ending_or_ended(sid),
+            "new input must already stop"
+        );
+        assert!(
+            !is_session_ending_or_ended(other),
+            "another session is unaffected"
+        );
+        drop(guard);
+        assert!(is_session_ending_or_ended(sid));
+        assert!(is_session_ended(sid));
+    }
+
+    #[tokio::test]
+    async fn foreground_segment_owner_handle_requires_live_exact_transport_context() {
+        let transport = "test-segment-capability-owner";
+        let owner = TransportOwner::new(transport.to_owned());
+        assert!(current_transport_owner_for(transport).is_none());
+        owner
+            .scope(async {
+                let retained = current_transport_owner_for(transport).unwrap();
+                assert!(Arc::ptr_eq(&retained, &owner));
+                assert!(current_transport_owner_for("forged-owner").is_none());
+                owner.close(SessionEndReason::ProcessExit);
+                assert!(!retained.is_live());
+                assert!(current_transport_owner_for(transport).is_none());
+            })
+            .await;
+        assert!(current_transport_owner_for(transport).is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_owner_eof_before_first_dispatch_cannot_create_lifecycle() {
+        let sid = "test-live-owner-late-first-session";
+        let transport = "test-live-owner-late-first-transport";
+        let owner = TransportOwner::new(transport.to_owned());
+        let weak = Arc::downgrade(&owner);
+        assert_eq!(owner.close(SessionEndReason::ProcessExit), 0);
+        let result = owner
+            .scope(async {
+                begin_session_dispatch(
+                    sid,
+                    None,
+                    transport,
+                    true,
+                    SessionTransport::McpStdio,
+                    SessionClientKind::Mcp,
+                )
+            })
+            .await;
+        assert_eq!(result.err(), Some("transport owner has ended"));
+        assert!(!lifecycle_records().lock().unwrap().contains_key(sid));
+        assert!(!is_session_ended(sid), "no first-call tombstone is needed");
+        drop(owner);
+        assert!(
+            weak.upgrade().is_none(),
+            "closed owner has no global tombstone retain"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_owner_admitted_before_eof_is_stopped_then_settles() {
+        let sid = "test-live-owner-admitted-session";
+        let transport = "test-live-owner-admitted-transport";
+        let owner = TransportOwner::new(transport.to_owned());
+        let dispatch = owner
+            .scope(async {
+                begin_session_dispatch(
+                    sid,
+                    None,
+                    transport,
+                    true,
+                    SessionTransport::McpStdio,
+                    SessionClientKind::Mcp,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(owner.close(SessionEndReason::ProcessExit), 1);
+        assert!(is_session_ending_or_ended(sid));
+        assert!(
+            !is_session_ended(sid),
+            "in-flight dispatch still owns settlement"
+        );
+        let late = owner
+            .scope(async {
+                begin_session_dispatch(
+                    sid,
+                    None,
+                    transport,
+                    true,
+                    SessionTransport::McpStdio,
+                    SessionClientKind::Mcp,
+                )
+            })
+            .await;
+        assert_eq!(late.err(), Some("transport owner has ended"));
+        drop(dispatch);
+        assert!(is_session_ended(sid));
+    }
+
+    #[tokio::test]
+    async fn transport_owner_eof_does_not_stop_another_live_owner() {
+        let closed = TransportOwner::new("test-live-owner-isolated-closed".to_owned());
+        let transport = "test-live-owner-isolated-open";
+        let sid = "test-live-owner-isolated-session";
+        let live = TransportOwner::new(transport.to_owned());
+        closed.close(SessionEndReason::ProcessExit);
+        let dispatch = live
+            .scope(async {
+                begin_session_dispatch(
+                    sid,
+                    None,
+                    transport,
+                    true,
+                    SessionTransport::McpStdio,
+                    SessionClientKind::Mcp,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(!is_session_ending_or_ended(sid));
+        drop(dispatch);
+        assert_eq!(live.close(SessionEndReason::ProcessExit), 1);
+    }
+
+    #[tokio::test]
+    async fn transport_owner_capability_cannot_admit_another_identity() {
+        let sid = "test-live-owner-mismatch-session";
+        let owner = TransportOwner::new("test-live-owner-mismatch-owner".to_owned());
+        let result = owner
+            .scope(async {
+                begin_session_dispatch(
+                    sid,
+                    None,
+                    "test-live-owner-mismatch-foreign",
+                    true,
+                    SessionTransport::McpStdio,
+                    SessionClientKind::Mcp,
+                )
+            })
+            .await;
+        assert_eq!(
+            result.err(),
+            Some("session is not available to this transport")
+        );
+        assert!(!lifecycle_records().lock().unwrap().contains_key(sid));
+        owner.close(SessionEndReason::ProcessExit);
+    }
+
+    #[tokio::test]
+    async fn transport_owner_eof_rejects_late_activation_and_revival() {
+        let sid = "test-live-owner-revive-session";
+        let fresh = "test-live-owner-revive-fresh-session";
+        let transport = "test-live-owner-revive-transport";
+        let owner = TransportOwner::new(transport.to_owned());
+        owner
+            .scope(async {
+                activate_session(
+                    sid,
+                    None,
+                    transport,
+                    true,
+                    SessionTransport::McpStdio,
+                    SessionClientKind::Mcp,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(owner.close(SessionEndReason::ProcessExit), 1);
+        assert!(is_session_ended(sid));
+        owner
+            .scope(async {
+                assert_eq!(
+                    activate_session(
+                        fresh,
+                        None,
+                        transport,
+                        true,
+                        SessionTransport::McpStdio,
+                        SessionClientKind::Mcp,
+                    ),
+                    Err("transport owner has ended")
+                );
+                assert_eq!(
+                    activate_or_revive_session_for_owner(
+                        sid,
+                        None,
+                        transport,
+                        true,
+                        SessionTransport::McpStdio,
+                        SessionClientKind::Mcp,
+                        None,
+                    ),
+                    Err("transport owner has ended")
+                );
+                assert_eq!(
+                    revive_session_for_owner(sid, transport),
+                    Err("transport owner has ended")
+                );
+            })
+            .await;
+        assert!(is_session_ended(sid));
+        assert!(!lifecycle_records().lock().unwrap().contains_key(fresh));
     }
 
     #[test]

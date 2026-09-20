@@ -398,7 +398,7 @@ impl Tool for ClickTool {
             // screenshot width / logical screen width. This is robust even when
             // CGDisplayPixelsWide under-reports the backing scale (it returns the
             // scaled-mode point width on some Retina configs → a bogus 1.0).
-            let desktop_ratio = tokio::task::spawn_blocking(|| {
+            let desktop_ratio = crate::foreground_activity::spawn_blocking(|| {
                 let logical_w =
                     super::get_screen_size::main_screen_size().map(|(w, _, _)| w as f64);
                 let shot_w = crate::capture::screenshot_display_bytes()
@@ -435,22 +435,23 @@ impl Tool for ClickTool {
 
             let btn = button.clone();
             let desktop_modifiers: Vec<String> = args.str_array("modifier");
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                // Desktop scope is explicitly foreground and vision-driven: post
-                // at the global HID tap so WindowServer delivers to the window
-                // actually visible at this point. PID-posting here would silently
-                // turn the foreground contract back into background delivery.
-                let modifier_refs: Vec<&str> =
-                    desktop_modifiers.iter().map(String::as_str).collect();
-                crate::input::mouse::click_at_xy_desktop_with_modifiers(
-                    sx,
-                    sy,
-                    count,
-                    &btn,
-                    &modifier_refs,
-                )
-            })
-            .await;
+            let result =
+                crate::foreground_activity::spawn_blocking(move || -> anyhow::Result<()> {
+                    // Desktop scope is explicitly foreground and vision-driven: post
+                    // at the global HID tap so WindowServer delivers to the window
+                    // actually visible at this point. PID-posting here would silently
+                    // turn the foreground contract back into background delivery.
+                    let modifier_refs: Vec<&str> =
+                        desktop_modifiers.iter().map(String::as_str).collect();
+                    crate::input::mouse::click_at_xy_desktop_with_modifiers(
+                        sx,
+                        sy,
+                        count,
+                        &btn,
+                        &modifier_refs,
+                    )
+                })
+                .await;
             let button_label = match button.as_str() {
                 "right" => "right-click",
                 "middle" => "middle-click",
@@ -628,8 +629,10 @@ impl Tool for ClickTool {
                 && modifiers.is_empty();
             let inspect_background_surface = !foreground && button_str != "middle";
             let selection_action = effective_action == "press" && button_str != "middle";
+            let inspection_element = element_guard.clone();
             let (background_menu, background_popover, selectable_ancestry, element_route) =
-                match tokio::task::spawn_blocking(move || unsafe {
+                match crate::foreground_activity::spawn_blocking(move || unsafe {
+                    let element_ptr = inspection_element.as_ptr();
                     let element = element_ptr as AXUIElementRef;
                     let role = if inspect_background_surface || primary_press {
                         copy_string_attr(element, "AXRole").unwrap_or_default()
@@ -709,13 +712,16 @@ impl Tool for ClickTool {
 
             // Animate cursor to element center BEFORE firing AX action,
             // mirroring Swift's `performElementClick` → `animateAndWait(to:)`.
-            let center_ptr = element_ptr;
-            let center = tokio::task::spawn_blocking(move || unsafe {
-                crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
-            })
-            .await
-            .ok()
-            .flatten();
+            let center_element = element_guard.clone();
+            let center =
+                crate::foreground_activity::spawn_blocking(move || unsafe {
+                    crate::ax::bindings::element_screen_center(
+                        center_element.as_ptr() as AXUIElementRef
+                    )
+                })
+                .await
+                .ok()
+                .flatten();
 
             // Surface 5: button=middle on the AX path has no AX equivalent.
             // Fall back to a pixel middle-click at the element's screen-space center
@@ -744,7 +750,9 @@ impl Tool for ClickTool {
                 let mods_owned = modifiers.clone();
                 let foreground = delivery_mode.is_foreground();
                 let middle_app_context_route = app_context_route.clone();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = crate::foreground_activity::spawn_blocking(move || {
+                    let element_ptr = element_guard.as_ptr();
+                    crate::foreground_activity::check_request()?;
                     super::ensure_app_context_delegation_live(
                         middle_app_context_route.as_ref(),
                     )?;
@@ -906,7 +914,9 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.AXPress",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    crate::foreground_activity::spawn_blocking(move || {
+                        let element_ptr = element_guard.as_ptr();
+                        crate::foreground_activity::check_request()?;
                         super::ensure_app_context_delegation_live(ax_app_context_route.as_ref())?;
                         unsafe {
                             super::ensure_app_context_element_window(
@@ -1099,7 +1109,7 @@ impl Tool for ClickTool {
                             &self.state.config.read().unwrap(),
                         );
                         let dbg_path_c = dbg_path.clone();
-                        let dbg_result = tokio::task::spawn_blocking(move || {
+                        let dbg_result = crate::foreground_activity::spawn_blocking(move || {
                             let png = crate::capture::screenshot_window_bytes(wid)?;
                             let png = crate::capture::resize_png_if_needed(&png, max_dim)?;
                             crate::capture::write_crosshair_png(&png, cx, cy, &dbg_path_c)
@@ -1224,7 +1234,7 @@ impl Tool for ClickTool {
                 let focus_only = action == "focus";
                 let press_only = action == "press";
                 let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
-                let ax_result = tokio::task::spawn_blocking(move || unsafe {
+                let ax_result = crate::foreground_activity::spawn_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
                     };
@@ -1250,6 +1260,10 @@ impl Tool for ClickTool {
                     ) {
                         false
                     } else {
+                        if let Err(error) = crate::foreground_activity::check_request() {
+                            CFRelease(element as _);
+                            return Err(error);
+                        }
                         let press = core_foundation::string::CFString::new("AXPress");
                         AXUIElementPerformAction(element, press.as_concrete_TypeRef())
                             == kAXErrorSuccess
@@ -1343,7 +1357,7 @@ impl Tool for ClickTool {
             let synthetic_focus_context =
                 if activation_policy == PixelActivationPolicy::SyntheticTargetFocus {
                     let wid = window_id.expect("activation policy requires window_id");
-                    match tokio::task::spawn_blocking(move || {
+                    match crate::foreground_activity::spawn_blocking(move || {
                         crate::input::mouse::prepare_background_pixel_click(pid, wid)
                     })
                     .await
@@ -1411,7 +1425,7 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.pixel",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    crate::foreground_activity::spawn_blocking(move || {
                         super::ensure_app_context_delegation_live(
                             pixel_app_context_route.as_ref(),
                         )?;
@@ -1776,6 +1790,7 @@ fn perform_application_menu_click(
             )
         })?;
     crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, native)?;
+    crate::foreground_activity::check_request()?;
     let error = unsafe { crate::ax::bindings::perform_action(element, native) };
     if error != kAXErrorSuccess {
         anyhow::bail!(
@@ -1815,6 +1830,7 @@ fn perform_attached_popover_click(
             )
         })?;
     crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, native)?;
+    crate::foreground_activity::check_request()?;
     let error = unsafe { crate::ax::bindings::perform_action(element, native) };
     if error != kAXErrorSuccess {
         anyhow::bail!(
@@ -1973,6 +1989,7 @@ fn perform_ax_click(
         }
     }
 
+    crate::foreground_activity::check_request()?;
     let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
     if err != crate::ax::bindings::kAXErrorSuccess {
         // Some collection rows claim a click-like action but Finder returns

@@ -27,7 +27,7 @@ fn dispatch_unicode_text_with<Event, Error>(
     text: &str,
     inter_char_delay_ms: u64,
     mut create: impl FnMut(&str, bool) -> Result<Event, Error>,
-    mut post: impl FnMut(&Event),
+    mut post: impl FnMut(&Event) -> Result<(), Error>,
     mut before_down: impl FnMut() -> Result<(), Error>,
     mut pause: impl FnMut(std::time::Duration),
 ) -> Result<(), Error> {
@@ -39,8 +39,8 @@ fn dispatch_unicode_text_with<Event, Error>(
         // key-up allocation must not leave the target with an unmatched down.
         // Unicode payloads are literal text, not physical-key/IME composition.
         before_down()?;
-        post(&down);
-        post(&up);
+        post(&down)?;
+        post(&up)?;
         pause(std::time::Duration::from_millis(
             unicode_character_cadence_ms(inter_char_delay_ms),
         ));
@@ -105,7 +105,10 @@ pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> a
             }
             unicode_keyboard_event(&source, value, key_down)
         },
-        |event| post_keyboard_event(pid, event),
+        |event| {
+            post_keyboard_event(pid, event);
+            Ok(())
+        },
         || crate::foreground_activity::check_targeted_input(pid),
         std::thread::sleep,
     )
@@ -169,6 +172,214 @@ pub(crate) fn with_background_window_context<R>(
         },
         crate::input::skylight::end_synthetic_target_focus,
     )
+}
+
+/// Experimental feasibility result, not application-effect confirmation and
+/// not a claim about private NSWindow key/main/active state. This helper is not
+/// registered as a tool and does not bypass any existing singleton gate.
+#[derive(Debug)]
+pub(crate) struct BackgroundReturnProof {
+    pub pid: i32,
+    pub window_id: u32,
+    pub key_attempted: bool,
+    pub cleanup_confirmed: bool,
+    pub ax_context_restored: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackgroundReturnFailure {
+    pub stage: &'static str,
+    pub key_attempted: bool,
+    pub cleanup_confirmed: bool,
+    pub error: String,
+    pub cleanup_error: Option<String>,
+}
+
+/// Once admitted, retain only our matching release through unwinding. A
+/// refused preflight never posts either transition; there is no retry path.
+fn post_one_window_return_pair(
+    check: impl FnOnce() -> anyhow::Result<()>,
+    down: impl FnOnce(),
+    up: impl FnOnce(),
+) -> anyhow::Result<()> {
+    check()?;
+    struct Release<U: FnOnce()>(Option<U>);
+    impl<U: FnOnce()> Drop for Release<U> {
+        fn drop(&mut self) {
+            if let Some(up) = self.0.take() {
+                up();
+            }
+        }
+    }
+    let release = Release(Some(up));
+    down();
+    std::thread::sleep(std::time::Duration::from_millis(8));
+    drop(release);
+    Ok(())
+}
+
+/// Independent candidate: native window-tagged Return, already-focused exact
+/// field, no synthetic activation, AX focus mutation, or context restoration.
+/// The caller also holds the ordinary GenericKey gate's per-PID lease.
+pub(crate) fn experimental_chrome_window_return(
+    pid: i32,
+    window_id: u32,
+    field: &crate::ax::cache::RetainedElement,
+    trace: &super::return_trace::Trace,
+    check_authority: impl Fn() -> anyhow::Result<()>,
+) -> Result<BackgroundReturnProof, BackgroundReturnFailure> {
+    let failure = |stage, key_attempted, error: anyhow::Error| BackgroundReturnFailure {
+        stage,
+        key_attempted,
+        cleanup_confirmed: true,
+        error: error.to_string(),
+        cleanup_error: None,
+    };
+    // One immutable choice for both transitions. This flag is read only in
+    // this opt-in experiment; no failed post can select another transport.
+    let post_route = crate::input::skylight::window_return_post_route();
+    trace.event(post_route.trace_stage());
+    let observation = trace
+        .run("capture", || {
+            crate::input::skylight::WindowReturnObservation::capture(
+                pid,
+                window_id,
+                field,
+                trace.clone(),
+                check_authority,
+            )
+        })
+        .map_err(|error| failure("preflight", false, error))?;
+    let prepare = |down| {
+        let event = trace.run(if down { "prepare.down" } else { "prepare.up" }, || {
+            crate::input::skylight::window_tagged_return_event(window_id, down, trace)
+        })?;
+        trace.run(if down { "auth.down" } else { "auth.up" }, || {
+            crate::input::skylight::prepare_authenticated_window_return_post(pid, event, post_route)
+        })
+    };
+    let down = prepare(true).map_err(|error| failure("preflight", false, error))?;
+    let up = prepare(false).map_err(|error| failure("preflight", false, error))?;
+    post_one_window_return_pair(
+        || trace.run("check.pre_dispatch", || observation.check_before_post()),
+        || {
+            trace.event("post.down.invoked");
+            down.post();
+            trace.event("post.down.returned");
+        },
+        || {
+            trace.event("post.up.invoked");
+            up.post();
+            trace.event("post.up.returned");
+        },
+    )
+    .map_err(|error| failure("preflight", false, error))?;
+    // Both owned transitions have now been posted once. A later change is an
+    // unknown application outcome, not permission to restore, retry, or focus.
+    trace
+        .run("check.settlement", || observation.check_after_post())
+        .map_err(|error| failure("settlement", true, error))?;
+    Ok(BackgroundReturnProof {
+        pid,
+        window_id,
+        key_attempted: true,
+        cleanup_confirmed: true,
+        // No context was changed by the Driver, so claiming a restore would
+        // be false. The candidate receipt omits this legacy proof field.
+        ax_context_restored: false,
+    })
+}
+
+/// A fixed, unmodified Return to one freshly resolved native Chrome address
+/// field. The caller MUST own the same-PID mutation lease and provide a checker
+/// for the live exact token, canonical request/session and target capability.
+/// The checker is called before native writes; no foreground/fallback transport
+/// is available here. Keep the full helper inside a tracked blocking worker.
+pub(crate) fn experimental_chrome_background_return(
+    pid: i32,
+    window_id: u32,
+    field: &crate::ax::cache::RetainedElement,
+    check_authority: impl Fn() -> anyhow::Result<()>,
+) -> Result<BackgroundReturnProof, BackgroundReturnFailure> {
+    use super::background_keyboard::{dispatch_exact_background_once, ExactBackgroundStage};
+    let preflight_error = |error: anyhow::Error| BackgroundReturnFailure {
+        stage: "preflight",
+        key_attempted: false,
+        cleanup_confirmed: true,
+        error: error.to_string(),
+        cleanup_error: None,
+    };
+    check_authority().map_err(preflight_error)?;
+    crate::foreground_activity::check_request().map_err(preflight_error)?;
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| preflight_error(anyhow::anyhow!("Return event source is unavailable")))?;
+    let prepare = |down| -> anyhow::Result<_> {
+        let event = CGEvent::new_keyboard_event(source.clone(), 36, down)
+            .map_err(|_| anyhow::anyhow!("Return event is unavailable"))?;
+        event.set_flags(CGEventFlags::CGEventFlagNull);
+        crate::foreground_activity::mark_generated(&event);
+        crate::input::skylight::prepare_authenticated_pid_post(pid, event)
+    };
+    // Both events and authentication are built before any app-local focus
+    // preparation. A failed allocation never leaves a posted down unmatched.
+    let down = prepare(true).map_err(preflight_error)?;
+    let up = prepare(false).map_err(preflight_error)?;
+    let context = crate::input::skylight::ExactBackgroundReturnContext::capture(
+        pid,
+        window_id,
+        field,
+        check_authority,
+    )
+    .map_err(preflight_error)?;
+    let attempted = std::cell::Cell::new(false);
+    let result = dispatch_exact_background_once(
+        context,
+        |context| context.prepare(),
+        |context| context.ready(),
+        |context| {
+            context.verify_for_dispatch()?;
+            struct OwnedReturnRelease(Option<crate::input::skylight::AuthenticatedPidPost>);
+            impl Drop for OwnedReturnRelease {
+                fn drop(&mut self) {
+                    if let Some(release) = self.0.take() {
+                        release.post();
+                    }
+                }
+            }
+            let release = OwnedReturnRelease(Some(up));
+            attempted.set(true);
+            down.post();
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            // Only our matching PID-routed key-up bypasses cancellation. It is
+            // never posted on the global HID queue and cannot be replayed.
+            drop(release);
+            Ok(())
+        },
+        |context| context.settle(),
+        |context| context.cleanup(),
+    );
+    match result {
+        Ok(()) => Ok(BackgroundReturnProof {
+            pid,
+            window_id,
+            key_attempted: attempted.get(),
+            cleanup_confirmed: true,
+            ax_context_restored: true,
+        }),
+        Err(error) => Err(BackgroundReturnFailure {
+            stage: match error.stage {
+                ExactBackgroundStage::Preparation => "preparation",
+                ExactBackgroundStage::Readiness => "readiness",
+                ExactBackgroundStage::Dispatch => "dispatch",
+                ExactBackgroundStage::Settlement => "settlement",
+                ExactBackgroundStage::Cleanup => "cleanup",
+            },
+            key_attempted: attempted.get(),
+            cleanup_confirmed: error.cleanup_confirmed,
+            error: error.error.to_string(),
+            cleanup_error: error.cleanup_error.map(|error| error.to_string()),
+        }),
+    }
 }
 
 /// Send a key combination to `pid` WITHOUT the auth-message envelope.
@@ -337,31 +548,25 @@ fn post_global_key(
     key_code: u16,
     key_down: bool,
     flags: CGEventFlags,
-    tap: core_graphics::event::CGEventTapLocation,
+    _tap: core_graphics::event::CGEventTapLocation,
 ) -> anyhow::Result<()> {
     let event = CGEvent::new_keyboard_event(source.clone(), key_code, key_down)
         .map_err(|_| anyhow::anyhow!("CGEvent keyboard event creation failed"))?;
     event.set_flags(flags);
-    if key_down {
-        crate::foreground_activity::check_input()?;
-    }
-    crate::foreground_activity::mark_generated(&event);
-    event.post(tap);
-    Ok(())
+    crate::foreground_activity::post_global(&event, !key_down)
 }
 
 fn release_global_modifiers(
     source: &CGEventSource,
     pressed: &[(u16, CGEventFlags)],
     mut active_flags: CGEventFlags,
-    tap: core_graphics::event::CGEventTapLocation,
+    _tap: core_graphics::event::CGEventTapLocation,
 ) {
     for &(key_code, flag) in pressed.iter().rev() {
         active_flags.remove(flag);
         if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), key_code, false) {
             event.set_flags(active_flags);
-            crate::foreground_activity::mark_generated(&event);
-            event.post(tap);
+            let _ = crate::foreground_activity::post_global(&event, true);
         }
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
@@ -435,7 +640,7 @@ fn release_pid_modifiers(
 /// uses the same complete character cadence as PID-routed Unicode typing.
 pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
     crate::foreground_activity::check_input()?;
-    use core_graphics::event::CGEventTapLocation;
+    use core_graphics::event::CGEventType;
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
@@ -443,7 +648,12 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
         text,
         inter_char_delay_ms,
         |value, key_down| unicode_keyboard_event(&source, value, key_down),
-        |event| event.post(CGEventTapLocation::HID),
+        |event| {
+            crate::foreground_activity::post_global(
+                event,
+                matches!(event.get_type(), CGEventType::KeyUp),
+            )
+        },
         crate::foreground_activity::check_input,
         std::thread::sleep,
     )
@@ -829,6 +1039,50 @@ pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_return_refusal_posts_neither_transition() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = super::post_one_window_return_pair(
+            || anyhow::bail!("not already focused"),
+            || events.borrow_mut().push("down"),
+            || events.borrow_mut().push("up"),
+        );
+        assert!(result.is_err());
+        assert!(events.borrow().is_empty());
+    }
+
+    #[test]
+    fn window_return_posts_exactly_one_owned_pair() {
+        let events = std::cell::RefCell::new(Vec::new());
+        super::post_one_window_return_pair(
+            || {
+                events.borrow_mut().push("check");
+                Ok(())
+            },
+            || events.borrow_mut().push("down"),
+            || events.borrow_mut().push("up"),
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), ["check", "down", "up"]);
+    }
+
+    #[test]
+    fn window_return_unwind_releases_only_its_owned_up() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::post_one_window_return_pair(
+                || Ok(()),
+                || {
+                    events.borrow_mut().push("down");
+                    panic!("test dispatch unwind")
+                },
+                || events.borrow_mut().push("up"),
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(*events.borrow(), ["down", "up"]);
+    }
+
     use super::*;
     use core_graphics::event::CGEventType;
     use std::{cell::Cell, cell::RefCell, rc::Rc};
@@ -840,7 +1094,10 @@ mod tests {
             "A中🙂",
             5,
             |value, down| Ok::<_, &str>((value.to_owned(), down)),
-            |(value, down)| events.borrow_mut().push(format!("{value}:{down}")),
+            |(value, down)| {
+                events.borrow_mut().push(format!("{value}:{down}"));
+                Ok(())
+            },
             || Ok(()),
             |duration| {
                 events
@@ -873,7 +1130,7 @@ mod tests {
                 "x",
                 requested,
                 |_, _| Ok::<_, &str>(()),
-                |_| {},
+                |_| Ok(()),
                 || Ok(()),
                 |duration| pauses.borrow_mut().push(duration.as_millis()),
             )
@@ -895,7 +1152,10 @@ mod tests {
                 }
                 Ok::<_, &str>((value.to_owned(), down))
             },
-            |event| posted.borrow_mut().push(event.clone()),
+            |event| {
+                posted.borrow_mut().push(event.clone());
+                Ok(())
+            },
             || {
                 if revoked.get() {
                     Err("activity interrupted")
@@ -923,7 +1183,10 @@ mod tests {
                     Ok((value.to_owned(), down))
                 }
             },
-            |event| posted.borrow_mut().push(event.clone()),
+            |event| {
+                posted.borrow_mut().push(event.clone());
+                Ok(())
+            },
             || Ok(()),
             |duration| pauses.borrow_mut().push(duration.as_millis()),
         )

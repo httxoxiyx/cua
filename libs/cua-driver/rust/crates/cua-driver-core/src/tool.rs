@@ -1921,7 +1921,10 @@ impl ToolRegistry {
             // checked against its approved manifest.
             return Ok(());
         }
-        let delivery_mode = if tool_name == "bring_to_front" {
+        let delivery_mode = if matches!(
+            tool_name,
+            "bring_to_front" | "begin_foreground_segment" | "end_foreground_segment"
+        ) {
             "foreground"
         } else {
             args.get("delivery_mode")
@@ -2630,6 +2633,7 @@ fn is_physical_desktop_action(tool: &str) -> bool {
             | "set_value"
             | "bring_to_front"
             | "set_window_frame"
+            | "end_foreground_segment"
     )
 }
 

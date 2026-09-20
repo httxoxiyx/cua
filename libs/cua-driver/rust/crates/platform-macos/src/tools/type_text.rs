@@ -33,7 +33,8 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_string_attr, focused_element_of_pid, kAXErrorSuccess, set_string_attr, AXUIElementRef,
+    copy_bool_attr, copy_string_attr, focused_element_of_pid, is_attribute_settable,
+    kAXErrorSuccess, set_string_attr, AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
@@ -181,7 +182,7 @@ impl Tool for TypeTextTool {
             ) {
                 return synthesis_refusal_result("hid", &refusal, AxAttempt::NotAttempted);
             }
-            let result = tokio::task::spawn_blocking(move || {
+            let result = crate::foreground_activity::spawn_blocking(move || {
                 crate::input::keyboard::type_text_global(&text, delay_ms)
             })
             .await;
@@ -315,7 +316,7 @@ impl Tool for TypeTextTool {
         // Resolve the element pointer (if element_index given). Retain it out
         // of the cache so a concurrent get_window_state can't free it before
         // the blocking type below dereferences it (use-after-free → daemon
-        // crash). The guard lives to method end, past type_text_blocking.
+        // crash). Each detached blocking worker owns a cloned retain as well.
         let element_guard = if let (Some(idx), Some(wid), Some(snapshot_id)) =
             (element_index, window_id, snapshot_id)
         {
@@ -378,6 +379,7 @@ impl Tool for TypeTextTool {
         // coordinate translation + delivery_mode, so it lands on the same pixel a
         // px-click would.
         let used_pixel_focus = px.is_some() && py.is_some();
+        let mut foreground_pixel_focus = None;
         if let (Some(cx), Some(cy)) = (px, py) {
             // The px form has no exact element for a semantic-only write; when
             // the keyboard rung is refused, refuse before the focus click too.
@@ -394,13 +396,27 @@ impl Tool for TypeTextTool {
                 .get("from_zoom")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if let Err(e) = super::focus_by_pixel(
+            if delivery_mode.is_foreground() {
+                match super::prepare_foreground_pixel_focus(
+                    &self.state,
+                    pid,
+                    window_id,
+                    cx,
+                    cy,
+                    from_zoom,
+                )
+                .await
+                {
+                    Ok(plan) => foreground_pixel_focus = Some(plan),
+                    Err(error) => return error,
+                }
+            } else if let Err(e) = super::focus_by_pixel(
                 &self.state,
                 pid,
                 window_id,
                 cx,
                 cy,
-                delivery_mode.is_foreground(),
+                false,
                 args.opt_str("session"),
                 args.opt_str("_session_id"),
                 from_zoom,
@@ -415,11 +431,14 @@ impl Tool for TypeTextTool {
             // focused element via the CGEvent (key_events) rung.
         }
         if let (Some((element, _)), Some(wid)) = (element_guard.as_ref(), window_id) {
-            let center_ptr = element.as_ptr() as usize;
-            if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
-                crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
-            })
-            .await
+            let center_element = element.clone();
+            if let Ok(Some((screen_x, screen_y))) =
+                crate::foreground_activity::spawn_blocking(move || unsafe {
+                    crate::ax::bindings::element_screen_center(
+                        center_element.as_ptr() as AXUIElementRef
+                    )
+                })
+                .await
             {
                 let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
                 crate::cursor::overlay::send_command(
@@ -466,13 +485,17 @@ impl Tool for TypeTextTool {
         let is_terminal_target = crate::terminal::is_terminal_pid(pid);
 
         let blocking_policy = keyboard_policy.clone();
+        let blocking_element = element_guard.clone();
         let result = focus_guard::with_focus_suppressed(
             // The observation snapshot owns the canonical target-only lease.
             None,
             prior_front,
             "type_text.AXSelectedText",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                crate::foreground_activity::spawn_blocking(move || {
+                    let element_ptr = blocking_element
+                        .as_ref()
+                        .map(|(element, index)| (element.as_ptr(), Some(*index)));
                     type_text_blocking(
                         pid,
                         &text_clone,
@@ -485,6 +508,7 @@ impl Tool for TypeTextTool {
                         remembered_cursor,
                         transient_route,
                         app_context_route,
+                        foreground_pixel_focus,
                     )
                 })
                 .await
@@ -884,6 +908,27 @@ fn should_stop_after_ax_attempt(ax_attempt: AxAttempt) -> bool {
     }
 }
 
+/// An implicit focused object is not necessarily an editable field (for
+/// example, Calculator may focus a button or its read-only display). Do not
+/// attempt an atomic insert unless its capability and read-back witness are
+/// known before the write. Web-content AX values are not renderer witnesses,
+/// so implicit web fields skip this rung before any potentially silent write.
+/// Explicitly addressed elements keep their existing behavior; this only
+/// chooses whether the implicit AX rung is eligible.
+fn implicit_ax_insert_eligible(
+    role: &str,
+    enabled: Option<bool>,
+    selected_text_settable: bool,
+    before: Option<&str>,
+    in_web_area: bool,
+) -> bool {
+    matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox")
+        && enabled != Some(false)
+        && selected_text_settable
+        && before.is_some()
+        && !in_web_area
+}
+
 fn unverifiable_ax_result(pid: i32, window_id: Option<u32>) -> ToolResult {
     let mut structured = serde_json::json!({
         "code": "type_text_ax_unverifiable",
@@ -1092,8 +1137,13 @@ async fn background_keyboard_policy(
         decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
     };
     let lease = super::acquire_background_mutation(pid).await;
-    let facts = match tokio::task::spawn_blocking(move || {
-        crate::ax::exact_target::gather_background_facts(pid, window_id, element_ptr)
+    let retained = element_ptr.map(|ptr| unsafe { crate::ax::cache::RetainedElement::retain(ptr) });
+    let facts = match crate::foreground_activity::spawn_blocking(move || {
+        crate::ax::exact_target::gather_background_facts(
+            pid,
+            window_id,
+            retained.as_ref().map(|element| element.as_ptr()),
+        )
     })
     .await
     {
@@ -1334,10 +1384,10 @@ fn cgevent_type_verified(
     // Re-applying once on a failed read-back covers apps that install their
     // responder slightly late.
     if let Some((ptr, _)) = element_ptr_and_idx {
-        let _ = crate::input::ax_actions::focus_element(ptr);
+        crate::input::ax_actions::focus_element(ptr)?;
         if settle_ms > 0 && !crate::input::ax_actions::is_element_focused(pid, ptr) {
             std::thread::sleep(FOCUS_REAPPLY_DELAY);
-            let _ = crate::input::ax_actions::focus_element(ptr);
+            crate::input::ax_actions::focus_element(ptr)?;
         }
     }
     // First-keystroke settle (foreground rung only — caller passes `settle_ms > 0`).
@@ -1393,8 +1443,10 @@ fn await_typed_delivery(
 
 /// Best-effort-background ladder for `type_text`.
 ///
-/// - `delivery_mode == Background` (default): AX insert → read-back; on a
-///   silent/unreadable accept, CGEvent keystrokes → read-back. Never fronts.
+/// - `delivery_mode == Background` (default): eligible AX insert → read-back;
+///   an unattempted, rejected or provably unchanged AX rung may proceed to an
+///   already-admitted CGEvent route. An unverifiable AX attempt stops without
+///   replaying the text. Never fronts.
 /// - `delivery_mode == Foreground`: the agent's explicit last resort — briefly
 ///   front the exact `window_id`, prime its pointer-owned keyboard context,
 ///   insert at the current text cursor, restore, then read-back.
@@ -1414,6 +1466,7 @@ fn type_text_blocking(
     remembered_cursor: Option<(f64, f64)>,
     transient_route: Option<crate::transient_ui::TransientRoute>,
     app_context_route: Option<crate::ax::app_context::AppContextDelegationRoute>,
+    foreground_pixel_focus: Option<super::ForegroundPixelFocus>,
 ) -> anyhow::Result<TypeTextDelivery> {
     super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
     if let Some((element_ptr, _)) = element_ptr_and_idx {
@@ -1428,7 +1481,18 @@ fn type_text_blocking(
     // An unreadable value is not evidence that the field is empty — and for a
     // window-addressed request it must come from the exact target window,
     // never a same-process sibling.
-    let before = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
+    // For an implicit nonterminal background target, defer this read until
+    // its AX object is retained below. Its eligibility witness and eventual
+    // AX write must address the same object, not two focused-element lookups.
+    let mut before = if foreground_pixel_focus.is_none()
+        && (delivery_mode.is_foreground() || is_terminal_target || element_ptr_and_idx.is_some())
+    {
+        read_axvalue_bound(pid, element_ptr_and_idx, window_id)
+    } else {
+        // Coordinate focus has no relevant old-responder witness. Implicit
+        // background input instead reads its retained target below.
+        None
+    };
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
@@ -1472,16 +1536,23 @@ fn type_text_blocking(
         // armed interactive stream on every text chunk.
         let foreground_settle_ms = foreground_settle_ms(pid, apps::frontmost_pid());
         let do_type = || {
-            cgevent_type_verified(
-                pid,
-                text,
-                delay_ms,
-                before.as_deref(),
-                element_ptr_and_idx,
-                foreground_settle_ms,
-                window_id,
-                event_route,
-            )
+            super::with_prepared_foreground_focus(foreground_pixel_focus, || {
+                let focused_before = if foreground_pixel_focus.is_some() {
+                    read_axvalue_bound(pid, element_ptr_and_idx, window_id)
+                } else {
+                    before.clone()
+                };
+                cgevent_type_verified(
+                    pid,
+                    text,
+                    delay_ms,
+                    focused_before.as_deref(),
+                    element_ptr_and_idx,
+                    foreground_settle_ms,
+                    window_id,
+                    event_route,
+                )
+            })
         };
         let ((verified, delivered_chars), fronted) = match window_id {
             Some(wid) if screen_sharing_target => {
@@ -1498,12 +1569,14 @@ fn type_text_blocking(
                     transient_route,
                     app_context_route,
                     || {
-                        if foreground_settle_ms > 0 {
-                            std::thread::sleep(std::time::Duration::from_millis(
-                                foreground_settle_ms,
-                            ));
-                        }
-                        crate::input::keyboard::type_text_physical_global(text, delay_ms)
+                        super::with_prepared_foreground_focus(foreground_pixel_focus, || {
+                            if foreground_settle_ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    foreground_settle_ms,
+                                ));
+                            }
+                            crate::input::keyboard::type_text_physical_global(text, delay_ms)
+                        })
                     },
                 )?;
                 ((false, None), true)
@@ -1518,7 +1591,17 @@ fn type_text_blocking(
                     typed_delivery = do_type()?;
                     Ok(())
                 };
-                if focus_click {
+                if foreground_pixel_focus.is_some() {
+                    crate::input::skylight::with_foreground_keyboard_target_activation_routed(
+                        pid as libc::pid_t,
+                        wid,
+                        remembered_cursor,
+                        true,
+                        transient_route,
+                        app_context_route,
+                        type_action,
+                    )?;
+                } else if focus_click {
                     crate::input::skylight::with_foreground_keyboard_focus_activation_routed(
                         pid as libc::pid_t,
                         wid,
@@ -1610,10 +1693,47 @@ fn type_text_blocking(
             }
         },
     };
+    let ax_target = ax_target.and_then(|(element, owns, idx_opt)| {
+        if element_ptr_and_idx.is_some() {
+            return Some((element, owns, idx_opt));
+        }
+        // This is the retained object from the exact-window focused-element
+        // lookup, so even a focus change cannot substitute a sibling field
+        // between the before witness and the atomic write.
+        before = unsafe { copy_string_attr(element, "AXValue") };
+        let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+        let enabled = unsafe { copy_bool_attr(element, "AXEnabled") };
+        let selected_text_settable = unsafe { is_attribute_settable(element, "AXSelectedText") };
+        // Classify this SAME retained object, not a fresh focused-element
+        // lookup. A web renderer can accept AXSelectedText without observing
+        // an input event; skip before attempting it so the already-admitted
+        // keyboard route remains available without replaying an unknown write.
+        let in_web_area = target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        if implicit_ax_insert_eligible(
+            &role,
+            enabled,
+            selected_text_settable,
+            before.as_deref(),
+            in_web_area,
+        ) {
+            Some((element, owns, idx_opt))
+        } else {
+            if owns {
+                unsafe { CFRelease(element as _) };
+            }
+            None
+        }
+    });
     let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
         let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+        if let Err(error) = crate::foreground_activity::check_request() {
+            if owns {
+                unsafe { CFRelease(element as _) };
+            }
+            return Err(error);
+        }
         let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
         // Classify the atomic write before considering synthesis. Complete AX
         // delivery returns immediately. Partial delivery is surfaced as such
@@ -1666,7 +1786,9 @@ fn type_text_blocking(
              checking whether the keyboard rung remains safe"
         );
     } else {
-        tracing::debug!("No focused element for pid {pid}; using CGEvent keystrokes");
+        tracing::debug!(
+            "No eligible AX insertion target for pid {pid}; checking the admitted keyboard route"
+        );
     }
 
     // The semantic AX rung did not confirm complete or partial delivery and
@@ -1719,6 +1841,79 @@ fn type_text_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_ax_insert_requires_an_editable_role() {
+        for role in ["AXTextField", "AXTextArea", "AXComboBox"] {
+            assert!(implicit_ax_insert_eligible(
+                role,
+                Some(true),
+                true,
+                Some(""),
+                false,
+            ));
+        }
+        for role in ["AXStaticText", "AXButton", "AXWindow", "AXGroup", ""] {
+            assert!(!implicit_ax_insert_eligible(
+                role,
+                Some(true),
+                true,
+                Some("454"),
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn implicit_ax_insert_requires_settable_capability_and_readable_witness() {
+        for (enabled, settable, before) in [
+            (Some(false), true, Some("")),
+            (Some(true), false, Some("")),
+            (Some(true), true, None),
+            (None, false, Some("")),
+        ] {
+            assert!(!implicit_ax_insert_eligible(
+                "AXTextField",
+                enabled,
+                settable,
+                before,
+                false,
+            ));
+        }
+        // An empty string is a readable witness; missing optional AXEnabled
+        // does not negate the affirmative SelectedText capability.
+        assert!(implicit_ax_insert_eligible(
+            "AXTextField",
+            None,
+            true,
+            Some(""),
+            false,
+        ));
+    }
+
+    #[test]
+    fn implicit_ax_insert_skips_web_echo_but_keeps_native_address_field() {
+        for role in ["AXTextField", "AXTextArea", "AXComboBox"] {
+            // An affirmative AX capability and readable value do not make a
+            // web field's atomic write observable to its renderer.
+            assert!(!implicit_ax_insert_eligible(
+                role,
+                Some(true),
+                true,
+                Some(""),
+                true,
+            ));
+        }
+        // Chrome's native address field has no AXWebArea ancestor and keeps
+        // the existing eligible AX insertion path.
+        assert!(implicit_ax_insert_eligible(
+            "AXTextField",
+            Some(true),
+            true,
+            Some("https://example.test/"),
+            false,
+        ));
+    }
 
     #[test]
     fn unicode_default_is_five_ms_but_physical_default_remains_thirty() {
@@ -1964,6 +2159,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         // We don't care whether r is Ok or Err — what matters is that
         // calling it with is_terminal_target=true is safe and never
@@ -1990,6 +2186,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             Some(7),
             BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
+            None,
             None,
             None,
             None,
@@ -2146,6 +2343,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
+            None,
             None,
             None,
             None,

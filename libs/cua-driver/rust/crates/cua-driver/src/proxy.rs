@@ -16,6 +16,7 @@
 //!   Putting the proxy here avoids `mcp-server → cua-driver` reverse
 //!   coupling.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +36,8 @@ use crate::serve::{
 
 const CONTROL_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_SESSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const CANCELLATION_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_QUEUED_PROXY_REQUESTS: usize = 8;
 
 #[derive(Clone, Copy)]
 struct ControlConnectionTiming {
@@ -259,6 +262,7 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
+    let (stop_control_tx, stop_control_rx) = tokio::sync::oneshot::channel();
     supervise_proxy_io(
         run_proxy_io(
             BufReader::new(stdin),
@@ -267,8 +271,10 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
             &cached_tools_list,
             &session_id,
             daemon_observes_tool_calls,
+            stop_control_tx,
         ),
         control_task,
+        stop_control_rx,
     )
     .await
 }
@@ -286,13 +292,49 @@ fn control_task_failure(
 
 async fn supervise_proxy_io<F>(
     proxy_io: F,
+    control_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    stop_control: tokio::sync::oneshot::Receiver<()>,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    supervise_proxy_io_with_timeout(
+        proxy_io,
+        control_task,
+        stop_control,
+        CANCELLATION_SETTLEMENT_TIMEOUT,
+    )
+    .await
+}
+
+async fn supervise_proxy_io_with_timeout<F>(
+    proxy_io: F,
     mut control_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    mut stop_control: tokio::sync::oneshot::Receiver<()>,
+    settlement_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     F: Future<Output = anyhow::Result<()>>,
 {
     tokio::pin!(proxy_io);
     tokio::select! {
+        biased;
+        stop = &mut stop_control => {
+            // Deliberate cancellation/EOF ends only this proxy's transport
+            // owner. The per-call socket remains open until its normal result
+            // proves native dispatch and cleanup have settled. A failed or
+            // timed-out exchange provides no such proof and must not be replayed.
+            control_task.abort();
+            let _ = control_task.await;
+            if stop.is_err() {
+                return proxy_io.await;
+            }
+            tokio::time::timeout(settlement_timeout, &mut proxy_io)
+                .await
+                .map_err(|_| anyhow::anyhow!(
+                    "native cancellation did not settle before the deadline; transport retired without settlement proof; do not replay"
+                ))?
+        }
         result = &mut proxy_io => {
             control_task.abort();
             let _ = control_task.await;
@@ -307,43 +349,56 @@ where
 
 /// Run the service-owned stdio loop over caller-provided I/O.
 ///
-/// A clean reader EOF must return `Ok(())` promptly. The caller then drops the
-/// persistent control connection, allowing the daemon to reap the MCP session
-/// and its recording, preview, and overlay state (issue #2002).
+/// Reader EOF or matching cancellation closes the control owner immediately,
+/// but an in-flight call is still read through its normal response before this
+/// proxy retires. It must never reuse an ended transport for another request.
 async fn run_proxy_io<R, W>(
-    mut reader: R,
+    reader: R,
     mut writer: W,
     socket_path: &str,
     cached_tools_list: &Arc<serde_json::Value>,
     session_id: &str,
     daemon_observes_tool_calls: bool,
+    stop_control: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut line = String::new();
+    // Lines::next_line is cancellation-safe. Repeated select! against
+    // read_line would lose a partially read JSON notification when the tool
+    // response wins the race.
+    let mut lines = reader.lines();
+    let mut queued = VecDeque::new();
+    let mut stop_control = Some(stop_control);
     let mut session_observed = false;
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break; // EOF — MCP client disconnected (stdin closed).
-        }
+        let line = match queued.pop_front() {
+            Some(line) => line,
+            None => match lines.next_line().await? {
+                Some(line) => line,
+                None => {
+                    stop_proxy_control(&mut stop_control);
+                    break;
+                }
+            },
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         debug!(raw = trimmed, "→ proxy request");
 
+        let mut retire = false;
         let response = match serde_json::from_str::<Request>(trimmed) {
             Err(e) => {
                 error!("JSON parse error: {e}");
                 Response::parse_error()
             }
             Ok(req) if req.is_notification() => {
-                // Notifications are intentionally dropped by the stdio adapter.
+                // No call is active here. Late/unknown cancellation and other
+                // notifications cannot retire or revive an unrelated request.
                 continue;
             }
             Ok(req) => {
@@ -374,15 +429,23 @@ where
                     })
                     .flatten();
                 let id = req.id.clone().unwrap_or(serde_json::Value::Null);
-                let response = handle_proxy_request(
+                let response_future = handle_proxy_request(
                     req,
-                    id,
+                    id.clone(),
                     socket_path,
                     cached_tools_list,
                     session_id,
                     daemon_observes_tool_calls,
+                );
+                let (response, retiring) = await_proxy_response(
+                    &mut lines,
+                    &mut queued,
+                    &id,
+                    response_future,
+                    &mut stop_control,
                 )
-                .await;
+                .await?;
+                retire = retiring;
                 if let Some(metadata) = initialize_metadata {
                     observe_proxy_session_started(metadata);
                     session_observed = true;
@@ -408,17 +471,83 @@ where
         writer.write_all(serialized.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
+        if retire {
+            break;
+        }
     }
 
-    // Reached on a clean stdin EOF (the `n == 0` break above) — the normal
-    // "MCP client disconnected" seam. Session teardown is NO LONGER done here:
-    // it's fully subsumed by the persistent control connection spawned at
-    // startup. On any proxy exit — graceful stdin EOF (this path), an I/O
-    // error propagated via `?`, OR a SIGKILL/crash — the kernel closes the
-    // control socket, the daemon's reader hits EOF, and it fires
-    // `session_end(session_id)` once (idempotent). That single path reliably
-    // covers the ungraceful-death case the old best-effort exit hook missed.
+    // Teardown is still owned by the control connection's EOF. Explicit
+    // cancellation only closes it sooner, while retaining this call's response
+    // channel long enough to distinguish settlement from uncertain transport loss.
     Ok(())
+}
+
+fn stop_proxy_control(stop_control: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    if let Some(stop) = stop_control.take() {
+        let _ = stop.send(());
+    }
+}
+
+fn cancels_request(request: &Request, active_id: &serde_json::Value) -> bool {
+    request.is_notification()
+        && request.method == "notifications/cancelled"
+        && request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("requestId"))
+            .is_some_and(|id| id == active_id && (id.is_string() || id.is_number()))
+}
+
+/// Observe cancellation without dropping the admitted request future. Ordinary
+/// pipelined messages retain their order, with the same sequential dispatch and
+/// bounded lookahead/backpressure; notifications do not occupy the queue.
+async fn await_proxy_response<R, F>(
+    lines: &mut tokio::io::Lines<R>,
+    queued: &mut VecDeque<String>,
+    active_id: &serde_json::Value,
+    response: F,
+    stop_control: &mut Option<tokio::sync::oneshot::Sender<()>>,
+) -> anyhow::Result<(Response, bool)>
+where
+    R: AsyncBufRead + Unpin,
+    F: Future<Output = Response>,
+{
+    tokio::pin!(response);
+    loop {
+        tokio::select! {
+            biased;
+            response = &mut response => return Ok((response, false)),
+            line = lines.next_line(), if queued.len() < MAX_QUEUED_PROXY_REQUESTS => {
+                let line = match line {
+                    Ok(Some(line)) => line,
+                    Ok(None) => {
+                        stop_proxy_control(stop_control);
+                        return Ok((response.await, true));
+                    }
+                    Err(error) => {
+                        stop_proxy_control(stop_control);
+                        // Even failed input must not drop the native response
+                        // waiter until settlement or the supervisor deadline.
+                        let _ = response.await;
+                        return Err(error.into());
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(request) = serde_json::from_str::<Request>(&line) {
+                    if cancels_request(&request, active_id) {
+                        stop_proxy_control(stop_control);
+                        return Ok((response.await, true));
+                    }
+                    if request.is_notification() {
+                        continue;
+                    }
+                }
+                queued.push_back(line);
+            }
+        }
+    }
 }
 
 fn proxy_knows_tool(cached_tools_list: &serde_json::Value, name: &str) -> bool {
@@ -826,7 +955,18 @@ async fn handle_proxy_request(
     daemon_observes_tool_calls: bool,
 ) -> Response {
     match req.method.as_str() {
-        "initialize" => Response::ok(id, initialize_result()),
+        "initialize" => {
+            let mut result = initialize_result();
+            result["capabilities"]["experimental"] = serde_json::json!({
+                "cua/native-request-cancellation": {
+                    "version": 1,
+                    "method": "notifications/cancelled",
+                    "settlement": "response_then_exit",
+                    "retires_transport": true,
+                }
+            });
+            Response::ok(id, result)
+        }
 
         "tools/list" => Response::ok(id, (**cached_tools_list).clone()),
 
@@ -885,29 +1025,19 @@ async fn forward_tool_call(
         client_kind: None,
     };
 
-    // The daemon client is sync, so jump to a blocking thread to keep
-    // the tokio reactor responsive while the AX-heavy call (e.g.
-    // `screenshot`, `get_window_state`) does its thing on the daemon
-    // side.
-    let socket = socket_path.to_owned();
-    let blocking = tokio::task::spawn_blocking(move || send_request(&socket, &req)).await;
-
-    let resp = match blocking {
-        Err(join_err) => {
-            return Response::error(
-                id,
-                -32603,
-                format!("internal join error forwarding to daemon: {join_err}"),
-            );
-        }
-        Ok(Err(e)) => {
+    // Keep the per-call response channel asynchronous: cancellation closes only
+    // the separate control owner and awaits this response. A settlement timeout
+    // can then retire the proxy without leaving a 120s detached blocking reader
+    // that would keep Tokio shutdown alive. No response means no settlement proof.
+    let resp = match send_proxy_request(socket_path, &req).await {
+        Err(e) => {
             return Response::error(
                 id,
                 -32603,
                 format!("daemon transport error forwarding `{name}`: {e}"),
             );
         }
-        Ok(Ok(r)) => r,
+        Ok(r) => r,
     };
 
     if !resp.ok {
@@ -946,6 +1076,62 @@ async fn forward_tool_call(
     Response::ok(id, result)
 }
 
+async fn send_proxy_request(
+    socket_path: &str,
+    request: &DaemonRequest,
+) -> anyhow::Result<DaemonResponse> {
+    #[cfg(unix)]
+    {
+        let stream = tokio::net::UnixStream::connect(socket_path).await?;
+        return exchange_proxy_request(stream, request).await;
+    }
+    #[cfg(all(not(unix), target_os = "windows"))]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let stream = loop {
+            match ClientOptions::new().open(socket_path) {
+                Ok(stream) => break stream,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        return exchange_proxy_request(stream, request).await;
+    }
+    #[cfg(all(not(unix), not(target_os = "windows")))]
+    {
+        let _ = (socket_path, request);
+        anyhow::bail!("daemon proxy is not supported on this platform");
+    }
+}
+
+async fn exchange_proxy_request<S>(
+    mut stream: S,
+    request: &DaemonRequest,
+) -> anyhow::Result<DaemonResponse>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let line = serde_json::to_string(request)? + "\n";
+    tokio::time::timeout(Duration::from_secs(120), async {
+        stream.write_all(line.as_bytes()).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out writing daemon request"))??;
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    let bytes = tokio::time::timeout(Duration::from_secs(120), reader.read_line(&mut response))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for daemon response"))??;
+    if bytes == 0 {
+        anyhow::bail!("daemon closed connection without response");
+    }
+    Ok(serde_json::from_str(response.trim_end())?)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 //
 // The daemon-backed integration harness exercises the full proxy lifecycle.
@@ -962,6 +1148,7 @@ mod tests {
         let reader = BufReader::new(&b""[..]);
         let mut writer = Vec::new();
         let cached_tools = Arc::new(serde_json::json!({"tools": []}));
+        let (stop_control, _stop_rx) = tokio::sync::oneshot::channel();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(250),
@@ -972,6 +1159,7 @@ mod tests {
                 &cached_tools,
                 "eof-test-session",
                 false,
+                stop_control,
             ),
         )
         .await
@@ -987,6 +1175,7 @@ mod tests {
         let reader = BufReader::new(&input[..]);
         let mut writer = Vec::new();
         let cached_tools = Arc::new(serde_json::json!({"tools": []}));
+        let (stop_control, _stop_rx) = tokio::sync::oneshot::channel();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(250),
@@ -997,6 +1186,7 @@ mod tests {
                 &cached_tools,
                 "initialize-test-session",
                 false,
+                stop_control,
             ),
         )
         .await
@@ -1010,6 +1200,11 @@ mod tests {
             serde_json::from_slice(&writer).expect("response must be JSON");
         assert_eq!(response["id"], 1);
         assert!(response.get("result").is_some());
+        assert_eq!(
+            response["result"]["capabilities"]["experimental"]["cua/native-request-cancellation"]
+                ["settlement"],
+            "response_then_exit"
+        );
     }
 
     #[tokio::test]
@@ -1102,15 +1297,213 @@ mod tests {
         let proxy_io = std::future::pending::<anyhow::Result<()>>();
         let control_task =
             tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("test control channel lost")) });
+        let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
         let error = tokio::time::timeout(
             Duration::from_millis(250),
-            supervise_proxy_io(proxy_io, control_task),
+            supervise_proxy_io(proxy_io, control_task, stop_rx),
         )
         .await
         .expect("supervisor must stop promptly")
         .expect_err("control loss must fail the proxy");
         assert!(error.to_string().contains("test control channel lost"));
+    }
+
+    #[test]
+    fn cancellation_requires_notification_and_exact_typed_request_id() {
+        for (wire, expected) in [
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+                true,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"7"}}"#,
+                false,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":8}}"#,
+                false,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":8,"method":"notifications/cancelled","params":{"requestId":7}}"#,
+                false,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}"#,
+                false,
+            ),
+        ] {
+            let request = serde_json::from_str(wire).unwrap();
+            assert_eq!(cancels_request(&request, &serde_json::json!(7)), expected);
+        }
+    }
+
+    struct SignalControlClosed(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for SignalControlClosed {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_cancel_closes_control_but_waits_for_native_response() {
+        let (proxy_input, mut client_input) = tokio::io::duplex(4096);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let control_guard = SignalControlClosed(Some(closed_tx));
+        let control_task = tokio::spawn(async move {
+            let _control_guard = control_guard;
+            std::future::pending::<anyhow::Result<()>>().await
+        });
+        let proxy_io = async move {
+            let mut lines = BufReader::new(proxy_input).lines();
+            let mut queued = VecDeque::new();
+            let mut stop_tx = Some(stop_tx);
+            let (response, retired) = await_proxy_response(
+                &mut lines,
+                &mut queued,
+                &serde_json::json!(7),
+                async { response_rx.await.unwrap() },
+                &mut stop_tx,
+            )
+            .await?;
+            assert!(retired);
+            assert_eq!(response.id, serde_json::json!(7));
+            assert!(matches!(
+                response.body,
+                cua_driver_core::protocol::ResponseBody::Result { .. }
+            ));
+            Ok(())
+        };
+        let supervisor = tokio::spawn(supervise_proxy_io(proxy_io, control_task, stop_rx));
+        client_input
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":7}}\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(250), closed_rx)
+            .await
+            .expect("cancel must close the control connection promptly")
+            .unwrap();
+        assert!(
+            !supervisor.is_finished(),
+            "control EOF is not native settlement"
+        );
+        response_tx
+            .send(Response::ok(
+                serde_json::json!(7),
+                serde_json::json!({"isError": true}),
+            ))
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(250), supervisor)
+            .await
+            .expect("normal native response permits proxy retirement")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn eof_during_request_signals_end_and_preserves_response_waiter() {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let pending = tokio::spawn(async move {
+            let mut lines = BufReader::new(&b""[..]).lines();
+            await_proxy_response(
+                &mut lines,
+                &mut VecDeque::new(),
+                &serde_json::json!("request"),
+                async { response_rx.await.unwrap() },
+                &mut Some(stop_tx),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_millis(250), stop_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!pending.is_finished());
+        response_tx
+            .send(Response::ok(
+                serde_json::json!("request"),
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        let (response, retired) = pending.await.unwrap().unwrap();
+        assert!(retired);
+        assert_eq!(response.id, serde_json::json!("request"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_queued_work_instead_of_reusing_ended_owner() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":7}}\n";
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let pending = tokio::spawn(async move {
+            let mut lines = BufReader::new(&input[..]).lines();
+            let mut queued = VecDeque::new();
+            let (response, retired) = await_proxy_response(
+                &mut lines,
+                &mut queued,
+                &serde_json::json!(7),
+                async { response_rx.await.unwrap() },
+                &mut Some(stop_tx),
+            )
+            .await?;
+            assert!(
+                retired,
+                "caller must retire instead of dispatching queued work"
+            );
+            assert_eq!(queued.len(), 1);
+            Ok::<_, anyhow::Error>(response)
+        });
+        stop_rx.await.unwrap();
+        response_tx
+            .send(Response::ok(serde_json::json!(7), serde_json::json!({})))
+            .unwrap();
+        assert_eq!(pending.await.unwrap().unwrap().id, serde_json::json!(7));
+    }
+
+    #[tokio::test]
+    async fn deliberate_stop_timeout_is_not_a_settled_response() {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let control_task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+        let proxy_io = async move {
+            stop_tx.send(()).unwrap();
+            std::future::pending::<anyhow::Result<()>>().await
+        };
+        let error = supervise_proxy_io_with_timeout(
+            proxy_io,
+            control_task,
+            stop_rx,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("missing native response must not be treated as cancellation settlement");
+        assert!(error.to_string().contains("without settlement proof"));
+    }
+
+    #[tokio::test]
+    async fn async_daemon_exchange_preserves_normal_response_envelope() {
+        let (client, server) = tokio::io::duplex(4096);
+        let request = control_request("call", "test-session");
+        let exchange = tokio::spawn(async move { exchange_proxy_request(client, &request).await });
+        let (reader, mut writer) = tokio::io::split(server);
+        let mut lines = BufReader::new(reader).lines();
+        let sent: DaemonRequest =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(sent.session_id.as_deref(), Some("test-session"));
+        let expected = DaemonResponse::ok(serde_json::json!({"message":"settled 已结束"}));
+        let payload = serde_json::to_vec(&expected).unwrap();
+        for chunk in payload.chunks(3) {
+            writer.write_all(chunk).await.unwrap();
+        }
+        writer.write_all(b"\n").await.unwrap();
+        let response = exchange.await.unwrap().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.result, expected.result);
     }
 
     /// Reconstruct the `!resp.ok` branch in isolation so we can assert

@@ -33,9 +33,30 @@ use cua_driver_core::element_cache::ElementCacheCore;
 pub struct RetainedElement(usize);
 
 impl RetainedElement {
+    /// Retain a pointer whose lifetime the caller already owns or borrows.
+    ///
+    /// # Safety
+    ///
+    /// A nonzero `ptr` must name a live CF object for this call. In particular,
+    /// retain before handing it to a detached blocking worker, not after the
+    /// async owner's lifetime may have ended.
+    pub(crate) unsafe fn retain(ptr: usize) -> Self {
+        if ptr != 0 {
+            CFRetain(ptr as AXUIElementRef as CFTypeRef);
+        }
+        Self(ptr)
+    }
+
     /// The raw pointer, valid for as long as this guard is held.
     pub fn as_ptr(&self) -> usize {
         self.0
+    }
+}
+
+impl Clone for RetainedElement {
+    fn clone(&self) -> Self {
+        // The source guard keeps the object alive until its clone owns a retain.
+        unsafe { Self::retain(self.0) }
     }
 }
 
@@ -244,6 +265,42 @@ mod tests {
             base,
             "guard drop releases its retain"
         );
+    }
+
+    #[tokio::test]
+    async fn blocking_element_clone_outlives_cancelled_async_owner() {
+        let value = CFString::new("cua-driver-cancelled-worker-retained-element");
+        let ptr = value.as_concrete_TypeRef() as usize;
+        let base = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
+        let guard = unsafe { RetainedElement::retain(ptr) };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            let worker_guard = guard.clone();
+            tokio::task::spawn_blocking(move || {
+                let _worker_guard = worker_guard;
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(_worker_guard);
+                finished_tx.send(()).unwrap();
+            })
+            .await
+            .unwrap();
+            drop(guard);
+        });
+        started_rx.await.unwrap();
+        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base + 2);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            unsafe { CFGetRetainCount(ptr as CFTypeRef) },
+            base + 1,
+            "detached worker still owns its retain after the async owner is dropped"
+        );
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base);
     }
 
     /// A missing index returns None without retaining anything.

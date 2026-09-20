@@ -205,7 +205,9 @@ impl Tool for RightClickTool {
                 prior_front,
                 "right_click.AX",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    crate::foreground_activity::spawn_blocking(move || {
+                        let element_ptr = element_guard.as_ptr();
+                        crate::foreground_activity::check_request()?;
                         super::ensure_app_context_delegation_live(ax_app_context_route.as_ref())?;
                         unsafe {
                             super::ensure_app_context_element_window(
@@ -315,7 +317,7 @@ impl Tool for RightClickTool {
             prior_front,
             "right_click.pixel",
             || async move {
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                crate::foreground_activity::spawn_blocking(move || -> anyhow::Result<()> {
                     super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
                     let do_it = move || -> anyhow::Result<()> {
                         let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
@@ -387,6 +389,7 @@ fn ax_show_menu(element_ptr: usize, idx: usize, pid: i32, wid: u32) -> anyhow::R
     // primitive. This makes "right-click element N" land on any element, not
     // just ones with a native context-menu AX action.
     if advertised.iter().any(|a| a == "AXShowMenu") {
+        crate::foreground_activity::check_request()?;
         let err = unsafe { perform_action(element, "AXShowMenu") };
         if err == kAXErrorSuccess {
             return Ok(format!(

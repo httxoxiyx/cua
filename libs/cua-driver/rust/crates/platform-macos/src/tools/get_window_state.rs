@@ -235,7 +235,7 @@ async fn lock_and_invalidate_app_context_targets(
     }
     let registry = state.app_context_delegation_registry.clone();
     let lease_targets = targets.clone();
-    let leases = tokio::task::spawn_blocking(move || {
+    let leases = crate::foreground_activity::spawn_blocking(move || {
         registry.acquire_target_observation_leases(lease_targets)
     })
     .await
@@ -656,7 +656,7 @@ impl Tool for GetWindowStateTool {
         // is never a public application binding, including when the caller
         // asks it to select its own app-context window. Only an ordinary host
         // app_context observation may resolve the helper cross-process.
-        let direct_helper = tokio::task::spawn_blocking(move || {
+        let direct_helper = crate::foreground_activity::spawn_blocking(move || {
             (
                 crate::ax::app_context::looks_like_open_save_panel_process(requested_pid),
                 crate::transient_ui::is_trusted_transient_helper_process(requested_pid),
@@ -732,7 +732,7 @@ impl Tool for GetWindowStateTool {
                 } else {
                     let registry = self.state.app_context_delegation_registry.clone();
                     let lease_session = transient_session.clone();
-                    let lease = match tokio::task::spawn_blocking(move || {
+                    let lease = match crate::foreground_activity::spawn_blocking(move || {
                         registry.acquire_observation_lease(&lease_session, requested_pid)
                     })
                     .await
@@ -756,7 +756,7 @@ impl Tool for GetWindowStateTool {
                     Some(ticket)
                 };
                 let expected_for_resolution = expected.clone();
-                let resolution = tokio::task::spawn_blocking(move || {
+                let resolution = crate::foreground_activity::spawn_blocking(move || {
                     crate::ax::app_context::resolve_app_context(
                         requested_pid,
                         &expected_for_resolution,
@@ -851,7 +851,7 @@ impl Tool for GetWindowStateTool {
                     // shared helper target. Re-prove the complete host→panel
                     // association only after taking the target writer.
                     let expected_for_recheck = expected.clone();
-                    let recheck = tokio::task::spawn_blocking(move || {
+                    let recheck = crate::foreground_activity::spawn_blocking(move || {
                         crate::ax::app_context::resolve_app_context(
                             requested_pid,
                             &expected_for_recheck,
@@ -919,7 +919,7 @@ impl Tool for GetWindowStateTool {
         // `com.apple.appkit.xpc.openAndSavePanelService`, so the owner-mismatch
         // shape is routine, and the caller must be told the real owner pid.
         {
-            let owner = match tokio::task::spawn_blocking(move || {
+            let owner = match crate::foreground_activity::spawn_blocking(move || {
                 crate::windows::resolve_window_owner(base_target.pid, base_target.window_id)
             })
             .await
@@ -966,7 +966,7 @@ impl Tool for GetWindowStateTool {
         let transient_target = if delegated_panel {
             None
         } else {
-            let transient_detection = tokio::task::spawn_blocking(move || {
+            let transient_detection = crate::foreground_activity::spawn_blocking(move || {
                 crate::transient_ui::detect_visible_transient_helper(source_target)
             })
             .await;
@@ -995,6 +995,10 @@ impl Tool for GetWindowStateTool {
         let (pid, window_id) = transient_target
             .map(|target| (target.pid, target.window_id))
             .unwrap_or((base_target.pid, base_target.window_id));
+        if let Err(refusal) = crate::foreground_activity::check_segment_target(pid, Some(window_id))
+        {
+            return refusal;
+        }
 
         let query = args.opt_str("query");
         let screenshot_out_file = args.opt_str("screenshot_out_file").map(|s| {
@@ -1075,7 +1079,7 @@ impl Tool for GetWindowStateTool {
             // deadline so callers receive a structured driver error. The AX
             // walker also applies a native per-element messaging timeout because
             // dropping a spawn_blocking JoinHandle cannot cancel a blocked AX call.
-            let walk_future = tokio::task::spawn_blocking(move || {
+            let walk_future = crate::foreground_activity::spawn_blocking(move || {
                 if delegated_panel {
                     crate::ax::tree::walk_tree_bounded_strict_window(
                         pid,
@@ -1112,7 +1116,7 @@ impl Tool for GetWindowStateTool {
             if !plan.include_screenshot {
                 return (None, None, None);
             }
-            match tokio::task::spawn_blocking(move || {
+            match crate::foreground_activity::spawn_blocking(move || {
                 let menu = if !observation_only && transient_target.is_none() && !delegated_panel {
                     crate::ax::application_menu::active_application_menu(pid, window_id)
                 } else {
@@ -1154,7 +1158,7 @@ impl Tool for GetWindowStateTool {
         if let Some((expected, context, _ticket)) = app_context_observation.as_mut() {
             let before = context.clone();
             let expected_for_resolution = expected.clone();
-            let after = tokio::task::spawn_blocking(move || {
+            let after = crate::foreground_activity::spawn_blocking(move || {
                 crate::ax::app_context::resolve_app_context(requested_pid, &expected_for_resolution)
             })
             .await;
@@ -1195,7 +1199,7 @@ impl Tool for GetWindowStateTool {
             // route, or response state is committed. The capture itself is
             // side-effect free; everything after this point can safely use the
             // same validated physical surface.
-            let final_detection = tokio::task::spawn_blocking(move || {
+            let final_detection = crate::foreground_activity::spawn_blocking(move || {
                 crate::transient_ui::detect_visible_transient_helper(source_target)
             })
             .await;
@@ -1220,7 +1224,7 @@ impl Tool for GetWindowStateTool {
 
         if let Some(menu) = application_menu.as_ref() {
             let proof = menu.clone();
-            if !tokio::task::spawn_blocking(move || {
+            if !crate::foreground_activity::spawn_blocking(move || {
                 crate::ax::application_menu::revalidate_menu_image(&proof)
             })
             .await
@@ -1242,7 +1246,7 @@ impl Tool for GetWindowStateTool {
         // publishing that frame under the old (pid, window_id) would bind
         // pixels from a different surface to the caller's target.
         let captured_screenshot = if let Some(screenshot) = captured_screenshot {
-            let owner = match tokio::task::spawn_blocking(move || {
+            let owner = match crate::foreground_activity::spawn_blocking(move || {
                 crate::windows::resolve_window_owner(pid, window_id)
             })
             .await
@@ -1295,7 +1299,7 @@ impl Tool for GetWindowStateTool {
             if context.delegation.is_some() {
                 let before = context.clone();
                 let expected_for_resolution = expected.clone();
-                let final_resolution = tokio::task::spawn_blocking(move || {
+                let final_resolution = crate::foreground_activity::spawn_blocking(move || {
                     crate::ax::app_context::resolve_app_context(
                         requested_pid,
                         &expected_for_resolution,
@@ -1701,7 +1705,7 @@ impl Tool for GetWindowStateTool {
         // not a promise. Old consumers ignore the extra field.
         if plan.include_elements && transient_target.is_none() {
             let capture_available = screenshot_dims.is_some();
-            let report = tokio::task::spawn_blocking(move || {
+            let report = crate::foreground_activity::spawn_blocking(move || {
                 let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
                 cua_driver_core::background_input::background_input_capability_report(
                     cua_driver_core::background_input::ExactWindowTarget { pid, window_id },
@@ -1774,7 +1778,7 @@ impl Tool for GetWindowStateTool {
             // well as before state publication above. If the modal disappears
             // during response construction, never leave a route that the
             // caller could consume on its next foreground keyboard action.
-            let commit_detection = tokio::task::spawn_blocking(move || {
+            let commit_detection = crate::foreground_activity::spawn_blocking(move || {
                 crate::transient_ui::detect_visible_transient_helper(source_target)
             })
             .await;

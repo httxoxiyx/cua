@@ -25,6 +25,7 @@ mod type_text;
 // through GetWindowStateTool.
 mod check_permissions;
 mod cursor_tools;
+mod foreground_segment;
 mod get_accessibility_tree;
 mod get_config;
 mod get_cursor_position;
@@ -332,7 +333,7 @@ impl Tool for AppContextDelegationGuard {
             // helper window id. Several foreground backends intentionally
             // recover the physical owner from the window id, so allowing that
             // mismatch here would bypass the app-context capability entirely.
-            let owner = tokio::task::spawn_blocking(move || {
+            let owner = crate::foreground_activity::spawn_blocking(move || {
                 crate::windows::resolve_window_owner(target.pid, target.window_id)
             })
             .await;
@@ -349,7 +350,7 @@ impl Tool for AppContextDelegationGuard {
             // side before it can revoke or replace this generation.
             let registry = self.registry.clone();
             let session_for_lookup = session.clone();
-            let resolution = tokio::task::spawn_blocking(move || {
+            let resolution = crate::foreground_activity::spawn_blocking(move || {
                 let lease = registry.acquire_action_lease(&session_for_lookup, target);
                 let resolution = registry.resolve_live(&session_for_lookup, target);
                 (lease, resolution)
@@ -360,6 +361,12 @@ impl Tool for AppContextDelegationGuard {
                     Some(action_lease),
                     crate::ax::app_context::DelegationRouteResolution::Live(route),
                 )) => {
+                    if let Err(refusal) = crate::foreground_activity::check_segment_target(
+                        route.delegation.target.pid,
+                        Some(route.delegation.target.window_id),
+                    ) {
+                        return refusal;
+                    }
                     if !cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite()
                     {
                         return app_context_delegation_policy_refusal();
@@ -397,7 +404,7 @@ impl Tool for AppContextDelegationGuard {
         // A matching live route above is the only authority to consume this
         // otherwise non-public helper target. Direct/unobserved helper calls
         // fail closed even when the caller discovered the pid independently.
-        let looks_like_helper = tokio::task::spawn_blocking(move || {
+        let looks_like_helper = crate::foreground_activity::spawn_blocking(move || {
             crate::ax::app_context::looks_like_open_save_panel_process(pid)
         })
         .await
@@ -631,7 +638,7 @@ pub(crate) fn background_refusal_result(
 /// target-bound verification.
 pub(crate) struct BackgroundMutationLease {
     pid: i32,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl BackgroundMutationLease {
@@ -657,8 +664,15 @@ async fn decide_background_window_action(
     use cua_driver_core::background_input::{
         decide_background_input, BackgroundInputDecision, ExactWindowTarget,
     };
-    let facts = match tokio::task::spawn_blocking(move || {
-        crate::ax::exact_target::gather_background_facts(pid, window_id, element_ptr)
+    // The caller retains this pointer, but its future can be cancelled while
+    // the detached native worker is still gathering facts.
+    let retained = element_ptr.map(|ptr| unsafe { crate::ax::cache::RetainedElement::retain(ptr) });
+    let facts = match crate::foreground_activity::spawn_blocking(move || {
+        crate::ax::exact_target::gather_background_facts(
+            pid,
+            window_id,
+            retained.as_ref().map(|element| element.as_ptr()),
+        )
     })
     .await
     {
@@ -692,10 +706,14 @@ pub(crate) async fn gate_background_window_action(
 }
 
 pub(crate) async fn acquire_background_mutation(pid: i32) -> BackgroundMutationLease {
-    BackgroundMutationLease {
-        pid,
-        _guard: crate::background_mutation::acquire(pid).await,
-    }
+    // A segment owns this coordinator across RPCs. Its checked invocation
+    // supplies the retained guard; reacquiring it would deadlock the segment.
+    let guard = match crate::foreground_activity::current_segment_background_lease(pid) {
+        Some(guard) => guard,
+        None => Arc::new(crate::background_mutation::acquire(pid).await),
+    };
+    crate::foreground_activity::retain_background_lease(Arc::clone(&guard));
+    BackgroundMutationLease { pid, _guard: guard }
 }
 
 /// Finish the post-action observation window. Embedded interactive clients
@@ -735,7 +753,423 @@ mod interactive_observation_tests {
     }
 }
 
-/// px-focus for the keyboard family (type_text / press_key / hotkey): focus the
+/// Read-only coordinate plan. Focus and keyboard input consume this plan inside
+/// the same foreground Episode; preparing it never fronts or mutates an app.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForegroundPixelFocus {
+    pid: i32,
+    window_id: u32,
+    native_x: f64,
+    native_y: f64,
+    width: f64,
+    height: f64,
+    scale: f64,
+}
+
+impl ForegroundPixelFocus {
+    fn from_frame(
+        pid: i32,
+        window_id: u32,
+        native_x: f64,
+        native_y: f64,
+        frame: &px_frame::WindowPxFrame,
+    ) -> anyhow::Result<Self> {
+        let plan = Self {
+            pid,
+            window_id,
+            native_x,
+            native_y,
+            width: frame.bounds.width,
+            height: frame.bounds.height,
+            scale: frame.scale,
+        };
+        plan.screen_point(frame)?;
+        Ok(plan)
+    }
+
+    fn screen_point(&self, frame: &px_frame::WindowPxFrame) -> anyhow::Result<(f64, f64)> {
+        let values = [
+            self.native_x,
+            self.native_y,
+            frame.bounds.x,
+            frame.bounds.y,
+            frame.bounds.width,
+            frame.bounds.height,
+            frame.scale,
+        ];
+        if values.iter().any(|value| !value.is_finite())
+            || frame.scale <= 0.0
+            || frame.bounds.width <= 0.0
+            || frame.bounds.height <= 0.0
+            || frame.bounds.width != self.width
+            || frame.bounds.height != self.height
+            || frame.scale != self.scale
+        {
+            anyhow::bail!(
+                "foreground focus frame changed or is invalid; obtain a fresh screenshot"
+            );
+        }
+        let (x, y, local_x, local_y) = frame.to_screen(self.native_x, self.native_y);
+        if local_x < 0.0 || local_y < 0.0 || local_x >= self.width || local_y >= self.height {
+            anyhow::bail!("foreground focus point lies outside the exact window frame");
+        }
+        Ok((x, y))
+    }
+
+    fn apply(
+        self,
+        expected_element: Option<&crate::ax::cache::RetainedElement>,
+    ) -> anyhow::Result<()> {
+        use crate::ax::bindings::{copy_string_attr, element_at_screen_position};
+        use core_foundation::base::CFRelease;
+
+        // This helper deliberately does not create an Episode. The caller's
+        // existing exact-window activation owns focus, input and restoration.
+        crate::foreground_activity::check_input()?;
+        if !matches!(
+            crate::windows::resolve_window_owner(self.pid, self.window_id),
+            crate::windows::WindowOwner::SamePid
+        ) || crate::input::skylight::front_process_matches(self.pid, self.window_id)
+            != Some(true)
+        {
+            anyhow::bail!("foreground focus target changed before dispatch");
+        }
+        let frame = px_frame::resolve_window_px_frame(self.window_id)
+            .map_err(|error| anyhow::anyhow!("foreground focus frame unavailable: {error:?}"))?;
+        let (x, y) = self.screen_point(&frame)?;
+        crate::foreground_activity::check_input()?;
+        if let Some(expected) = expected_element {
+            let element = expected.as_ptr() as crate::ax::bindings::AXUIElementRef;
+            if unsafe { crate::ax::exact_target::element_window_id(element) }
+                != Some(self.window_id)
+                || !unsafe { crate::ax::bindings::element_screen_rect(element) }
+                    .is_some_and(|rect| point_within_rect(rect, x, y))
+            {
+                anyhow::bail!(
+                    "indexed foreground focus target moved or changed window; re-observe"
+                );
+            }
+        }
+
+        // Native editable fields can establish focus without collapsing an
+        // existing selection. Web AX focus is not renderer first-responder
+        // evidence; those controls use the one explicit real focus click below.
+        if let Some(element) = unsafe { element_at_screen_position(self.pid, x, y) } {
+            let focused: anyhow::Result<bool> = (|| {
+                if let Some(expected) = expected_element {
+                    // The hit-test result owns a live AX reference. Retain it
+                    // while walking parents; equal bounds alone do not prove
+                    // that this is still the caller's indexed control.
+                    let hit =
+                        unsafe { crate::ax::cache::RetainedElement::retain(element as usize) };
+                    if !focus_hit_matches_target(expected, hit) {
+                        anyhow::bail!(
+                            "foreground focus hit no longer belongs to the indexed target"
+                        );
+                    }
+                }
+                let inside = unsafe { crate::ax::exact_target::element_window_id(element) }
+                    == Some(self.window_id);
+                let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+                if !inside
+                    || !matches!(role.as_str(), "AXTextField" | "AXTextArea" | "AXComboBox")
+                    || type_text::target_in_web_area(
+                        self.pid,
+                        Some((element as usize, None)),
+                        Some(self.window_id),
+                    )
+                {
+                    return Ok(false);
+                }
+                crate::foreground_activity::check_input()?;
+                crate::input::ax_actions::focus_element(element as usize)?;
+                Ok(crate::input::ax_actions::is_element_focused(
+                    self.pid,
+                    element as usize,
+                ))
+            })();
+            unsafe { CFRelease(element as _) };
+            if focused? {
+                return Ok(());
+            }
+        } else if expected_element.is_some() {
+            anyhow::bail!("cannot prove indexed foreground focus hit; re-observe");
+        }
+
+        // AX probing may take time. Re-read bounds immediately before the HID
+        // focus click and reject resize/movement, rather than clicking a point
+        // whose original target has moved away during the probe.
+        let current = crate::windows::window_bounds_by_id(self.window_id)
+            .ok_or_else(|| anyhow::anyhow!("foreground focus window closed"))?;
+        if current.x != frame.bounds.x
+            || current.y != frame.bounds.y
+            || current.width != self.width
+            || current.height != self.height
+        {
+            anyhow::bail!("foreground focus window moved or resized before click; re-observe");
+        }
+        crate::foreground_activity::check_input()?;
+        crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
+            x,
+            y,
+            1,
+            "left",
+            &[],
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        crate::foreground_activity::check_input()
+    }
+}
+
+fn bounded_focus_ancestry_matches<T>(
+    mut current: T,
+    mut matches: impl FnMut(&T) -> bool,
+    mut parent: impl FnMut(&T) -> Option<T>,
+) -> bool {
+    for _ in 0..40 {
+        if matches(&current) {
+            return true;
+        }
+        let Some(next) = parent(&current) else {
+            return false;
+        };
+        current = next;
+    }
+    false
+}
+
+fn focus_hit_matches_target(
+    expected: &crate::ax::cache::RetainedElement,
+    hit: crate::ax::cache::RetainedElement,
+) -> bool {
+    use core_foundation::base::{CFEqual, CFRelease};
+
+    bounded_focus_ancestry_matches(
+        hit,
+        |element| unsafe { CFEqual(expected.as_ptr() as _, element.as_ptr() as _) != 0 },
+        |element| unsafe {
+            let parent = crate::ax::bindings::copy_element_attr(
+                element.as_ptr() as crate::ax::bindings::AXUIElementRef,
+                "AXParent",
+            )?;
+            let guard = crate::ax::cache::RetainedElement::retain(parent as usize);
+            CFRelease(parent as _);
+            Some(guard)
+        },
+    )
+}
+
+pub(crate) async fn prepare_foreground_pixel_focus(
+    state: &ToolState,
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+    from_zoom: bool,
+) -> Result<ForegroundPixelFocus, cua_driver_core::protocol::ToolResult> {
+    let window_id = window_id.ok_or_else(|| {
+        cua_driver_core::protocol::ToolResult::error(
+            "foreground coordinate focus requires an exact window_id",
+        )
+    })?;
+    let zoom = if from_zoom {
+        Some(state.zoom_registry.get(pid).ok_or_else(|| {
+            cua_driver_core::protocol::ToolResult::error(
+                "from_zoom=true requires a current zoom context",
+            )
+        })?)
+    } else {
+        None
+    };
+    let ratio = state
+        .resize_registry
+        .ratio(pid, Some(window_id))
+        .unwrap_or(1.0);
+    let (x, y) = keyboard_focus_native_pixels(x, y, zoom, ratio)
+        .map_err(|error| cua_driver_core::protocol::ToolResult::error(error.to_string()))?;
+    prepare_foreground_native_pixel_focus(pid, window_id, x, y).await
+}
+
+fn keyboard_focus_native_pixels(
+    x: f64,
+    y: f64,
+    zoom: Option<ZoomContext>,
+    ratio: f64,
+) -> anyhow::Result<(f64, f64)> {
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+        anyhow::bail!("foreground focus coordinates must be finite and nonnegative");
+    }
+    match zoom {
+        Some(zoom) if zoom.scale_inv.is_finite() && zoom.scale_inv > 0.0 => {
+            Ok(zoom.zoom_to_window(x, y))
+        }
+        None if ratio.is_finite() && ratio > 0.0 => Ok((x * ratio, y * ratio)),
+        _ => anyhow::bail!("foreground focus screenshot scale is invalid"),
+    }
+}
+
+/// AX-derived centers are already native window pixels: never apply a second
+/// screenshot resize/zoom transform to them.
+pub(crate) async fn prepare_foreground_native_pixel_focus(
+    pid: i32,
+    window_id: u32,
+    native_x: f64,
+    native_y: f64,
+) -> Result<ForegroundPixelFocus, cua_driver_core::protocol::ToolResult> {
+    match crate::foreground_activity::spawn_blocking(move || {
+        crate::foreground_activity::check_request()?;
+        let frame = px_frame::resolve_window_px_frame(window_id)
+            .map_err(|error| anyhow::anyhow!("foreground focus frame unavailable: {error:?}"))?;
+        ForegroundPixelFocus::from_frame(pid, window_id, native_x, native_y, &frame)
+    })
+    .await
+    {
+        Ok(Ok(plan)) => Ok(plan),
+        Ok(Err(error)) => Err(cua_driver_core::protocol::ToolResult::error(
+            error.to_string(),
+        )),
+        Err(error) => Err(cua_driver_core::protocol::ToolResult::error(format!(
+            "foreground focus preparation failed: {error}"
+        ))),
+    }
+}
+
+fn run_after_focus<T>(
+    focus: impl FnOnce() -> anyhow::Result<()>,
+    input: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    focus()?;
+    input()
+}
+
+pub(crate) fn with_prepared_foreground_focus<T>(
+    focus: Option<ForegroundPixelFocus>,
+    input: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_prepared_foreground_element_focus(focus, None, input)
+}
+
+pub(crate) fn with_prepared_foreground_element_focus<T>(
+    focus: Option<ForegroundPixelFocus>,
+    expected_element: Option<&crate::ax::cache::RetainedElement>,
+    input: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    run_after_focus(
+        || focus.map_or(Ok(()), |plan| plan.apply(expected_element)),
+        input,
+    )
+}
+
+#[cfg(test)]
+mod foreground_pixel_focus_tests {
+    use super::*;
+
+    fn frame() -> px_frame::WindowPxFrame {
+        px_frame::WindowPxFrame {
+            bounds: crate::windows::WindowBounds {
+                x: 100.0,
+                y: 200.0,
+                width: 300.0,
+                height: 400.0,
+            },
+            scale: 2.0,
+        }
+    }
+
+    #[test]
+    fn foreground_focus_uses_screenshot_resize_or_zoom_once() {
+        let (x, y) = keyboard_focus_native_pixels(10.0, 20.0, None, 2.0).unwrap();
+        let plan = ForegroundPixelFocus::from_frame(7, 8, x, y, &frame()).unwrap();
+        assert_eq!(plan.screen_point(&frame()).unwrap(), (110.0, 220.0));
+        let zoom = ZoomContext {
+            origin_x: 20.0,
+            origin_y: 40.0,
+            scale_inv: 2.0,
+        };
+        let (x, y) = keyboard_focus_native_pixels(10.0, 20.0, Some(zoom), 9.0).unwrap();
+        let plan = ForegroundPixelFocus::from_frame(7, 8, x, y, &frame()).unwrap();
+        assert_eq!(plan.screen_point(&frame()).unwrap(), (120.0, 240.0));
+    }
+
+    #[test]
+    fn foreground_focus_requires_positive_frame_and_inside_point() {
+        for (x, y) in [(600.0, 0.0), (0.0, 800.0), (-1.0, 0.0), (f64::NAN, 1.0)] {
+            assert!(ForegroundPixelFocus::from_frame(7, 8, x, y, &frame()).is_err());
+        }
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(keyboard_focus_native_pixels(1.0, 2.0, None, scale).is_err());
+        }
+    }
+
+    #[test]
+    fn foreground_focus_revalidates_size_and_scale_and_uses_live_origin() {
+        let plan = ForegroundPixelFocus::from_frame(7, 8, 20.0, 40.0, &frame()).unwrap();
+        let mut moved = frame();
+        moved.bounds.x = 500.0;
+        assert_eq!(plan.screen_point(&moved).unwrap(), (510.0, 220.0));
+        moved.bounds.width += 1.0;
+        assert!(plan.screen_point(&moved).is_err());
+        let mut scaled = frame();
+        scaled.scale = 1.0;
+        assert!(plan.screen_point(&scaled).is_err());
+    }
+
+    #[test]
+    fn indexed_focus_accepts_only_exact_target_or_bounded_descendant() {
+        assert!(bounded_focus_ancestry_matches(
+            8,
+            |node| *node == 7,
+            |node| (*node > 0).then(|| *node - 1),
+        ));
+        assert!(!bounded_focus_ancestry_matches(
+            8,
+            |node| *node == 9,
+            |node| (*node > 0).then(|| *node - 1),
+        ));
+        let mut reads = 0;
+        assert!(!bounded_focus_ancestry_matches(
+            8,
+            |_| false,
+            |node| {
+                reads += 1;
+                Some(*node)
+            },
+        ));
+        assert_eq!(reads, 40, "cyclic AX parent graphs must stay bounded");
+    }
+
+    #[test]
+    fn foreground_focus_precedes_input_and_interruption_prevents_it() {
+        let events = std::cell::RefCell::new(Vec::new());
+        run_after_focus(
+            || {
+                events.borrow_mut().push("focus");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("input");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), ["focus", "input"]);
+        events.borrow_mut().clear();
+        assert!(run_after_focus(
+            || {
+                events.borrow_mut().push("interrupted");
+                anyhow::bail!("stop")
+            },
+            || {
+                events.borrow_mut().push("input");
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(*events.borrow(), ["interrupted"]);
+    }
+}
+
+/// Background px-focus for the keyboard family (type_text / press_key / hotkey): focus the
 /// element at (x,y) before a keystroke — the *element px action* form of a
 /// keyboard tool. Prefer non-destructive AX focus so an existing selection is
 /// retained; the foreground rung falls back to a real pixel click when needed.
@@ -866,13 +1300,13 @@ async fn pixel_focus_landed(pid: i32, window_id: Option<u32>, x: f64, y: f64) ->
     let Some(wid) = window_id else {
         return false;
     };
-    tokio::task::spawn_blocking(move || {
+    crate::foreground_activity::spawn_blocking(move || {
         let Ok(frame) = px_frame::resolve_window_px_frame(wid) else {
             return false;
         };
         let (screen_x, screen_y, _, _) = frame.to_screen(x, y);
         unsafe {
-            let Some(focused) = crate::ax::bindings::focused_element_of_pid(pid) else {
+            let Some(focused) = crate::ax::exact_target::focused_element_in_window(pid, wid) else {
                 return false;
             };
             let rect = crate::ax::bindings::element_screen_rect(focused);
@@ -1036,7 +1470,7 @@ pub fn load_driver_config() -> DriverConfig {
 /// used by CoreGraphics input APIs. Retina scaled modes cannot rely on the
 /// nominal backing factor alone, so derive the ratio from the actual PNG.
 pub async fn desktop_screenshot_point(x: f64, y: f64) -> (f64, f64) {
-    let ratio = tokio::task::spawn_blocking(|| {
+    let ratio = crate::foreground_activity::spawn_blocking(|| {
         let logical_w = get_screen_size::main_screen_size().map(|(w, _, _)| w as f64);
         let shot_w = crate::capture::screenshot_display_bytes()
             .ok()
@@ -1242,6 +1676,9 @@ pub(crate) async fn resolve_foreground_keyboard_target(
     has_explicit_element_or_point: bool,
     app_context_route: Option<crate::ax::app_context::AppContextDelegationRoute>,
 ) -> Result<ForegroundKeyboardTarget, cua_driver_core::protocol::ToolResult> {
+    // A cross-RPC segment cannot inherit a newly observed helper/sibling as
+    // its physical keyboard destination. Its exact target is immutable.
+    crate::foreground_activity::check_segment_target(pid, window_id)?;
     if let Some(route) = app_context_route {
         let exact_target = window_id.is_some_and(|window_id| {
             route.delegation.target == crate::ax::app_context::AppContextTarget { pid, window_id }
@@ -1256,7 +1693,7 @@ pub(crate) async fn resolve_foreground_keyboard_target(
             app_context_route: Some(route),
         });
     }
-    if tokio::task::spawn_blocking(move || {
+    if crate::foreground_activity::spawn_blocking(move || {
         crate::transient_ui::is_trusted_transient_helper_process(pid)
     })
     .await
@@ -1265,7 +1702,7 @@ pub(crate) async fn resolve_foreground_keyboard_target(
         return Err(transient_ui_direct_target_refusal(pid, window_id));
     }
     let Some(source_window_id) = window_id else {
-        let detection = tokio::task::spawn_blocking(move || {
+        let detection = crate::foreground_activity::spawn_blocking(move || {
             crate::transient_ui::detect_any_visible_transient_helper_for_host(pid)
         })
         .await;
@@ -1290,12 +1727,13 @@ pub(crate) async fn resolve_foreground_keyboard_target(
     };
     let registry = state.transient_ui_registry.clone();
     let session_for_lookup = session.clone();
-    let resolution =
-        tokio::task::spawn_blocking(move || registry.resolve_live(&session_for_lookup, source))
-            .await;
+    let resolution = crate::foreground_activity::spawn_blocking(move || {
+        registry.resolve_live(&session_for_lookup, source)
+    })
+    .await;
     match resolution {
         Ok(crate::transient_ui::RouteResolution::None) => {
-            let detection = tokio::task::spawn_blocking(move || {
+            let detection = crate::foreground_activity::spawn_blocking(move || {
                 crate::transient_ui::detect_visible_transient_helper(source)
             })
             .await;
@@ -1351,6 +1789,10 @@ fn foreground_keyboard_target_from_evidence(
             })
         }
         crate::transient_ui::RouteResolution::Live(route) => {
+            crate::foreground_activity::check_segment_target(
+                route.target.pid,
+                Some(route.target.window_id),
+            )?;
             if !target_rewrite_allowed {
                 return Err(transient_ui_policy_refusal(
                     route.source.pid,
@@ -1478,7 +1920,7 @@ pub(crate) async fn guard_same_pid_transient_target(
         return Ok(());
     };
     let source = crate::transient_ui::WindowTarget { pid, window_id };
-    let detection = tokio::task::spawn_blocking(move || {
+    let detection = crate::foreground_activity::spawn_blocking(move || {
         crate::transient_ui::detect_same_pid_transient_in_front(source)
     })
     .await
@@ -1534,7 +1976,7 @@ pub(crate) async fn guard_transient_pointer_target(
     pid: i32,
     window_id: Option<u32>,
 ) -> Result<(), cua_driver_core::protocol::ToolResult> {
-    if tokio::task::spawn_blocking(move || {
+    if crate::foreground_activity::spawn_blocking(move || {
         crate::transient_ui::is_trusted_transient_helper_process(pid)
     })
     .await
@@ -1543,7 +1985,7 @@ pub(crate) async fn guard_transient_pointer_target(
         return Err(transient_ui_pointer_refusal(pid, window_id, false));
     }
     let Some(window_id) = window_id else {
-        let detection = tokio::task::spawn_blocking(move || {
+        let detection = crate::foreground_activity::spawn_blocking(move || {
             crate::transient_ui::detect_any_visible_transient_helper_for_host(pid)
         })
         .await
@@ -1562,16 +2004,17 @@ pub(crate) async fn guard_transient_pointer_target(
     let source = crate::transient_ui::WindowTarget { pid, window_id };
     let registry = state.transient_ui_registry.clone();
     let session = session.clone();
-    let resolution = tokio::task::spawn_blocking(move || registry.resolve_live(&session, source))
-        .await
-        .map_err(|error| {
-            cua_driver_core::protocol::ToolResult::error(format!(
-                "Could not revalidate transient UI before pointer delivery: {error}"
-            ))
-        })?;
+    let resolution =
+        crate::foreground_activity::spawn_blocking(move || registry.resolve_live(&session, source))
+            .await
+            .map_err(|error| {
+                cua_driver_core::protocol::ToolResult::error(format!(
+                    "Could not revalidate transient UI before pointer delivery: {error}"
+                ))
+            })?;
     match resolution {
         crate::transient_ui::RouteResolution::None => {
-            let detection = tokio::task::spawn_blocking(move || {
+            let detection = crate::foreground_activity::spawn_blocking(move || {
                 crate::transient_ui::detect_visible_transient_helper(source)
             })
             .await
@@ -1701,6 +2144,22 @@ pub fn register_all(
         host_owns_permission_ux,
         host_bundle_id,
     ));
+    // Native segment teardown is content-free and never changes focus from a
+    // session/runtime cleanup callback. In-flight workers retain their own
+    // ownership until settlement; explicit end is the only restore path.
+    registry.retain_session_end_hook(
+        cua_driver_core::session::register_scoped_fallible_session_end_hook(
+            "foreground_segments",
+            crate::foreground_activity::stop_session_segments,
+        ),
+    );
+    if let Some(runtime_scope) = cua_driver_core::tool::current_dispatch_runtime_scope() {
+        registry.retain_runtime_cleanup(move || {
+            crate::foreground_activity::stop_runtime_segments(&runtime_scope);
+        });
+    }
+    registry.register(Box::new(foreground_segment::BeginForegroundSegmentTool));
+    registry.register(Box::new(foreground_segment::EndForegroundSegmentTool));
     let cursor_outcome_reader = {
         let cursor_registry = state.cursor_registry.clone();
         cua_driver_core::session::register_scoped_cursor_outcome_reader(std::sync::Arc::new(

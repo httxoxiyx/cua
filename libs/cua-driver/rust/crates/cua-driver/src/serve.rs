@@ -21,15 +21,41 @@
 //! Source-installed local builds use the corresponding `cua-driver-local`
 //! namespace on every platform.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use cua_driver_core::daemon::{
     is_daemon_listening, send_request, socket_path_for_namespace, DaemonRequest, DaemonResponse,
     ToolObservationOrigin,
 };
 
-static ACTIVE_PROXY_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+type ProxyOwners = HashMap<String, Arc<cua_driver_core::session::TransportOwner>>;
+static ACTIVE_PROXY_SESSIONS: OnceLock<Mutex<ProxyOwners>> = OnceLock::new();
+
+struct ProxyControlSession {
+    session_id: String,
+    owner: Arc<cua_driver_core::session::TransportOwner>,
+}
+
+impl Drop for ProxyControlSession {
+    fn drop(&mut self) {
+        {
+            let mut owners = active_proxy_sessions()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if owners
+                .get(&self.session_id)
+                .is_some_and(|owner| Arc::ptr_eq(owner, &self.owner))
+            {
+                owners.remove(&self.session_id);
+            }
+        }
+        // Revoke before lifecycle cleanup. A request that already cloned this
+        // capability cannot recreate a session after the map entry is gone.
+        self.owner
+            .close(cua_driver_core::session::SessionEndReason::ProcessExit);
+    }
+}
 
 #[derive(Clone, Debug)]
 struct TrustedResumeRecord {
@@ -136,25 +162,38 @@ async fn end_trusted_connection(connection: &TrustedConnectionSession) -> Result
     Ok(())
 }
 
-fn active_proxy_sessions() -> &'static Mutex<HashSet<String>> {
-    ACTIVE_PROXY_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
+fn active_proxy_sessions() -> &'static Mutex<ProxyOwners> {
+    ACTIVE_PROXY_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn is_active_proxy_session(session: Option<&str>) -> bool {
-    session.is_some_and(|session| active_proxy_sessions().lock().unwrap().contains(session))
+    session.is_some_and(|session| {
+        active_proxy_sessions()
+            .lock()
+            .unwrap()
+            .get(session)
+            .is_some_and(|owner| owner.is_live())
+    })
 }
 
 fn begin_proxy_control_session(
-    control_session_id: &mut Option<String>,
+    control_session_id: &mut Option<ProxyControlSession>,
     requested_session_id: Option<&str>,
+    make_owner: impl FnOnce(&str) -> Arc<cua_driver_core::session::TransportOwner>,
 ) -> DaemonResponse {
-    let Some(requested_session_id) = requested_session_id.filter(|session| !session.is_empty())
-    else {
-        return DaemonResponse::err("session_begin requires a non-empty session_id", 65);
+    // The existing proxy mints mcp-* envelope identities. Reserving that
+    // namespace makes a post-EOF request recognizable without retaining an
+    // unbounded set of dead transport ids. Public `session` labels are separate.
+    let Some(requested_session_id) = requested_session_id.filter(|session| {
+        session
+            .strip_prefix("mcp-")
+            .is_some_and(|id| !id.is_empty())
+    }) else {
+        return DaemonResponse::err("session_begin requires a proxy-minted mcp-* session_id", 65);
     };
 
-    if let Some(bound_session_id) = control_session_id.as_deref() {
-        if bound_session_id != requested_session_id {
+    if let Some(bound) = control_session_id.as_ref() {
+        if bound.session_id != requested_session_id || !bound.owner.is_live() {
             return DaemonResponse::err(
                 "a control connection cannot change its bound session_id",
                 65,
@@ -163,12 +202,49 @@ fn begin_proxy_control_session(
         return DaemonResponse::ok(serde_json::json!({"session_begin": true}));
     }
 
-    *control_session_id = Some(requested_session_id.to_owned());
-    active_proxy_sessions()
-        .lock()
-        .unwrap()
-        .insert(requested_session_id.to_owned());
+    let mut owners = active_proxy_sessions().lock().unwrap();
+    if owners.contains_key(requested_session_id) {
+        return DaemonResponse::err(
+            "proxy session already belongs to another control connection",
+            65,
+        );
+    }
+    let owner = make_owner(requested_session_id);
+    owners.insert(requested_session_id.to_owned(), Arc::clone(&owner));
+    *control_session_id = Some(ProxyControlSession {
+        session_id: requested_session_id.to_owned(),
+        owner,
+    });
     DaemonResponse::ok(serde_json::json!({"session_begin": true}))
+}
+
+fn proxy_owner_for_request(
+    request: &DaemonRequest,
+) -> Result<Option<Arc<cua_driver_core::session::TransportOwner>>, &'static str> {
+    let owner = request.session_id.as_deref().and_then(|session| {
+        active_proxy_sessions()
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned()
+    });
+    if let Some(owner) = owner {
+        if !owner.is_live() {
+            return Err("proxy transport owner has ended");
+        }
+        return Ok(Some(owner));
+    }
+    if matches!(
+        request.observation_origin,
+        Some(ToolObservationOrigin::McpProxy)
+    ) || request
+        .session_id
+        .as_deref()
+        .is_some_and(|session| session.starts_with("mcp-"))
+    {
+        return Err("proxy transport owner is not registered or has ended");
+    }
+    Ok(None)
 }
 
 fn renew_proxy_control_session(
@@ -534,6 +610,17 @@ fn observe_daemon_error(
 }
 
 async fn invoke_daemon_tool(
+    sdk: &std::sync::Arc<crate::sdk_adapter::SdkAdapter>,
+    req: DaemonRequest,
+) -> DaemonResponse {
+    match proxy_owner_for_request(&req) {
+        Ok(Some(owner)) => owner.scope(invoke_daemon_tool_inner(sdk, req)).await,
+        Ok(None) => invoke_daemon_tool_inner(sdk, req).await,
+        Err(error) => DaemonResponse::err(error, 77),
+    }
+}
+
+async fn invoke_daemon_tool_inner(
     sdk: &std::sync::Arc<crate::sdk_adapter::SdkAdapter>,
     req: DaemonRequest,
 ) -> DaemonResponse {
@@ -1062,7 +1149,7 @@ pub async fn run_serve(
                     // their immediate EOF triggers NO teardown. When a control
                     // connection EOFs (graceful proxy exit OR kill -9, both
                     // kernel-guaranteed), the post-loop block reaps the session.
-                    let mut control_session_id: Option<String> = None;
+                    let mut control_session_id: Option<ProxyControlSession> = None;
                     let mut trusted_session: Option<TrustedConnectionSession> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
@@ -1346,6 +1433,7 @@ pub async fn run_serve(
                                 let resp = begin_proxy_control_session(
                                     &mut control_session_id,
                                     req.session_id.as_deref(),
+                                    |session| reg.transport_owner(session),
                                 );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -1354,7 +1442,7 @@ pub async fn run_serve(
                             "session_heartbeat" => {
                                 let resp = renew_proxy_control_session(
                                     &reg,
-                                    control_session_id.as_deref(),
+                                    control_session_id.as_ref().map(|binding| binding.session_id.as_str()),
                                     req.session_id.as_deref(),
                                 );
                                 let _ = writer.write_all(
@@ -1404,10 +1492,7 @@ pub async fn run_serve(
                     // their (immediate) EOF is a no-op here. fire_session_end is
                     // idempotent, so racing a legacy explicit session_end is
                     // benign.
-                    if let Some(sid) = control_session_id {
-                        active_proxy_sessions().lock().unwrap().remove(&sid);
-                        reg.end_transport_sessions(&sid);
-                    }
+                    drop(control_session_id);
                     if let Some(connection) = trusted_session {
                         detach_trusted_connection(&trusted_resume_registry, connection).await;
                     }
@@ -1809,7 +1894,7 @@ pub async fn run_serve(
                     // EOF reaper. Named-pipe peer death surfaces as
                     // ERROR_BROKEN_PIPE on the next read, ending the while-let
                     // loop equally reliably.
-                    let mut control_session_id: Option<String> = None;
+                    let mut control_session_id: Option<ProxyControlSession> = None;
                     let mut trusted_session: Option<TrustedConnectionSession> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
@@ -2071,6 +2156,7 @@ pub async fn run_serve(
                                 let resp = begin_proxy_control_session(
                                     &mut control_session_id,
                                     req.session_id.as_deref(),
+                                    |session| reg.transport_owner(session),
                                 );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -2079,7 +2165,7 @@ pub async fn run_serve(
                             "session_heartbeat" => {
                                 let resp = renew_proxy_control_session(
                                     &reg,
-                                    control_session_id.as_deref(),
+                                    control_session_id.as_ref().map(|binding| binding.session_id.as_str()),
                                     req.session_id.as_deref(),
                                 );
                                 let _ = writer.write_all(
@@ -2118,10 +2204,7 @@ pub async fn run_serve(
                     // was the proxy's control connection (see the unix branch for
                     // the full rationale). Per-call connections leave
                     // control_session_id None.
-                    if let Some(sid) = control_session_id {
-                        active_proxy_sessions().lock().unwrap().remove(&sid);
-                        reg.end_transport_sessions(&sid);
-                    }
+                    drop(control_session_id);
                     if let Some(connection) = trusted_session {
                         detach_trusted_connection(&trusted_resume_registry, connection).await;
                     }
@@ -2652,7 +2735,7 @@ mod gate_tests {
         });
         wait_for_socket(&socket).await;
 
-        let sid = "heartbeat-integration-session";
+        let sid = "mcp-heartbeat-integration-session";
         let stream = tokio::net::UnixStream::connect(&socket)
             .await
             .expect("connect control socket");
@@ -3165,10 +3248,31 @@ mod service_authorization_status_tests {
 mod session_boundary_tests {
     use super::{
         active_proxy_sessions, apply_session_identity, begin_proxy_control_session,
-        inject_browser_approvals,
+        inject_browser_approvals, proxy_owner_for_request, DaemonRequest, ProxyControlSession,
+        ToolObservationOrigin,
     };
     use cua_driver_core::browser::download::MCP_HOST_DOWNLOAD_APPROVAL_ARG;
     use serde_json::json;
+
+    fn begin_control(
+        bound: &mut Option<ProxyControlSession>,
+        session: Option<&str>,
+    ) -> super::DaemonResponse {
+        begin_proxy_control_session(bound, session, |id| {
+            cua_driver_core::session::TransportOwner::new(format!("proxy-boundary-test:{id}"))
+        })
+    }
+
+    fn proxy_call(session: &str, origin: Option<ToolObservationOrigin>) -> DaemonRequest {
+        DaemonRequest {
+            method: "call".into(),
+            name: Some("press_key".into()),
+            args: Some(json!({})),
+            session_id: Some(session.into()),
+            observation_origin: origin,
+            client_kind: None,
+        }
+    }
 
     #[test]
     fn explicit_session_becomes_session_id_and_is_returned() {
@@ -3220,44 +3324,101 @@ mod session_boundary_tests {
 
     #[test]
     fn browser_download_approval_requires_a_live_proxy_session() {
-        let session = "approval-boundary-test";
+        let session = "mcp-approval-boundary-test";
         let mut raw_download = json!({"destination_root": "/private/path"});
         inject_browser_approvals("browser_download", &mut raw_download, Some(session));
         assert!(raw_download.get(MCP_HOST_DOWNLOAD_APPROVAL_ARG).is_none());
 
-        active_proxy_sessions()
-            .lock()
-            .unwrap()
-            .insert(session.to_owned());
+        let mut bound = None;
+        assert!(begin_control(&mut bound, Some(session)).ok);
         let mut proxy_download = json!({"destination_root": "/private/path"});
         inject_browser_approvals("browser_download", &mut proxy_download, Some(session));
-        active_proxy_sessions().lock().unwrap().remove(session);
+        drop(bound);
         assert_eq!(proxy_download[MCP_HOST_DOWNLOAD_APPROVAL_ARG], true);
     }
 
     #[test]
     fn control_connection_binds_one_immutable_nonempty_session() {
-        let first = "control-boundary-first";
-        let second = "control-boundary-second";
+        let first = "mcp-control-boundary-first";
+        let second = "mcp-control-boundary-second";
         let mut bound = None;
 
-        let missing = begin_proxy_control_session(&mut bound, None);
+        let missing = begin_control(&mut bound, None);
         assert!(!missing.ok);
         assert!(bound.is_none());
+        assert!(!begin_control(&mut bound, Some("sdk-not-a-proxy-owner")).ok);
 
-        let established = begin_proxy_control_session(&mut bound, Some(first));
+        let established = begin_control(&mut bound, Some(first));
         assert!(established.ok);
-        assert_eq!(bound.as_deref(), Some(first));
-        assert!(active_proxy_sessions().lock().unwrap().contains(first));
+        assert_eq!(
+            bound.as_ref().map(|binding| binding.session_id.as_str()),
+            Some(first)
+        );
+        assert!(active_proxy_sessions().lock().unwrap().contains_key(first));
 
-        let repeated = begin_proxy_control_session(&mut bound, Some(first));
+        let repeated = begin_control(&mut bound, Some(first));
         assert!(repeated.ok, "repeating the same binding is idempotent");
 
-        let rebound = begin_proxy_control_session(&mut bound, Some(second));
+        let rebound = begin_control(&mut bound, Some(second));
         assert!(!rebound.ok, "a live control connection cannot change owner");
-        assert_eq!(bound.as_deref(), Some(first));
-        assert!(!active_proxy_sessions().lock().unwrap().contains(second));
+        assert_eq!(
+            bound.as_ref().map(|binding| binding.session_id.as_str()),
+            Some(first)
+        );
+        assert!(!active_proxy_sessions().lock().unwrap().contains_key(second));
 
-        active_proxy_sessions().lock().unwrap().remove(first);
+        let mut duplicate = None;
+        assert!(!begin_control(&mut duplicate, Some(first)).ok);
+        assert!(duplicate.is_none());
+        drop(bound);
+        assert!(!active_proxy_sessions().lock().unwrap().contains_key(first));
+    }
+
+    #[test]
+    fn proxy_owner_eof_rejects_late_lookup_and_revokes_admitted_capability() {
+        let session = "mcp-owner-boundary-eof";
+        let mut bound = None;
+        assert!(begin_control(&mut bound, Some(session)).ok);
+        let request = proxy_call(session, Some(ToolObservationOrigin::McpProxy));
+        let admitted = proxy_owner_for_request(&request).unwrap().unwrap();
+        assert!(admitted.is_live());
+        drop(bound);
+        assert!(!admitted.is_live(), "an earlier lookup must see revocation");
+        assert!(proxy_owner_for_request(&request).is_err());
+        assert!(
+            proxy_owner_for_request(&proxy_call(session, None)).is_err(),
+            "legacy proxy calls cannot fall through as direct calls after EOF"
+        );
+        assert!(
+            proxy_owner_for_request(&proxy_call(
+                "missing-proxy",
+                Some(ToolObservationOrigin::McpProxy)
+            ))
+            .is_err(),
+            "a caller-supplied provenance field cannot mint a live capability"
+        );
+        assert!(proxy_owner_for_request(&proxy_call(
+            "sdk-direct-owner",
+            Some(ToolObservationOrigin::Direct)
+        ))
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn proxy_owner_eof_does_not_revoke_another_control_connection() {
+        let first = "mcp-owner-boundary-isolation-first";
+        let second = "mcp-owner-boundary-isolation-second";
+        let mut first_bound = None;
+        let mut second_bound = None;
+        assert!(begin_control(&mut first_bound, Some(first)).ok);
+        assert!(begin_control(&mut second_bound, Some(second)).ok);
+        drop(first_bound);
+        assert!(proxy_owner_for_request(&proxy_call(first, None)).is_err());
+        assert!(proxy_owner_for_request(&proxy_call(second, None))
+            .unwrap()
+            .unwrap()
+            .is_live());
+        drop(second_bound);
     }
 }

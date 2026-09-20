@@ -270,7 +270,7 @@ impl Tool for PressKeyTool {
             let key = input.key;
             let modifiers = input.modifiers.unwrap_or_default();
             let key_for_input = key.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = crate::foreground_activity::spawn_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_bare_global(&key_for_input, &modifier_refs)
             })
@@ -356,11 +356,34 @@ impl Tool for PressKeyTool {
             );
         }
 
+        let window_return_candidate = !fg
+            && std::env::var("CUA_EXPERIMENTAL_CHROME_WINDOW_RETURN").as_deref() == Ok("1")
+            && key.eq_ignore_ascii_case("return")
+            && modifiers.is_empty()
+            && px.is_none()
+            && py.is_none();
+        // Diagnostics own only bounded in-memory phase records. This owner
+        // flushes after the request/worker outcome, never between key down/up.
+        let trace_request = window_return_candidate.then(|| {
+            crate::input::return_trace::TraceRequest::new(
+                "return",
+                requested_pid,
+                window_id.unwrap_or(0),
+            )
+        });
+        let trace = trace_request
+            .as_ref()
+            .map(|request| request.trace())
+            .unwrap_or_else(crate::input::return_trace::Trace::disabled);
+
         // Revalidate before either background gating or foreground activation.
         // A same-process modal can appear after observation, so a retained host
         // target must redirect before any key transition is sent.
-        if let Err(refusal) = super::guard_same_pid_transient_target(requested_pid, window_id).await
-        {
+        let transient_span = trace.begin("transient_guard");
+        let transient_result =
+            super::guard_same_pid_transient_target(requested_pid, window_id).await;
+        transient_span.finish(transient_result.is_ok());
+        if let Err(refusal) = transient_result {
             return refusal;
         }
 
@@ -401,7 +424,8 @@ impl Tool for PressKeyTool {
         // needs to run under suppression, the cache lookup does not.
         // Retain out of the cache so a concurrent get_window_state can't free
         // the element before the suppressed focus below dereferences it
-        // (use-after-free → daemon crash). Guard lives to method end.
+        // (use-after-free → daemon crash). Each blocking worker owns a guard:
+        // cancelling this async request must not free a detached worker's target.
         let pre_focus_guard = if let (Some(idx), Some(wid), Some(snapshot_id)) =
             (element_index, window_id, snapshot_id)
         {
@@ -425,6 +449,7 @@ impl Tool for PressKeyTool {
             None
         };
         let pre_focus_ptr: Option<usize> = pre_focus_guard.as_ref().map(|g| g.as_ptr());
+        trace.event("retained_target_resolved");
         if let Some(element_ptr) = pre_focus_ptr {
             if unsafe {
                 super::ensure_app_context_element_window(
@@ -435,6 +460,206 @@ impl Tool for PressKeyTool {
             .is_err()
             {
                 return super::app_context_delegation_stale_refusal();
+            }
+        }
+
+        // Independent candidate: keep the ordinary GenericKey singleton gate,
+        // but deliver a window-tagged Return without preparing or restoring
+        // any app-local focus. Failure never falls through to another route.
+        if window_return_candidate {
+            let (Some(wid), Some(idx), Some(snapshot), Some(field)) = (
+                window_id,
+                element_index,
+                snapshot_id,
+                pre_focus_guard.as_ref(),
+            ) else {
+                return ToolResult::error(
+                    "window-tagged Return requires an explicit fresh field token and exact window",
+                )
+                .with_structured(serde_json::json!({
+                    "code": "experimental_window_return_target_required", "effect": "refused",
+                    "key_attempted": false, "cleanup_confirmed": true, "retryable": false,
+                }));
+            };
+            let gate_span = trace.begin("generic_key_gate");
+            let gate_result = super::gate_background_window_action(
+                pid,
+                wid,
+                pre_focus_ptr,
+                cua_driver_core::background_input::BackgroundAction::GenericKey,
+            )
+            .await;
+            gate_span.finish(gate_result.is_ok());
+            let lease = match gate_result {
+                Ok(lease) => lease,
+                Err(refusal) => return refusal,
+            };
+            let state = Arc::clone(&self.state);
+            let field = field.clone();
+            let field_ptr = field.as_ptr();
+            let worker_trace = trace.clone();
+            let outcome = crate::foreground_activity::spawn_blocking(move || {
+                // A cancelled async caller may drop its stack while this
+                // worker still owes the paired key-up. Keep the flush owner
+                // here so log I/O cannot land inside that owned key interval.
+                let _trace_request = trace_request;
+                let _lease = lease;
+                worker_trace.event("worker_entered");
+                let outcome = crate::input::keyboard::experimental_chrome_window_return(
+                    pid,
+                    wid,
+                    &field,
+                    &worker_trace,
+                    || {
+                        crate::foreground_activity::check_request()?;
+                        let live = state
+                            .element_cache
+                            .get_element_retained_for_snapshot(pid, wid, snapshot, idx)
+                            .ok_or_else(|| anyhow::anyhow!("window-tagged Return token expired"))?;
+                        if live.as_ptr() != field_ptr {
+                            anyhow::bail!("window-tagged Return field identity changed");
+                        }
+                        super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
+                        unsafe {
+                            super::ensure_app_context_element_window(
+                                app_context_route.as_ref(),
+                                field_ptr as AXUIElementRef,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                );
+                worker_trace.event(match &outcome {
+                    Ok(_) => "worker_posted_pair",
+                    Err(failure) if failure.key_attempted => "worker_posted_outcome_unconfirmed",
+                    Err(_) => "worker_refused_before_post",
+                });
+                outcome
+            })
+            .await;
+            return match outcome {
+                Ok(Ok(proof)) => ToolResult::text(
+                    "Window-tagged background Return posted once without focus preparation; verify the exact page effect.",
+                ).with_structured(serde_json::json!({
+                    "path": "experimental_chrome_window_return",
+                    "pid": proof.pid, "window_id": proof.window_id,
+                    "effect": "unverifiable", "verified": false,
+                    "key_attempted": proof.key_attempted,
+                    "cleanup_confirmed": proof.cleanup_confirmed,
+                    "focus_preparation": "none",
+                })).with_action_record(action_record(false, false)),
+                Ok(Err(failure)) => ToolResult::error(format!(
+                    "Window-tagged background Return stopped at {}: {}. No replay or focus fallback.",
+                    failure.stage, failure.error,
+                )).with_structured(serde_json::json!({
+                    "code": "experimental_window_return_stopped",
+                    "stage": failure.stage, "reason": failure.error,
+                    "effect": if failure.key_attempted { "unverifiable" } else { "refused" },
+                    "key_attempted": failure.key_attempted,
+                    "cleanup_confirmed": failure.cleanup_confirmed,
+                    "retryable": false, "replay_safe": false,
+                })),
+                Err(error) => ToolResult::error(format!(
+                    "Window-tagged background Return worker failed: {error}; no replay is safe.",
+                )).with_structured(serde_json::json!({
+                    "code": "experimental_window_return_worker_failed",
+                    "effect": "unverifiable", "cleanup_confirmed": false,
+                    "retryable": false, "replay_safe": false,
+                })),
+            };
+        }
+
+        // Candidate-only feasibility route. Production retains its existing
+        // singleton gate until exact multi-window Chrome delivery is qualified.
+        // This opt-in does not admit generic keys, implicit fields, or HID.
+        if !fg
+            && std::env::var("CUA_EXPERIMENTAL_CHROME_BACKGROUND_RETURN").as_deref() == Ok("1")
+            && key.eq_ignore_ascii_case("return")
+            && modifiers.is_empty()
+            && px.is_none()
+            && py.is_none()
+        {
+            if let (Some(wid), Some(idx), Some(snapshot), Some(field)) = (
+                window_id,
+                element_index,
+                snapshot_id,
+                pre_focus_guard.as_ref(),
+            ) {
+                // This gate authorizes only exact AX preparation. The helper
+                // independently checks its narrower target-only key capability
+                // before posting, under the same retained mutation lease.
+                let lease = match super::gate_background_window_action(
+                    pid,
+                    wid,
+                    pre_focus_ptr,
+                    cua_driver_core::background_input::BackgroundAction::AxSemantic,
+                )
+                .await
+                {
+                    Ok(lease) => lease,
+                    Err(refusal) => return refusal,
+                };
+                let state = Arc::clone(&self.state);
+                let field = field.clone();
+                let field_ptr = field.as_ptr();
+                let outcome = crate::foreground_activity::spawn_blocking(move || {
+                    let _lease = lease;
+                    crate::input::keyboard::experimental_chrome_background_return(
+                        pid,
+                        wid,
+                        &field,
+                        || {
+                            crate::foreground_activity::check_request()?;
+                            let live = state
+                                .element_cache
+                                .get_element_retained_for_snapshot(pid, wid, snapshot, idx)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("background Return element token expired")
+                                })?;
+                            if live.as_ptr() != field_ptr {
+                                anyhow::bail!("background Return element identity changed");
+                            }
+                            super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
+                            unsafe {
+                                super::ensure_app_context_element_window(
+                                    app_context_route.as_ref(),
+                                    field_ptr as AXUIElementRef,
+                                )?;
+                            }
+                            Ok(())
+                        },
+                    )
+                })
+                .await;
+                return match outcome {
+                    Ok(Ok(proof)) => ToolResult::text(
+                        "Experimental background Return attempted once; inspect the exact target to verify its effect.",
+                    ).with_structured(serde_json::json!({
+                        "path": "experimental_chrome_background_return",
+                        "pid": proof.pid, "window_id": proof.window_id,
+                        "effect": "unverifiable", "verified": false,
+                        "key_attempted": proof.key_attempted,
+                        "cleanup_confirmed": proof.cleanup_confirmed,
+                        "ax_context_restored": proof.ax_context_restored,
+                    })).with_action_record(action_record(false, false)),
+                    Ok(Err(failure)) => ToolResult::error(format!(
+                        "Experimental background Return stopped at {}: {}. Do not replay; inspect the target.",
+                        failure.stage, failure.error,
+                    )).with_structured(serde_json::json!({
+                        "code": "experimental_background_return_stopped",
+                        "stage": failure.stage, "reason": failure.error,
+                        "effect": "unverifiable", "key_attempted": failure.key_attempted,
+                        "cleanup_confirmed": failure.cleanup_confirmed,
+                        "cleanup_error": failure.cleanup_error, "replay_safe": false,
+                    })),
+                    Err(error) => ToolResult::error(format!(
+                        "Experimental background Return worker failed: {error}; no replay is safe.",
+                    )).with_structured(serde_json::json!({
+                        "code": "experimental_background_return_worker_failed",
+                        "effect": "unverifiable", "cleanup_confirmed": false,
+                        "replay_safe": false,
+                    })),
+                };
             }
         }
 
@@ -465,21 +690,35 @@ impl Tool for PressKeyTool {
             None
         };
 
-        // px form: pixel-click to focus, then the key goes to the focused element.
-        // Reuses click's translation + delivery_mode; after it, deliver via the
-        // plain background path (the focus-click already handled fronting if fg).
+        // Foreground coordinates are only prepared here. Focus and key delivery
+        // run together inside the one activation Episode below.
+        let mut foreground_pixel_focus = None;
         let coordinate_focus = if let (Some(cx), Some(cy)) = (px, py) {
             let from_zoom = args
                 .get("from_zoom")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if let Err(e) = super::focus_by_pixel(
+            if fg {
+                match super::prepare_foreground_pixel_focus(
+                    &self.state,
+                    pid,
+                    window_id,
+                    cx,
+                    cy,
+                    from_zoom,
+                )
+                .await
+                {
+                    Ok(plan) => foreground_pixel_focus = Some(plan),
+                    Err(error) => return error,
+                }
+            } else if let Err(e) = super::focus_by_pixel(
                 &self.state,
                 pid,
                 window_id,
                 cx,
                 cy,
-                fg,
+                false,
                 args.opt_str("session"),
                 args.opt_str("_session_id"),
                 from_zoom,
@@ -520,10 +759,11 @@ impl Tool for PressKeyTool {
             "press_key.CGEvent",
             || async move {
                 let pre_focus_app_context_route = app_context_route.clone();
-                // Pre-focus the element while the snapshot lease is active so
-                // its side-effects remain covered.
-                if let Some(element_ptr) = pre_focus_ptr {
-                    let focus_result = tokio::task::spawn_blocking(move || {
+                // Foreground focus belongs inside the bounded activation below;
+                // never write focus first and only then check the idle lease.
+                if let Some(element) = pre_focus_guard.as_ref().filter(|_| !fg).cloned() {
+                    let focus_result = crate::foreground_activity::spawn_blocking(move || {
+                        let element_ptr = element.as_ptr();
                         super::ensure_app_context_delegation_live(
                             pre_focus_app_context_route.as_ref(),
                         )?;
@@ -536,13 +776,20 @@ impl Tool for PressKeyTool {
                         crate::input::ax_actions::focus_element(element_ptr)
                     })
                     .await;
-                    if let Ok(Err(error)) = focus_result {
-                        return Ok(Err(error));
+                    match focus_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Ok(Err(error)),
+                        Err(error) => return Err(error),
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 }
 
-                tokio::task::spawn_blocking(move || {
+                crate::foreground_activity::spawn_blocking(move || {
+                    // Keep the retained target in the worker until all native
+                    // dispatch and read-back have settled, even if JoinHandle
+                    // ownership disappears when the caller is cancelled.
+                    let _pre_focus_guard = pre_focus_guard;
+                    let pre_focus_ptr = _pre_focus_guard.as_ref().map(|element| element.as_ptr());
                     super::ensure_app_context_delegation_live(app_context_route.as_ref())?;
                     if let Some(element_ptr) = pre_focus_ptr {
                         unsafe {
@@ -568,16 +815,16 @@ impl Tool for PressKeyTool {
                             )
                         })?;
                         return dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                            let key_action = || {
+                            let key_action = || super::with_prepared_foreground_focus(foreground_pixel_focus, || {
                                 // Activation can change the first responder, so
-                                // repeat the best-effort AX focus write inside
+                                // perform the best-effort AX focus write inside
                                 // the guarded foreground interval immediately
                                 // before the physical key transition.
                                 if let Some(element_ptr) = pre_focus_ptr {
-                                    let _ = crate::input::ax_actions::focus_element(element_ptr);
+                                    crate::input::ax_actions::focus_element(element_ptr)?;
                                 }
                                 crate::input::keyboard::press_key_global(&key, &m)
-                            };
+                            });
                             crate::input::skylight::with_foreground_keyboard_target_activation_routed(
                                 pid as libc::pid_t,
                                 wid,

@@ -175,6 +175,8 @@ fn is_scoped_action(tool_name: &str) -> bool {
             | "press_key"
             | "hotkey"
             | "set_value"
+            | "begin_foreground_segment"
+            | "end_foreground_segment"
     )
 }
 

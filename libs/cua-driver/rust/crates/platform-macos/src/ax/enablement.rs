@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use super::bindings::{enable_chromium_accessibility, AXUIElementRef};
+use super::bindings::{enable_chromium_accessibility_traced, AXUIElementRef};
+use crate::input::return_trace::TraceRequest;
 
 /// How long to let a freshly-enabled Chromium/Electron app build its
 /// web-content AX tree before we read it. Paid at most once per process
@@ -68,16 +69,27 @@ fn cached_lifetime_is_current(
 ///
 /// `app_element` must be a valid application `AXUIElementRef` for `pid`.
 pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) {
+    let trace_request = TraceRequest::new("ax_enablement", pid, 0);
+    let trace = trace_request.trace();
     let stamp = process_start_stamp(pid);
+    trace.event(if stamp.is_some() {
+        "process_stamp_available"
+    } else {
+        "process_stamp_unavailable"
+    });
     let already_enabled = enabled_processes()
         .lock()
         .map(|cache| cached_lifetime_is_current(cache.get(&pid), stamp))
         .unwrap_or(false);
     if already_enabled {
+        trace.event("cache_hit");
         return;
     }
-    if enable_chromium_accessibility(app_element) {
+    trace.event("cache_miss");
+    if enable_chromium_accessibility_traced(app_element, &trace) {
+        let settle = trace.begin("settle");
         crate::permissions::panel::pump_run_loop_briefly(CHROMIUM_SETTLE_SECONDS);
+        settle.finish(true);
         if let Ok(mut cache) = enabled_processes().lock() {
             cache.insert(pid, stamp);
         }

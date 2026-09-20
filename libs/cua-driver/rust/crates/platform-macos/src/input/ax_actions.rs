@@ -33,6 +33,12 @@ pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
         if is_selectable_container_role(&role)
             && unsafe { copy_bool_attr(current, "AXSelected") }.is_some()
         {
+            if crate::foreground_activity::check_request().is_err() {
+                if owns_current {
+                    unsafe { CFRelease(current as CFTypeRef) };
+                }
+                return None;
+            }
             let err = unsafe { set_bool_attr_true(current, "AXSelected") };
             if err == kAXErrorSuccess
                 && unsafe { copy_bool_attr(current, "AXSelected") } == Some(true)
@@ -221,6 +227,7 @@ pub fn ensure_ax_action_enabled(element_ptr: usize, action: &str) -> anyhow::Res
 pub fn perform_ax_action(element_ptr: usize, action: &str) -> anyhow::Result<()> {
     let ax_action = map_action(action);
     ensure_ax_action_enabled(element_ptr, ax_action)?;
+    crate::foreground_activity::check_request()?;
     let err = unsafe { perform_action(element_ptr as AXUIElementRef, ax_action) };
 
     if err == kAXErrorSuccess {
@@ -274,6 +281,7 @@ mod tests {
 
 /// Set AXFocused=true on an element (for pre-focusing before key press).
 pub fn focus_element(element_ptr: usize) -> anyhow::Result<()> {
+    crate::foreground_activity::check_request()?;
     let err = unsafe { set_bool_attr_true(element_ptr as AXUIElementRef, "AXFocused") };
     if err == kAXErrorSuccess {
         Ok(())
@@ -309,6 +317,7 @@ pub fn is_element_focused(pid: i32, element_ptr: usize) -> bool {
 
 /// Set the AXValue of an element (for dropdowns, text fields, etc.).
 pub fn set_ax_value(element_ptr: usize, value: &str) -> anyhow::Result<()> {
+    crate::foreground_activity::check_request()?;
     let err = unsafe { set_string_attr(element_ptr as AXUIElementRef, "AXValue", value) };
     if err == kAXErrorSuccess {
         Ok(())

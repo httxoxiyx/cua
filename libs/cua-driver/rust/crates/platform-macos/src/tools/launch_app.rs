@@ -228,7 +228,7 @@ impl Tool for LaunchAppTool {
         // blocking task returns (pid, app_info, windows). Suppression
         // upgrade happens AFTER the blocking call returns (back on the
         // async runtime), then we sleep holding the targeted lease.
-        let launch_result = tokio::task::spawn_blocking(move || {
+        let launch_result = crate::foreground_activity::spawn_blocking(move || {
             let pid = if let Some(ref bid) = bundle_id {
                 if urls.is_empty()
                     && additional_arguments.is_empty()
