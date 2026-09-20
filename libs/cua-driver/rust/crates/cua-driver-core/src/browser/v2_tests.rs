@@ -63,6 +63,12 @@ struct FixtureState {
     viewport_css_width: f64,
     viewport_css_height: f64,
     tab_visible: bool,
+    dom_fill_result: Option<Value>,
+    dom_fill_fails: bool,
+    isolated_world_unavailable: bool,
+    isolated_context_id: Option<Value>,
+    navigate_during_world_creation: bool,
+    isolated_node_missing: bool,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -89,6 +95,12 @@ impl Default for FixtureState {
             viewport_css_width: 800.0,
             viewport_css_height: 600.0,
             tab_visible: true,
+            dom_fill_result: None,
+            dom_fill_fails: false,
+            isolated_world_unavailable: false,
+            isolated_context_id: None,
+            navigate_during_world_creation: false,
+            isolated_node_missing: false,
             calls: Vec::new(),
         }
     }
@@ -648,9 +660,45 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             | "Emulation.setFocusEmulationEnabled"
             | "Input.dispatchMouseEvent"
             | "Input.insertText" => MockReply::ok(json!({})),
+            "Page.createIsolatedWorld" => {
+                if st.isolated_world_unavailable {
+                    MockReply::method_not_found("Page.createIsolatedWorld")
+                } else {
+                    if st.navigate_during_world_creation {
+                        st.main_loader = "L_MAIN_CHANGED".into();
+                    }
+                    MockReply::ok(json!({
+                        "executionContextId": st.isolated_context_id.clone()
+                            .unwrap_or_else(|| json!(if is_oopif { 302 } else { 301 }))
+                    }))
+                }
+            }
+            "DOM.resolveNode"
+                if st.isolated_node_missing && call.params.get("executionContextId").is_some() =>
+            {
+                MockReply::err(-32000, "No node in this isolated world")
+            }
             "DOM.resolveNode" => MockReply::ok(json!({
                 "object": { "objectId": format!("obj-{}", call.params["backendNodeId"]) }
             })),
+            "Runtime.callFunctionOn"
+                if call.params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|script| script.contains("mutationAttempted")) =>
+            {
+                if st.dom_fill_fails {
+                    MockReply::err(-32000, "DOM fill reply lost after possible dispatch")
+                } else {
+                    MockReply::ok(st.dom_fill_result.clone().unwrap_or_else(|| {
+                        json!({
+                            "result": {"value": {
+                                "status": "ok", "mutation_attempted": true,
+                                "value_matches": true, "events_dispatched": ["input", "change"]
+                            }}
+                        })
+                    }))
+                }
+            }
             "Runtime.callFunctionOn" => MockReply::ok(json!({ "result": { "value": true } })),
             other => MockReply::method_not_found(other),
         }
@@ -2273,6 +2321,375 @@ async fn oopif_capability_regression_refuses_rather_than_reroutes() {
 }
 
 // ── Typing routes ────────────────────────────────────────────────────────────
+
+fn dom_fill_args(target: &str, tab: &str, ext_ref: &str) -> Value {
+    json!({
+        "target_id": target, "tab_id": tab, "ref": ext_ref,
+        "text": "New York", "session": SESSION,
+        "input_route": "dom_event", "mode": "insert_text", "replace": true,
+    })
+}
+
+fn assert_no_dom_fill_focus_or_input(f: &Fixture) {
+    for method in [
+        "DOM.focus",
+        "DOM.scrollIntoViewIfNeeded",
+        "DOM.getBoxModel",
+        "Input.insertText",
+        "Input.dispatchKeyEvent",
+        "Input.dispatchMouseEvent",
+        "Emulation.setFocusEmulationEnabled",
+        "Page.bringToFront",
+        "Target.activateTarget",
+    ] {
+        assert!(recorded_calls(f, method).is_empty(), "unexpected {method}");
+    }
+}
+
+#[tokio::test]
+async fn dom_fill_uses_exact_isolated_world_without_focus_or_input() {
+    let f = fixture_with_platform(|_| {}, true).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let ext_ref = ref_of(&snap, "main", "Shadow Input");
+    f.state.lock().unwrap().calls.clear();
+    let text = "'quoted' \"text\" \n\u{1f680}";
+    let mut args = dom_fill_args(&target, &tab, &ext_ref);
+    args["text"] = json!(text);
+    let result = BrowserTypeTool::new(f.engine.clone()).invoke(args).await;
+    let value = structured(&result);
+    assert_eq!(value["status"], "ok", "{value}");
+    assert_eq!(value["effect"], "unverifiable");
+    assert_eq!(value["input_trust"], "dom_event");
+    assert_eq!(value["route"], "dom_event");
+    assert_eq!(value["value_matches"], true);
+    assert_eq!(value["retryable"], false);
+    let worlds = recorded_calls(&f, "Page.createIsolatedWorld");
+    assert_eq!(worlds.len(), 1);
+    assert_eq!(worlds[0].1["frameId"], "F_MAIN");
+    assert_eq!(worlds[0].1["grantUniveralAccess"], false);
+    let nodes = recorded_calls(&f, "DOM.resolveNode");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].1["backendNodeId"], 20);
+    assert_eq!(nodes[0].1["executionContextId"], 301);
+    let calls = recorded_calls(&f, "Runtime.callFunctionOn");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, worlds[0].0);
+    assert_eq!(calls[0].1["objectId"], "obj-20");
+    assert_eq!(calls[0].1["arguments"][0]["value"], text);
+    assert_eq!(calls[0].1["userGesture"], false);
+    let script = calls[0].1["functionDeclaration"].as_str().unwrap();
+    assert!(
+        !script.contains(text),
+        "text must not become executable source"
+    );
+    for forbidden in [
+        ".focus(",
+        "defaultView",
+        "Input.",
+        "bringToFront",
+        "contentEditable =",
+    ] {
+        assert!(!script.contains(forbidden), "unexpected {forbidden}");
+    }
+    for required in [
+        "this.ownerDocument !== document",
+        "this.isConnected",
+        "HTMLInputElement.prototype",
+        "HTMLTextAreaElement.prototype",
+        "Object.getOwnPropertyDescriptor",
+        "descriptor.set.call(this, text)",
+        "descriptor.get.call(this)",
+        "EventTarget.prototype.dispatchEvent",
+        "new Event('input'",
+        "new Event('change'",
+        "this.readOnly",
+    ] {
+        assert!(script.contains(required), "missing {required}");
+    }
+    assert_no_dom_fill_focus_or_input(&f);
+}
+
+#[tokio::test]
+async fn dom_fill_oopif_keeps_world_node_and_action_on_child_session() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let ext_ref = ref_of(&snap, "oopif", "ad-input");
+    f.state.lock().unwrap().calls.clear();
+    let result = BrowserTypeTool::new(f.engine.clone())
+        .invoke(dom_fill_args(&target, &tab, &ext_ref))
+        .await;
+    assert_eq!(structured(&result)["status"], "ok");
+    let world = recorded_calls(&f, "Page.createIsolatedWorld");
+    assert_eq!(world[0].1["frameId"], "F_OOPIF");
+    assert!(world[0].0.as_deref().unwrap().starts_with("oopif-sess-"));
+    for method in ["DOM.resolveNode", "Runtime.callFunctionOn"] {
+        let calls = recorded_calls(&f, method);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, world[0].0);
+    }
+    assert_eq!(
+        recorded_calls(&f, "DOM.resolveNode")[0].1["executionContextId"],
+        302
+    );
+    assert_no_dom_fill_focus_or_input(&f);
+}
+
+/// Canonical dispatch publishes ActionResult, not the producer's rich legacy
+/// object. Exercise the real producer and the same projection/schema steps so
+/// adapter tests cannot accidentally require private request echoes on MCP.
+#[tokio::test]
+async fn dom_fill_and_trusted_typing_publish_the_closed_public_contract() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let ext_ref = ref_of(&snap, "main", "Shadow Input");
+    for route in ["dom_event", "trusted"] {
+        f.state.lock().unwrap().calls.clear();
+        let mut args = dom_fill_args(&target, &tab, &ext_ref);
+        if route == "trusted" {
+            // Omission is the real default, not a synthesized producer route.
+            args.as_object_mut().unwrap().remove("input_route");
+            args["replace"] = json!(false);
+        }
+        let result = BrowserTypeTool::new(f.engine.clone())
+            .invoke(args.clone())
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let raw = structured(&result);
+        assert_eq!(raw["status"], "ok");
+        assert_eq!(raw["target_id"], target);
+        assert_eq!(raw["tab_id"], tab);
+        assert_eq!(raw["ref"], ext_ref);
+        let public = ActionExecutionRecord::from_legacy("browser_type", &args, raw)
+            .expect("real producer must normalize")
+            .public_result()
+            .expect("normalized action must project");
+        let public = serde_json::to_value(public).expect("serialize public ActionResult");
+        cua_driver_contract::validate_success_output("browser_type", public.clone())
+            .expect("canonical result must match advertised schema");
+        assert_eq!(public["effect"], "unverifiable", "{public}");
+        assert_eq!(public["delivery"]["mode"], "background", "{public}");
+        for private in [
+            "status",
+            "target_id",
+            "tab_id",
+            "ref",
+            "frame",
+            "mode",
+            "replace",
+            "input_trust",
+            "value_matches",
+            "events_dispatched",
+            "requested_chars",
+            "mutation_attempted",
+            "retryable",
+        ] {
+            assert!(
+                public.get(private).is_none(),
+                "private {private} leaked: {public}"
+            );
+        }
+        if route == "dom_event" {
+            assert_eq!(raw["input_trust"], "dom_event");
+            assert_eq!(raw["value_matches"], true);
+            assert_eq!(
+                public,
+                json!({
+                    "effect": "unverifiable", "route": "dom",
+                    "delivery": {"mode": "background"},
+                    "escalation": {"target": "page", "reason": "effect_unconfirmed"},
+                })
+            );
+            assert_no_dom_fill_focus_or_input(&f);
+        } else {
+            assert_eq!(public["route"], "trusted_input");
+            assert_eq!(recorded_calls(&f, "Input.insertText").len(), 1);
+            assert!(recorded_calls(&f, "Page.createIsolatedWorld").is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn dom_fill_rejects_insertion_keystrokes_and_malformed_routes_before_binding() {
+    let f = fixture().await;
+    for patch in [
+        json!({"replace": false}),
+        json!({"replace": "true"}),
+        json!({"mode": "keystrokes"}),
+        json!({"mode": 42}),
+        json!({"input_route": "unknown"}),
+        json!({"input_route": true}),
+    ] {
+        let mut args = dom_fill_args("unbound", "unbound", "p0:0");
+        args.as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        let result = BrowserTypeTool::new(f.engine.clone()).invoke(args).await;
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+    }
+    assert!(f.state.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn dom_fill_rejects_legacy_frame_identity_before_world_creation() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let ext_ref = ref_of(&snap, "main", "Shadow Input");
+    f.engine.store.update_target(SESSION, &target, |target| {
+        for snapshot in target.tabs.get_mut(&tab).unwrap().snapshots.values_mut() {
+            for entry in snapshot.refs.values_mut() {
+                entry.frame.identity = None;
+            }
+        }
+    });
+    let result = BrowserTypeTool::new(f.engine.clone())
+        .invoke(dom_fill_args(&target, &tab, &ext_ref))
+        .await;
+    assert_eq!(structured(&result)["refusal"]["code"], "browser_ref_stale");
+    assert!(recorded_calls(&f, "Page.createIsolatedWorld").is_empty());
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
+}
+
+#[tokio::test]
+async fn dom_fill_refuses_navigation_before_or_during_world_creation() {
+    for during_creation in [false, true] {
+        let f = fixture_with(|state| state.navigate_during_world_creation = during_creation).await;
+        let (target, tab) = bind(&f).await;
+        let snap = snapshot(&f, &target, &tab).await;
+        let ext_ref = ref_of(&snap, "main", "Shadow Input");
+        if !during_creation {
+            f.state.lock().unwrap().main_loader = "L_NEW".into();
+        }
+        let result = BrowserTypeTool::new(f.engine.clone())
+            .invoke(dom_fill_args(&target, &tab, &ext_ref))
+            .await;
+        assert_eq!(structured(&result)["refusal"]["code"], "browser_ref_stale");
+        assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
+        assert_no_dom_fill_focus_or_input(&f);
+    }
+}
+
+#[tokio::test]
+async fn dom_fill_refuses_missing_world_context_or_exact_node_before_dispatch() {
+    for case in 0..3 {
+        let f = fixture_with(|state| match case {
+            0 => state.isolated_world_unavailable = true,
+            1 => state.isolated_context_id = Some(json!("wrong")),
+            _ => state.isolated_node_missing = true,
+        })
+        .await;
+        let (target, tab) = bind(&f).await;
+        let snap = snapshot(&f, &target, &tab).await;
+        let ext_ref = ref_of(&snap, "main", "Shadow Input");
+        let result = BrowserTypeTool::new(f.engine.clone())
+            .invoke(dom_fill_args(&target, &tab, &ext_ref))
+            .await;
+        assert_eq!(structured(&result)["status"], "refused");
+        assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
+        assert_no_dom_fill_focus_or_input(&f);
+    }
+}
+
+#[tokio::test]
+async fn dom_fill_js_prewrite_refusal_does_not_claim_mutation() {
+    for reason in [
+        "unsupported_element",
+        "unsupported_input_type",
+        "not_editable",
+        "stale_node",
+    ] {
+        let f = fixture_with(|state| {
+            state.dom_fill_result = Some(json!({"result": {"value": {
+                "status": "refused", "reason": reason, "mutation_attempted": false,
+            }}}))
+        })
+        .await;
+        let (target, tab) = bind(&f).await;
+        let snap = snapshot(&f, &target, &tab).await;
+        let ext_ref = ref_of(&snap, "main", "Shadow Input");
+        let result = BrowserTypeTool::new(f.engine.clone())
+            .invoke(dom_fill_args(&target, &tab, &ext_ref))
+            .await;
+        assert_eq!(
+            structured(&result)["refusal"]["code"],
+            "browser_action_unavailable"
+        );
+        assert_eq!(
+            structured(&result)["refusal"]["detail"]["mutation_attempted"],
+            false
+        );
+        assert_eq!(recorded_calls(&f, "Runtime.callFunctionOn").len(), 1);
+        assert_no_dom_fill_focus_or_input(&f);
+    }
+}
+
+#[tokio::test]
+async fn dom_fill_dispatched_errors_are_unknown_and_never_replayed() {
+    for case in 0..5 {
+        let f = fixture_with(|state| match case {
+            0 => state.dom_fill_fails = true,
+            1 => state.dom_fill_result = Some(json!({"exceptionDetails": {"text": "exception"}})),
+            2 => {
+                state.dom_fill_result = Some(json!({"result": {"value": {
+                    "status": "outcome_unknown", "mutation_attempted": true, "value_matches": false,
+                }}}))
+            }
+            3 => state.dom_fill_result = Some(json!({"result": {"value": true}})),
+            _ => {
+                state.dom_fill_result = Some(json!({"result": {"value": {
+                    "status": "refused", "mutation_attempted": true, "reason": "not_editable",
+                }}}))
+            }
+        })
+        .await;
+        let (target, tab) = bind(&f).await;
+        let snap = snapshot(&f, &target, &tab).await;
+        let ext_ref = ref_of(&snap, "main", "Shadow Input");
+        let result = BrowserTypeTool::new(f.engine.clone())
+            .invoke(dom_fill_args(&target, &tab, &ext_ref))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let value = structured(&result);
+        assert_eq!(value["status"], "outcome_unknown");
+        assert_eq!(value["effect"], "unverifiable");
+        assert_eq!(value["retryable"], false);
+        assert_eq!(value["mutation_attempted"], true);
+        assert_eq!(recorded_calls(&f, "Runtime.callFunctionOn").len(), 1);
+        assert_no_dom_fill_focus_or_input(&f);
+    }
+}
+
+#[tokio::test]
+async fn trusted_typing_refuses_standalone_limitation_before_any_focus() {
+    let f = fixture_with_platform(|_| {}, true).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let ext_ref = ref_of(&snap, "main", "Shadow Input");
+    f.state.lock().unwrap().calls.clear();
+    for route in [None, Some("trusted")] {
+        let mut args = json!({
+            "target_id": target, "tab_id": tab, "ref": ext_ref,
+            "text": "hi", "session": SESSION,
+        });
+        if let Some(route) = route {
+            args["input_route"] = json!(route);
+        }
+        let result = BrowserTypeTool::new(f.engine.clone()).invoke(args).await;
+        assert_eq!(
+            structured(&result)["refusal"]["code"],
+            "browser_input_trust_unavailable"
+        );
+        assert_eq!(
+            structured(&result)["refusal"]["detail"]["trusted_delivery_attempted"],
+            false
+        );
+    }
+    assert_no_dom_fill_focus_or_input(&f);
+    assert!(recorded_calls(&f, "Page.createIsolatedWorld").is_empty());
+}
 
 #[tokio::test]
 async fn typing_into_composed_shadow_input_uses_the_tab_session() {

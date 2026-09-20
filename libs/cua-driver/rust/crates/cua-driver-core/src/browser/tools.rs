@@ -1488,6 +1488,105 @@ async fn enter_focus_emulation(
     ))
 }
 
+// Runs only in a fresh, frame-bound isolated world: page-owned overrides of
+// `value`, prototypes, or dispatchEvent must not replace these native methods.
+// This is semantic replacement, never focused/trusted typing or submission.
+const DOM_FILL_FUNCTION: &str = r#"function(text) {
+    let mutationAttempted = false;
+    try {
+        const refuse = reason => ({status: 'refused', reason, mutation_attempted: false});
+        if (!this || this.ownerDocument !== document || !this.isConnected)
+            return refuse('stale_node');
+        let prototype;
+        if (this instanceof HTMLInputElement) {
+            if (!['text', 'search', 'tel', 'url', 'email', 'password'].includes(this.type))
+                return refuse('unsupported_input_type');
+            prototype = HTMLInputElement.prototype;
+        } else if (this instanceof HTMLTextAreaElement) {
+            prototype = HTMLTextAreaElement.prototype;
+        } else {
+            return refuse('unsupported_element');
+        }
+        if (this.disabled || this.readOnly || this.matches(':disabled'))
+            return refuse('not_editable');
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+        if (!descriptor || typeof descriptor.set !== 'function' || typeof descriptor.get !== 'function')
+            return refuse('native_setter_unavailable');
+        const dispatch = EventTarget.prototype.dispatchEvent;
+        const input = new Event('input', {bubbles: true, composed: true});
+        const change = new Event('change', {bubbles: true});
+        mutationAttempted = true;
+        descriptor.set.call(this, text);
+        dispatch.call(this, input);
+        dispatch.call(this, change);
+        const connected = this.ownerDocument === document && this.isConnected;
+        const matches = connected && descriptor.get.call(this) === text;
+        return {
+            status: matches ? 'ok' : 'outcome_unknown',
+            mutation_attempted: true,
+            value_matches: matches,
+            events_dispatched: ['input', 'change']
+        };
+    } catch (_) {
+        return {status: 'outcome_unknown', mutation_attempted: mutationAttempted};
+    }
+}"#;
+
+/// Require exactly one occurrence of the frozen frame/loader in the same CDP
+/// session after world/node resolution. Malformed/oversized trees never prove it.
+fn dom_fill_frame_is_current(tree: &Value, identity: &super::store::FrameIdentity) -> bool {
+    let Some(root) = tree.get("frameTree") else {
+        return false;
+    };
+    let mut pending = vec![root];
+    let mut visited = 0;
+    let mut matches = 0;
+    while let Some(node) = pending.pop() {
+        visited += 1;
+        if visited > 512 {
+            return false;
+        }
+        let Some(frame) = node.get("frame") else {
+            return false;
+        };
+        if frame.get("id").and_then(Value::as_str) == Some(identity.frame_id.as_str()) {
+            if frame.get("loaderId").and_then(Value::as_str) != Some(identity.loader_id.as_str()) {
+                return false;
+            }
+            matches += 1;
+        }
+        if let Some(children) = node.get("childFrames") {
+            let Some(children) = children.as_array() else {
+                return false;
+            };
+            if children.len() > 512 {
+                return false;
+            }
+            pending.extend(children);
+        }
+    }
+    matches == 1
+}
+
+fn dom_fill_unknown(target_id: &str, tab_id: &str, ext_ref: &str) -> ToolResult {
+    ToolResult::error(
+        "DOM fill outcome is unknown after dispatch; it may have changed the field or run page \
+         event handlers. Do not replay. Refresh page state and verify the expected postcondition.",
+    )
+    .with_structured(json!({
+        "status": "outcome_unknown",
+        "code": "browser_input_incomplete",
+        "effect": "unverifiable",
+        "route": "dom_event",
+        "input_trust": "dom_event",
+        "target_id": target_id,
+        "tab_id": tab_id,
+        "ref": ext_ref,
+        "mutation_attempted": true,
+        "retryable": false,
+    }))
+}
+
 pub struct BrowserTypeTool {
     def: ToolDef,
     engine: Arc<BrowserEngine>,
@@ -1497,7 +1596,14 @@ impl BrowserTypeTool {
     pub fn new(engine: Arc<BrowserEngine>) -> Self {
         let def = ToolDef {
             name: "browser_type".into(),
-            description: "Type text into an exactly-bound tab via the Input domain. \
+            description: "Type text into an exactly-bound tab. input_route=\"trusted\" \
+                (default) uses the Input domain and refuses when standalone background \
+                posture cannot be preserved. input_route=\"dom_event\" explicitly requests \
+                synthetic DOM fill: only replace=true with mode=\"insert_text\", a proven \
+                frame ref, and text inputs/textarea are supported. It uses the native \
+                value setter and untrusted input/change events without focusing or sending \
+                keyboard input; value readback does not prove page submission or framework \
+                acceptance. Refresh page state to verify the requested effect. Trusted \
                 mode=\"insert_text\" (default) uses Input.insertText; \
                 mode=\"keystrokes\" dispatches per-character key events. Both insert \
                 at the caret, so typing into a field that already holds text appends \
@@ -1513,6 +1619,16 @@ impl BrowserTypeTool {
                     "session": schema_session(),
                     "text": { "type": "string", "description": "Text to type." },
                     "ref": schema_ref(),
+                    "input_route": {
+                        "type": "string",
+                        "enum": ["trusted", "dom_event"],
+                        "default": "trusted",
+                        "description": "trusted: existing Input typing, subject to the \
+                            platform's standalone-background limitation. dom_event: explicit \
+                            synthetic replacement only; requires replace=true, insert_text, \
+                            and a frame-identified input/textarea ref. No focus or keyboard \
+                            events. Readback is not proof of submission."
+                    },
                     "mode": {
                         "type": "string",
                         "enum": ["insert_text", "keystrokes"],
@@ -1525,8 +1641,9 @@ impl BrowserTypeTool {
                             to whatever the field already holds. true: select the \
                             element's whole content first so the text replaces it — \
                             with an empty text this clears the field. Replacement goes \
-                            through the selection, so beforeinput/input still fire and \
-                            framework state stays consistent."
+                            through the selection on the trusted route. Required true on \
+                            the dom_event route, which instead uses a native value setter \
+                            followed by synthetic input/change events."
                     },
                 },
                 "required": ["target_id", "tab_id", "ref", "text"],
@@ -1591,6 +1708,25 @@ impl Tool for BrowserTypeTool {
             ));
         }
         let replace = args.opt_bool("replace").unwrap_or(false);
+        let route = match args.get("input_route") {
+            None => "trusted",
+            Some(Value::String(route)) if matches!(route.as_str(), "trusted" | "dom_event") => {
+                route.as_str()
+            }
+            _ => return ToolResult::error("input_route must be \"trusted\" or \"dom_event\""),
+        };
+        if route == "dom_event"
+            && (mode != "insert_text"
+                || args
+                    .get("mode")
+                    .is_some_and(|mode| mode.as_str() != Some("insert_text"))
+                || args.get("replace").and_then(Value::as_bool) != Some(true))
+        {
+            return ToolResult::error(
+                "input_route=dom_event requires mode=insert_text and explicit replace=true; \
+                 DOM fill is replacement, not keystrokes or caret insertion",
+            );
+        }
 
         let _mutation = match self
             .engine
@@ -1613,6 +1749,30 @@ impl Tool for BrowserTypeTool {
             Ok(value) => value,
             Err(error) => return error,
         };
+        if route == "trusted" && validated.record.cdp_window_id.is_some() {
+            if let Some(limitation) = self
+                .engine
+                .platform
+                .standalone_trusted_input_background_limitation()
+            {
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserInputTrustUnavailable,
+                    format!(
+                        "{limitation}; explicit input_route=\"dom_event\" with replace=true \
+                         can request synthetic HTML input/textarea replacement, not trusted typing"
+                    ),
+                )
+                .with_detail(json!({
+                    "requested_route": "trusted",
+                    "limitation": limitation,
+                    "alternative_route": "dom_event",
+                    "alternative_requires_ref": true,
+                    "alternative_requires_replace": true,
+                    "trusted_delivery_attempted": false,
+                }))
+                .to_tool_result();
+            }
+        }
         let entry = match self
             .engine
             .store
@@ -1628,6 +1788,14 @@ impl Tool for BrowserTypeTool {
             )
             .to_tool_result();
         }
+        if route == "dom_event" && entry.frame.identity.is_none() {
+            return BrowserRefusal::new(
+                BrowserRefusalCode::BrowserRefStale,
+                "DOM fill requires a proven frame and loader identity; legacy unproven refs \
+                 cannot be used. Re-snapshot the tab through a frame-capable endpoint.",
+            )
+            .to_tool_result();
+        }
         // Re-prove the ref's frame identity; typing routes to the frame's
         // own session (tab, or the contained OOPIF child session).
         let cdp_session = match self
@@ -1640,6 +1808,160 @@ impl Tool for BrowserTypeTool {
         };
         let conn = &validated.conn;
         let cdp = cdp_session.as_str();
+
+        if route == "dom_event" {
+            let identity = entry.frame.identity.as_ref().expect("checked above");
+            // Do not add this command to the personal-profile policy allowlist:
+            // unsupported/unauthorized isolated worlds refuse before filling.
+            let world = match conn
+                .call(
+                    Some(cdp),
+                    "Page.createIsolatedWorld",
+                    json!({
+                        "frameId": identity.frame_id,
+                        "worldName": "cua-dom-fill-v1",
+                        "grantUniveralAccess": false,
+                    }),
+                )
+                .await
+            {
+                Ok(world) => world,
+                Err(_) => {
+                    return BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        "the proven frame cannot provide an authorized isolated DOM-fill world",
+                    )
+                    .to_tool_result()
+                }
+            };
+            let Some(context_id) = world
+                .get("executionContextId")
+                .and_then(Value::as_i64)
+                .filter(|id| *id > 0)
+            else {
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserRouteUnavailable,
+                    "the isolated DOM-fill world returned no valid execution context",
+                )
+                .to_tool_result();
+            };
+            let object_id = conn
+                .call(
+                    Some(cdp),
+                    "DOM.resolveNode",
+                    json!({
+                        "backendNodeId": entry.backend_node_id,
+                        "executionContextId": context_id,
+                    }),
+                )
+                .await
+                .ok()
+                .and_then(|resolved| {
+                    resolved["object"]["objectId"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                });
+            let Some(object_id) = object_id else {
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "the exact ref no longer resolves in the isolated frame world",
+                )
+                .to_tool_result();
+            };
+            let tree = conn.call(Some(cdp), "Page.getFrameTree", json!({})).await;
+            if !matches!(tree, Ok(ref tree) if dom_fill_frame_is_current(tree, identity)) {
+                self.engine
+                    .store
+                    .invalidate_tab_snapshots(&session, &target_id, &tab_id);
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "the DOM-fill frame/loader changed or could not be re-proven after node resolution",
+                )
+                .to_tool_result();
+            }
+            // A single non-replayed command. Text is an argument, never source;
+            // no focus, scroll, overlay, Input command, or foreground API occurs.
+            let filled = conn
+                .call(
+                    Some(cdp),
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_id,
+                        "functionDeclaration": DOM_FILL_FUNCTION,
+                        "arguments": [{"value": text}],
+                        "returnByValue": true,
+                        "userGesture": false,
+                        "awaitPromise": false,
+                    }),
+                )
+                .await;
+            let Ok(filled) = filled else {
+                return dom_fill_unknown(&target_id, &tab_id, &ext_ref);
+            };
+            if filled.get("exceptionDetails").is_some() {
+                return dom_fill_unknown(&target_id, &tab_id, &ext_ref);
+            }
+            let value = &filled["result"]["value"];
+            if value["status"] == "refused"
+                && value["mutation_attempted"] == false
+                && matches!(
+                    value["reason"].as_str(),
+                    Some(
+                        "stale_node"
+                            | "unsupported_element"
+                            | "unsupported_input_type"
+                            | "not_editable"
+                            | "native_setter_unavailable"
+                    )
+                )
+            {
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserActionUnavailable,
+                    "the exact ref is not an eligible connected, editable HTML text input or textarea",
+                )
+                .with_detail(json!({
+                    "route": "dom_event",
+                    "input_trust": "dom_event",
+                    "reason": value["reason"],
+                    "mutation_attempted": false,
+                    "retryable": false,
+                }))
+                .to_tool_result();
+            }
+            if value["status"] != "ok"
+                || value["mutation_attempted"] != true
+                || value["value_matches"] != true
+                || value["events_dispatched"] != json!(["input", "change"])
+            {
+                return dom_fill_unknown(&target_id, &tab_id, &ext_ref);
+            }
+            return ToolResult::text(
+                "Dispatched synthetic DOM input/change events and read back the requested field \
+                 value. Application acceptance and submission are not verified; refresh page state.",
+            )
+            .with_structured(json!({
+                "status": "ok",
+                "effect": "unverifiable",
+                "route": "dom_event",
+                "input_trust": "dom_event",
+                "target_id": target_id,
+                "tab_id": tab_id,
+                "ref": ext_ref,
+                "frame": entry.frame.kind.as_str(),
+                "mode": "insert_text",
+                "replace": true,
+                "requested_chars": text.chars().count(),
+                "mutation_attempted": true,
+                "value_matches": true,
+                "events_dispatched": ["input", "change"],
+                "retryable": false,
+                "escalation": {
+                    "recommended": "page",
+                    "reason": "DOM value readback does not prove application acceptance or submission; refresh page state",
+                },
+            }));
+        }
 
         if let Err(_e) = conn
             .call(
@@ -2609,6 +2931,40 @@ mod tests {
             .structured_content
             .as_ref()
             .expect("structured content")
+    }
+
+    #[test]
+    fn dom_fill_frame_proof_requires_one_exact_live_loader() {
+        let identity = super::super::store::FrameIdentity {
+            frame_id: "child".into(),
+            loader_id: "live".into(),
+        };
+        let child = json!({"frame": {"id": "child", "loaderId": "live"}});
+        let tree = json!({"frameTree": {
+            "frame": {"id": "main", "loaderId": "main-loader"},
+            "childFrames": [child.clone()]
+        }});
+        assert!(dom_fill_frame_is_current(&tree, &identity));
+        for invalid in [
+            json!({}),
+            json!({"frameTree": {"frame": {"id": "child", "loaderId": "old"}}}),
+            json!({"frameTree": {"frame": {"id": "other", "loaderId": "live"}}}),
+            json!({"frameTree": {"frame": {"id": "main"}, "childFrames": [child.clone(), child]}}),
+            json!({"frameTree": {"frame": {"id": "child", "loaderId": "live"}, "childFrames": false}}),
+        ] {
+            assert!(!dom_fill_frame_is_current(&invalid, &identity), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn dom_fill_route_is_explicit_in_existing_type_schema() {
+        let tool = BrowserTypeTool::new(engine());
+        let route = &tool.def().input_schema["properties"]["input_route"];
+        assert_eq!(route["type"], "string");
+        assert_eq!(route["enum"], json!(["trusted", "dom_event"]));
+        assert_eq!(route["default"], "trusted");
+        assert_eq!(tool.def().name, "browser_type");
+        assert!(tool.def().description.contains("submission"));
     }
 
     #[test]
