@@ -51,6 +51,9 @@ These run without the repo-local GUI applications:
 | Token and protocol surfaces | `protocol_element_token_test.rs`, related tests | JSON-RPC-visible contract behavior |
 | Permission modes and policy startup | `permission_policy_startup_test.rs`, `daemon_required_test.rs`, core `authorization`, `policy`, and `session_manifest` tests | Fail-before-bind policy loading, managed/user intersection, immutable standard/autonomous/unrestricted startup, danger acknowledgement, admin disable, deny-by-default manifests, and canonical daemon dispatch |
 | Protected browser grants | Core `consent`, `browser::grant`, `browser::engine`, and `browser::v2_tests` | Exact request digests, provider authentication seam and deadline, persistent-indicator activation, Stop/session teardown, forged legacy artifact refusal, exact PID/window manifest scope, and the live-origin decision path used before mutation |
+| Native foreground ownership | Core `foreground_activity`, `foreground_segment`, `session`; macOS `foreground_activity`, `foreground_activity::segment`; Driver `proxy`, `serve` | Fixed activity generations/deadlines, exact transport/window binding, cancellation/EOF revocation, retained workers, owned input release, cleanup uncertainty and response settlement |
+| Explicit DOM text replacement | Core `browser::tools` and `browser::v2_tests` | Declared synthetic route, replacement-only input, frame/loader revalidation, no trusted fallback, unknown outcome/no replay and public receipt projection |
+| Multi-app PiP and window activation | `pip-preview`; macOS `pip` and `pip::window_activation` | Per-session/per-app retention, rendered-target identity, stale-click cancellation, exact activation sequencing and session cleanup |
 
 Some protocol tests spawn the driver process. They remain deterministic because
 they do not launch a real target application or require a desktop. They should
@@ -135,6 +138,13 @@ seed from the sanitized public base `macos-tahoe-cua:26.5.2`. The repo-local
 harnesses are canonical; Calculator and TextEdit are supporting real-app
 checks. SwiftUI's popover trigger is proven independently from the remaining
 transient-panel AX discovery gap.
+
+The [September 2026 qualification summary](macos-qualification-20260920.md)
+also records bounded workstation acceptance for foreground input, isolated
+Chrome DOM replacement and multi-app/exact-window PiP. Those local trials and
+operator confirmations are supplemental evidence, not new passing rows in the
+canonical cross-platform GUI catalog. Native Chrome background Return remains
+unqualified and its experiments stay default-off.
 
 ## Harness E2E: Linux
 

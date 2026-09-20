@@ -25,9 +25,13 @@ and their tests are retained; their presence does not establish release support.
 The native build can avoid UniFFI; generated language SDKs retain their existing
 FFI dependency and licensing requirements.
 
-This extraction does not fix the previously observed background text-field
-click failure in the input fixture. Its batch stopped before typing, so it is
-not evidence of successful batch input or Chinese input-method handling.
+The September 2026 macOS work repairs exact text-field targeting, implicit
+text insertion, foreground input/session cleanup, and multi-app PiP retention
+with exact-window activation. The [qualification summary](libs/cua-driver/docs/macos-qualification-20260920.md)
+separates automated tests, bounded device acceptance and remaining limits.
+Reliable fully background native Chrome Return is still unresolved; its
+experimental routes are explicitly opt-in and disabled in normal operation.
+The separate browser DOM replacement route is not trusted keyboard input.
 
 The app's display name is `cua`, without a custom icon. Bundle identity,
 permission attribution and signing behavior are unchanged. There is no approved
