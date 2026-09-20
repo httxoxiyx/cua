@@ -17,7 +17,7 @@
 
 pub mod temporary_activation;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 /// Fit a complete source window inside the preview bounds without cropping or
@@ -369,15 +369,17 @@ struct PublishedFrame {
     sequence: u64,
 }
 
-/// Platform-neutral card stack for the current target of each runtime session.
+/// Platform-neutral card stack for applications observed by each runtime session.
 ///
-/// Selecting another target retires only that session's prior frame. Sessions
-/// observing the same app retain independent frames; the most recently
-/// published surviving frame represents the app's single visible card.
+/// Switching applications retains earlier previews for the same task. Each
+/// session keeps one exact frame per app; sessions observing the same app keep
+/// independent frames. The most recently published surviving frame represents
+/// the app's single visible card. Session end, dead targets and capacity eviction
+/// still retire their frames; mere task handoff to another app does not.
 pub struct PipViewModel {
     max_cards: usize,
-    selected_apps: HashMap<String, i64>,
-    frames_by_session: HashMap<String, Arc<PublishedFrame>>,
+    selected_apps: HashMap<String, HashSet<i64>>,
+    frames_by_session: HashMap<(String, i64), Arc<PublishedFrame>>,
     anonymous_frames: HashMap<i64, Arc<PublishedFrame>>,
     frames_by_pid: HashMap<i64, Arc<PublishedFrame>>,
     publication_order: Vec<i64>,
@@ -398,39 +400,32 @@ impl PipViewModel {
     }
 
     /// Commit a successful observation's logical app before asynchronous preview
-    /// capture. Re-selecting the same app leaves its frame and card intact.
-    /// This does not itself authorize or capture any pixels.
+    /// capture, retaining this session's other observed apps. This does not
+    /// itself authorize or capture any pixels. Backends still bind each pending
+    /// publication to an exact window and monotonically increasing generation.
     pub fn select_target(&mut self, target: &PipTarget) -> PipModelChange {
         let Some(session_id) = target.session_id.as_ref() else {
             // Sessionless compatibility callers keep the original per-app
             // behavior; they have no shared lifecycle key to retarget.
             return PipModelChange::default();
         };
-        if self
-            .selected_apps
-            .get(session_id)
-            .is_some_and(|selected| *selected == target.app_key_pid())
-        {
-            return PipModelChange::default();
-        }
         self.selected_apps
-            .insert(session_id.clone(), target.app_key_pid());
-        let previous = self.frames_by_session.remove(session_id);
-        previous.map_or_else(PipModelChange::default, |previous| {
-            self.refresh_apps(vec![previous.frame.target.app_key_pid()])
-        })
+            .entry(session_id.clone())
+            .or_default()
+            .insert(target.app_key_pid());
+        PipModelChange::default()
     }
 
-    /// Whether a frame still belongs to its session's current logical app.
+    /// Whether a frame belongs to an app retained by its session.
     /// Backends must additionally validate publication generations and session
     /// liveness, including changes between windows or menu sources in that app
-    /// and a session ending or returning to an earlier app.
+    /// and a session ending or observing a newer target for an earlier app.
     pub fn accepts_target(&self, target: &PipTarget) -> bool {
         target
             .session_id
             .as_ref()
             .and_then(|session_id| self.selected_apps.get(session_id))
-            .is_none_or(|selected| *selected == target.app_key_pid())
+            .is_none_or(|selected| selected.contains(&target.app_key_pid()))
     }
 
     pub fn upsert(&mut self, frame: PipFrame) -> PipUpsert {
@@ -453,10 +448,14 @@ impl PipViewModel {
             sequence: self.next_sequence,
         });
         if let Some(session_id) = published.frame.target.session_id.as_ref() {
-            // Preserve compatibility with callers whose first publication is
-            // the selection. Once selected, upsert never changes that app.
-            self.selected_apps.entry(session_id.clone()).or_insert(pid);
-            self.frames_by_session.insert(session_id.clone(), published);
+            // Preserve compatibility with a session's first publication being
+            // its selection. Later additions/re-additions require observation.
+            self.selected_apps
+                .entry(session_id.clone())
+                .or_default()
+                .insert(pid);
+            self.frames_by_session
+                .insert((session_id.clone(), pid), published);
         } else {
             self.anonymous_frames.insert(pid, published);
         }
@@ -486,9 +485,13 @@ impl PipViewModel {
         }
     }
 
-    /// Clear every retained frame for an app, without revoking the sessions'
-    /// current selections. A future successful observation may seed it again.
+    /// Clear every retained frame and selection for an app. A future successful
+    /// observation may seed it again; delayed publications cannot resurrect an
+    /// evicted card. Keep empty session selections until explicit session end.
     pub fn remove_app(&mut self, pid: i64) -> bool {
+        for selected in self.selected_apps.values_mut() {
+            selected.remove(&pid);
+        }
         self.frames_by_session
             .retain(|_, published| published.frame.target.app_key_pid() != pid);
         self.anonymous_frames.remove(&pid);
@@ -500,12 +503,13 @@ impl PipViewModel {
     pub fn remove_target_frame(&mut self, target: &PipTarget) -> PipModelChange {
         let pid = target.app_key_pid();
         if let Some(session_id) = target.session_id.as_ref() {
+            let key = (session_id.clone(), pid);
             if self
                 .frames_by_session
-                .get(session_id)
+                .get(&key)
                 .is_some_and(|published| same_frame_target(&published.frame.target, target))
             {
-                self.frames_by_session.remove(session_id);
+                self.frames_by_session.remove(&key);
             }
         } else if self
             .anonymous_frames
@@ -552,14 +556,20 @@ impl PipViewModel {
         self.refresh_apps(affected)
     }
 
-    /// End only this session's selection and frame. Other sessions sharing its
-    /// app remain represented by their own most recent successful observation.
+    /// End all of this session's app selections and frames. Other sessions
+    /// sharing those apps retain their own most recent successful observations.
     pub fn remove_session(&mut self, session_id: &str) -> PipModelChange {
         self.selected_apps.remove(session_id);
-        let previous = self.frames_by_session.remove(session_id);
-        previous.map_or_else(PipModelChange::default, |previous| {
-            self.refresh_apps(vec![previous.frame.target.app_key_pid()])
-        })
+        let mut affected = Vec::new();
+        self.frames_by_session.retain(|(session, pid), _| {
+            if session == session_id {
+                affected.push(*pid);
+                false
+            } else {
+                true
+            }
+        });
+        self.refresh_apps(affected)
     }
 
     fn refresh_apps(&mut self, mut affected: Vec<i64>) -> PipModelChange {
@@ -907,26 +917,47 @@ mod tests {
     }
 
     #[test]
-    fn switching_a_session_retires_its_old_app_before_the_new_frame_arrives() {
+    fn cross_app_handoff_keeps_both_previews_in_one_session() {
         let mut model = PipViewModel::new(5);
         let finder = session_frame("task", 1, 11, 10);
         let text_edit = session_frame("task", 2, 22, 20);
         assert!(model.upsert(finder.clone()).accepted);
 
         let change = model.select_target(&text_edit.target);
-        assert_eq!(change.removed_pids, vec![1]);
-        assert!(change.changed_pids.is_empty());
-        assert!(model.is_empty());
-        assert!(!model.accepts_target(&finder.target));
-        assert!(model.accepts_target(&text_edit.target));
-
-        let late = model.upsert(finder);
-        assert!(!late.accepted);
-        assert!(late.change.is_empty());
-        assert!(model.is_empty());
-        assert!(model.upsert(text_edit).accepted);
+        assert!(change.is_empty());
         assert_eq!(model.len(), 1);
-        assert_eq!(model.ordered_frames()[0].target.pid, 2);
+        assert!(model.accepts_target(&finder.target));
+        assert!(model.accepts_target(&text_edit.target));
+        assert_eq!(model.frame_for_app(1).unwrap().target, finder.target);
+        assert!(model.upsert(text_edit).accepted);
+        assert_eq!(model.len(), 2);
+        assert_eq!(model.ordered_frames()[0].target.pid, 1);
+        assert_eq!(model.ordered_frames()[1].target.pid, 2);
+        assert_eq!(model.remove_session("task").removed_pids, vec![1, 2]);
+        assert!(model.is_empty());
+    }
+
+    #[test]
+    fn independent_pending_app_seeds_can_complete_in_either_order() {
+        for reverse in [false, true] {
+            let mut model = PipViewModel::new(5);
+            let mut frames = [
+                session_frame("task", 1, 11, 10),
+                session_frame("task", 2, 22, 20),
+            ];
+            for frame in &frames {
+                model.select_target(&frame.target);
+            }
+            if reverse {
+                frames.reverse();
+            }
+            for frame in frames {
+                assert!(model.upsert(frame).accepted);
+            }
+            assert_eq!(model.len(), 2);
+            assert_eq!(model.frame_for_app(1).unwrap().target.window_id, 11);
+            assert_eq!(model.frame_for_app(2).unwrap().target.window_id, 22);
+        }
     }
 
     #[test]
@@ -970,18 +1001,10 @@ mod tests {
 
             let text_edit = session_frame("task-a", 2, 22, 40);
             let change = model.select_target(&text_edit.target);
-            assert!(change.removed_pids.is_empty());
-            assert_eq!(
-                change.changed_pids,
-                if last_publisher == "task-a" {
-                    vec![1]
-                } else {
-                    vec![]
-                }
-            );
+            assert!(change.is_empty());
             assert_eq!(
                 model.frame_for_app(1).unwrap().target.session_id.as_deref(),
-                Some("task-b")
+                Some(last_publisher)
             );
             assert!(model.upsert(text_edit).accepted);
             assert_eq!(model.len(), 2);
@@ -991,25 +1014,24 @@ mod tests {
     }
 
     #[test]
-    fn ending_or_switching_the_last_publisher_restores_the_other_sessions_exact_window() {
-        for end_session in [false, true] {
-            let mut model = PipViewModel::new(5);
-            let first = session_frame("task-a", 1, 11, 10);
-            model.upsert(first.clone());
-            model.upsert(session_frame("task-b", 1, 12, 20));
-            let change = if end_session {
-                model.remove_session("task-b")
-            } else {
-                model.select_target(&session_frame("task-b", 2, 22, 30).target)
-            };
-            assert!(change.removed_pids.is_empty());
-            assert_eq!(change.changed_pids, vec![1]);
-            let restored = model.frame_for_app(1).unwrap();
-            assert_eq!(restored.target, first.target);
-            assert_eq!(restored.timestamp_ms, first.timestamp_ms);
-            assert_eq!(model.remove_session("task-a").removed_pids, vec![1]);
-            assert!(model.is_empty());
-        }
+    fn ending_multi_app_session_restores_other_sessions_exact_window() {
+        let mut model = PipViewModel::new(5);
+        let first = session_frame("task-a", 1, 11, 10);
+        model.upsert(first.clone());
+        model.upsert(session_frame("task-b", 1, 12, 20));
+        let second_app = session_frame("task-b", 2, 22, 30);
+        assert!(model.select_target(&second_app.target).is_empty());
+        assert!(model.upsert(second_app).accepted);
+        assert_eq!(model.frame_for_app(1).unwrap().target.window_id, 12);
+
+        let change = model.remove_session("task-b");
+        assert_eq!(change.removed_pids, vec![2]);
+        assert_eq!(change.changed_pids, vec![1]);
+        let restored = model.frame_for_app(1).unwrap();
+        assert_eq!(restored.target, first.target);
+        assert_eq!(restored.timestamp_ms, first.timestamp_ms);
+        assert_eq!(model.remove_session("task-a").removed_pids, vec![1]);
+        assert!(model.is_empty());
     }
 
     #[test]
@@ -1077,11 +1099,11 @@ mod tests {
         assert_eq!(model.frame_for_app(42).unwrap().target.pid, 900);
 
         let other_host = session_frame("task", 43, 10, 40);
-        assert_eq!(
-            model.select_target(&other_host.target).removed_pids,
-            vec![42]
-        );
-        assert!(!model.accepts_target(&document.target));
+        assert!(model.select_target(&other_host.target).is_empty());
+        assert!(model.accepts_target(&document.target));
+        assert!(model.upsert(other_host).accepted);
+        assert_eq!(model.len(), 2);
+        assert_eq!(model.frame_for_app(42).unwrap().target.window_id, 9);
     }
 
     #[test]
@@ -1096,7 +1118,40 @@ mod tests {
         assert!(model.remove_session("task-b").is_empty());
         assert_eq!(model.remove_session("task-c").removed_pids, vec![2]);
         assert!(model.is_empty());
-        assert!(model.upsert(session_frame("task-a", 1, 11, 40)).accepted);
+        let observed_again = session_frame("task-a", 1, 11, 40);
+        assert!(!model.upsert(observed_again.clone()).accepted);
+        model.select_target(&observed_again.target);
+        assert!(model.upsert(observed_again).accepted);
+    }
+
+    #[test]
+    fn one_session_has_bounded_app_retention_and_cannot_revive_evicted_frames() {
+        let mut model = PipViewModel::new(2);
+        for pid in 1..=8 {
+            let frame = session_frame("task", pid, pid as u64 * 10, pid as u64);
+            model.select_target(&frame.target);
+            assert!(model.upsert(frame).accepted);
+            assert!(model.retained_targets().len() <= 2);
+            assert!(model.selected_apps["task"].len() <= 2);
+        }
+        assert!(!model.upsert(session_frame("task", 1, 10, 99)).accepted);
+        assert_eq!(model.remove_session("task").removed_pids, vec![7, 8]);
+        assert!(model.is_empty());
+    }
+
+    #[test]
+    fn failed_preview_removes_only_its_own_app_in_a_multi_app_session() {
+        let mut model = PipViewModel::new(5);
+        let first = session_frame("task", 1, 11, 10);
+        let second = session_frame("task", 2, 22, 20);
+        model.upsert(first.clone());
+        model.select_target(&second.target);
+        model.upsert(second.clone());
+        assert_eq!(
+            model.remove_target_frame(&first.target).removed_pids,
+            vec![1]
+        );
+        assert_eq!(model.frame_for_app(2).unwrap().target, second.target);
     }
 
     #[test]
@@ -1105,8 +1160,9 @@ mod tests {
         model.upsert(frame(1, 11, 10));
         model.upsert(session_frame("task", 1, 12, 20));
         let change = model.select_target(&session_frame("task", 2, 22, 30).target);
-        assert!(change.removed_pids.is_empty());
-        assert_eq!(change.changed_pids, vec![1]);
+        assert!(change.is_empty());
+        assert_eq!(model.frame_for_app(1).unwrap().target.window_id, 12);
+        assert_eq!(model.remove_session("task").changed_pids, vec![1]);
         assert_eq!(model.frame_for_app(1).unwrap().target.session_id, None);
         assert_eq!(model.frame_for_app(1).unwrap().target.window_id, 11);
     }

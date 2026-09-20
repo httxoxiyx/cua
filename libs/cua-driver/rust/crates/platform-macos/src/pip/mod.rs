@@ -4,6 +4,8 @@
 //! card, and all cards live inside one borderless native stack. The daemon is
 //! in-process, so it does not need Codex's cross-process CAContext transport.
 
+mod window_activation;
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -115,6 +117,7 @@ struct LiveFrame {
 #[derive(Clone)]
 struct ClickedTarget {
     target: pip_preview::PipTarget,
+    layout_rect: CardRect,
 }
 
 struct ForegroundVisibilityState {
@@ -351,6 +354,8 @@ static LIVE_STREAMS: LazyLock<Mutex<HashMap<i64, LiveStreamEntry>>> =
 static DELEGATION_PROOF_STATE: LazyLock<Mutex<DelegationProofState>> =
     LazyLock::new(|| Mutex::new(DelegationProofState::default()));
 static NEXT_PIP_PUBLICATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+static CARD_ACTIVATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static LAST_CARD_ACTIVATION: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 static OBSERVATION_RETRIES: LazyLock<Mutex<HashMap<i64, ObservationRetry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -587,6 +592,7 @@ impl PipBackend for MacosPipBackend {
     }
 
     fn shutdown(self: Box<Self>) {
+        CARD_ACTIVATION_GENERATION.fetch_add(1, Ordering::AcqRel);
         stop_foreground_visibility_watcher();
         stop_all_live_capture();
         *DELEGATION_PROOF_STATE.lock().unwrap() = DelegationProofState::default();
@@ -1577,6 +1583,7 @@ pub fn diagnostic_state() -> serde_json::Value {
         .collect::<Vec<_>>();
     serde_json::json!({
         "initialized": initialized, "cards": cards, "preview_retries": retries,
+        "last_card_activation": LAST_CARD_ACTIVATION.lock().unwrap().clone(),
         "input_monitors_ready": input_monitors_ready,
         "presentation_counters": {
             "card_view_rebuilds": CARD_VIEW_REBUILDS.load(Ordering::Relaxed),
@@ -2751,64 +2758,98 @@ unsafe fn hovered_pid_at_content_point(
     None
 }
 
-fn activate_target_window(target: ClickedTarget) {
-    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+fn rendered_click_target(
+    cards: &[(pip_preview::PipTarget, CardRect)],
+    pid: Option<i64>,
+) -> (Option<ClickedTarget>, Option<i64>) {
+    let target = pid.and_then(|pid| {
+        cards
+            .iter()
+            .find(|(target, _)| target.app_key_pid() == pid)
+            .map(|(target, rect)| ClickedTarget {
+                target: target.clone(),
+                layout_rect: *rect,
+            })
+    });
+    (target, cards.last().map(|(target, _)| target.app_key_pid()))
+}
 
-    if !pip_target_session_is_live(&target.target)
-        || !delegation_frame_proof_is_live(&target.target)
-        || !physical_target_is_live(target.target.pid, target.target.window_id)
-        || !pip_delegation_is_live(&target.target)
+fn clicked_presentation_is_current(
+    clicked: &ClickedTarget,
+    cards: &[(pip_preview::PipTarget, CardRect)],
+) -> bool {
+    cards.iter().any(|(target, rect)| {
+        same_observation_target(target, &clicked.target) && *rect == clicked.layout_rect
+    })
+}
+
+fn clicked_target_is_retained(target: &pip_preview::PipTarget) -> bool {
+    VIEW_MODEL.lock().unwrap().as_ref().is_some_and(|model| {
+        model.accepts_target(target)
+            && model
+                .frame_for_app(target.app_key_pid())
+                .is_some_and(|frame| {
+                    same_observation_target(&frame.target, target)
+                        && frame_has_preview_authority_without_model(frame)
+                })
+    }) && !HIDDEN_APPS.lock().unwrap().contains(&target.app_key_pid())
+}
+
+fn frame_has_preview_authority_without_model(frame: &PipFrame) -> bool {
+    pip_target_session_is_live(&frame.target) && delegation_frame_proof_is_live(&frame.target)
+}
+
+fn activate_target_window(clicked: ClickedTarget) {
+    if !clicked_presentation_is_current(&clicked, &RENDERED_CARDS.lock().unwrap())
+        || !clicked_target_is_retained(&clicked.target)
     {
         return;
     }
-    let action_window_id = if is_application_menu_target(&target.target) {
-        let Some(menu) = pip_application_menu_image(&target.target) else {
-            return;
-        };
-        u64::from(menu.document_window_id)
-    } else {
-        target.target.window_id
-    };
-    let (Ok(app_pid), Ok(target_pid), Ok(window_id)) = (
-        libc::pid_t::try_from(target.target.app_key_pid()),
-        libc::pid_t::try_from(target.target.pid),
-        u32::try_from(action_window_id),
-    ) else {
-        return;
-    };
-    // Clicking a live PiP card is an intentional foreground request. A
-    // completed input's protection tail must not undo that host activation.
-    crate::focus_steal::cancel_deferred_suppression(app_pid);
-    crate::focus_steal::cancel_deferred_suppression(target_pid);
-    if let Some(app) =
-        unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(app_pid) }
+    let generation = CARD_ACTIVATION_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let app_pid = clicked.target.app_key_pid();
+    let window_id = clicked.target.window_id;
+    // AX messages and activation settling must not stall the shared AppKit/
+    // cursor pump. Bind the worker to the actual presentation clicked, never
+    // look up another window by app name, and cancel it on a later click.
+    if let Err(error) = std::thread::Builder::new()
+        .name(format!("cua-pip-activate-{app_pid}"))
+        .spawn(move || {
+            let target = clicked.target;
+            let validate = || {
+                CARD_ACTIVATION_GENERATION.load(Ordering::Acquire) == generation
+                    && clicked_target_is_retained(&target)
+                    && physical_target_is_live(target.pid, target.window_id)
+                    && pip_delegation_is_live(&target)
+            };
+            let action_window_id = if is_application_menu_target(&target) {
+                pip_application_menu_image(&target).map(|menu| u64::from(menu.document_window_id))
+            } else {
+                Some(target.window_id)
+            };
+            let result = action_window_id
+                .ok_or_else(|| anyhow::anyhow!("menu source expired"))
+                .and_then(|window_id| {
+                    window_activation::activate(app_pid, target.pid, window_id, validate)
+                });
+            let (status, error) = match result {
+                Ok(()) => ("confirmed", None),
+                Err(error) => {
+                    tracing::warn!(target: "pip", app_pid, window_id, %error,
+                        "exact PiP card activation was not confirmed");
+                    ("unconfirmed", Some(error.to_string()))
+                }
+            };
+            if CARD_ACTIVATION_GENERATION.load(Ordering::Acquire) == generation {
+                *LAST_CARD_ACTIVATION.lock().unwrap() = Some(serde_json::json!({
+                    "app_pid": app_pid, "source_pid": target.pid, "window_id": window_id,
+                    "status": status, "error": error,
+                }));
+            }
+            schedule_foreground_visibility_refresh();
+        })
     {
-        unsafe {
-            app.activateWithOptions(
-                NSApplicationActivationOptions::NSApplicationActivateAllWindows,
-            );
-        }
+        tracing::warn!(target: "pip", app_pid, window_id, %error, "could not start PiP activation worker");
     }
-    // Host activation can synchronously close or replace a modal panel. Never
-    // carry the pre-activation proof across that side effect.
-    if !physical_target_is_live(target.target.pid, target.target.window_id)
-        || !pip_delegation_is_live(&target.target)
-        || !delegation_frame_proof_is_live(&target.target)
-    {
-        return;
-    }
-    if app_pid == target_pid {
-        let _ = crate::input::skylight::set_front_process_persistently(target_pid, window_id);
-    }
-    // Keep the final proof adjacent to the exact-window activation. This also
-    // covers same-process windows that may close during app activation.
-    if !physical_target_is_live(target.target.pid, target.target.window_id)
-        || !pip_delegation_is_live(&target.target)
-        || !delegation_frame_proof_is_live(&target.target)
-    {
-        return;
-    }
-    let _ = crate::input::skylight::make_exact_window_key(target_pid, window_id);
 }
 
 fn pointer_gesture_is_click(
@@ -2825,6 +2866,11 @@ fn pointer_gesture_is_click(
 
 unsafe extern "C" fn promote_clicked_app_cb(ctx: *mut c_void) {
     let target = *Box::from_raw(ctx as *mut ClickedTarget);
+    if !clicked_presentation_is_current(&target, &RENDERED_CARDS.lock().unwrap())
+        || !clicked_target_is_retained(&target.target)
+    {
+        return;
+    }
     let snapshot = {
         let mut model = VIEW_MODEL.lock().unwrap();
         let Some(model) = model.as_mut() else {
@@ -3162,24 +3208,10 @@ extern "C" fn card_mouse_down(
     }
     unsafe {
         let pid = hovered_pid_at_event(view, event);
-        let (target, front_pid) = VIEW_MODEL
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|model| {
-                (
-                    pid.and_then(|pid| {
-                        model.frame_for_app(pid).map(|frame| ClickedTarget {
-                            target: frame.target.clone(),
-                        })
-                    }),
-                    model
-                        .ordered_frames()
-                        .last()
-                        .map(|frame| frame.target.app_key_pid()),
-                )
-            })
-            .unwrap_or((None, None));
+        // The model may be ahead of the main-queue render, or its last card
+        // may be hidden because its source is foreground. Hit-test only the
+        // published presentation, including its actual visible front card.
+        let (target, front_pid) = rendered_click_target(&RENDERED_CARDS.lock().unwrap(), pid);
         let window: *mut AnyObject = msg_send![view, window];
         if !window.is_null() {
             let start_mouse: objc2_foundation::NSPoint =
@@ -4815,7 +4847,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_apps_rejects_late_seed_including_return_to_previous_app() {
+    fn cross_app_handoff_retains_seeds_but_new_observation_rejects_old_generation() {
         let mut model = PipViewModel::new(5);
         let mut finder = frame(1_049_011, 1_049_010).target;
         finder.session_id = Some("pip-switch-regression".into());
@@ -4825,9 +4857,10 @@ mod tests {
         let old_generation = reserve_pip_publication(&finder);
         model.select_target(&editor);
         assert!(
-            !model.accepts_target(&finder),
-            "late Finder seed cannot reselect itself"
+            model.accepts_target(&finder),
+            "the task still retains its first app"
         );
+        assert!(pip_publication_is_current(&finder, old_generation));
         model.select_target(&finder);
         let current_generation = reserve_pip_publication(&finder);
         assert!(model.accepts_target(&finder));
@@ -4845,6 +4878,90 @@ mod tests {
         finish_pip_observation(&target, generation);
         remove_expired_card_proof(target.app_key_pid());
         assert!(!pip_publication_is_current(&target, generation));
+    }
+
+    #[test]
+    fn card_click_uses_the_rendered_window_not_a_newer_unrendered_model() {
+        let old = frame(701, 70);
+        let newer = frame(702, 70);
+        let rect = CardRect {
+            x: 8.0,
+            y: 8.0,
+            width: 300.0,
+            height: 200.0,
+        };
+        let mut model = PipViewModel::new(5);
+        model.upsert(newer);
+        let cards = vec![(old.target.clone(), rect)];
+        let (clicked, front) = rendered_click_target(&cards, Some(70));
+        let clicked = clicked.unwrap();
+        assert_eq!(clicked.target.window_id, 701);
+        assert_eq!(front, Some(70));
+        assert_ne!(
+            clicked.target.window_id,
+            model.frame_for_app(70).unwrap().target.window_id
+        );
+    }
+
+    #[test]
+    fn hidden_latest_card_does_not_change_visible_front_card_click() {
+        let shown = frame(801, 80);
+        let hidden = frame(901, 90);
+        let mut model = PipViewModel::new(5);
+        model.upsert(shown.clone());
+        model.select_target(&hidden.target);
+        model.upsert(hidden);
+        assert_eq!(model.ordered_frames().last().unwrap().target.pid, 90);
+        let cards = vec![(
+            shown.target,
+            CardRect {
+                x: 8.0,
+                y: 8.0,
+                width: 300.0,
+                height: 200.0,
+            },
+        )];
+        let (clicked, front) = rendered_click_target(&cards, Some(80));
+        assert_eq!(clicked.unwrap().target.app_key_pid(), front.unwrap());
+        assert!(rendered_click_target(&cards, Some(90)).0.is_none());
+    }
+
+    #[test]
+    fn changed_window_session_or_layout_cancels_card_click() {
+        let mut target = frame(701, 70).target;
+        target.session_id = Some("pip-click-a".into());
+        let rect = CardRect {
+            x: 8.0,
+            y: 8.0,
+            width: 300.0,
+            height: 200.0,
+        };
+        let clicked = ClickedTarget {
+            target: target.clone(),
+            layout_rect: rect,
+        };
+        assert!(clicked_presentation_is_current(
+            &clicked,
+            &[(target.clone(), rect)]
+        ));
+        assert!(!clicked_presentation_is_current(&clicked, &[]));
+        let mut sibling = target.clone();
+        sibling.window_id += 1;
+        assert!(!clicked_presentation_is_current(
+            &clicked,
+            &[(sibling, rect)]
+        ));
+        let mut another_session = target.clone();
+        another_session.session_id = Some("pip-click-b".into());
+        assert!(!clicked_presentation_is_current(
+            &clicked,
+            &[(another_session, rect)]
+        ));
+        let moved = CardRect { y: 26.0, ..rect };
+        assert!(!clicked_presentation_is_current(
+            &clicked,
+            &[(target, moved)]
+        ));
     }
 
     #[test]
