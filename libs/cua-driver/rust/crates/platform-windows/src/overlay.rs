@@ -347,7 +347,7 @@ pub fn is_visible_for_session(key: &str) -> bool {
                     rs.core.cfg.enabled
                         && rs.core.visible
                         && rs.core.idle_alpha >= 0.004
-                        && rs.core.pos.0 >= -100.0
+                        && rs.core.has_position()
                 })
         })
         .unwrap_or(false)
@@ -435,7 +435,7 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
         .cursors
         .entry(key.clone())
         .or_insert_with(|| render_state_for_key(&template, &k));
-    if !(rs.core.cfg.enabled && rs.core.pos.0 < -50.0) {
+    if !(rs.core.cfg.enabled && !rs.core.has_position()) {
         return false;
     }
     let mut sx = target_x - SEED_OFFSET;
@@ -451,7 +451,7 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
             sy = (target_y + SEED_OFFSET).min(virt_y + virt_h - 2.0);
         }
     }
-    rs.core.pos = (sx, sy);
+    rs.core.set_position((sx, sy));
     true
 }
 
@@ -477,7 +477,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     let should_animate = {
         let guard = RENDER.lock().unwrap();
         match guard.as_ref().and_then(|m| m.cursors.get(&key)) {
-            Some(rs) if rs.core.cfg.enabled && rs.core.pos.0 > -50.0 => true,
+            Some(rs) if rs.core.cfg.enabled && rs.core.has_position() => true,
             _ => false,
         }
     };
@@ -586,7 +586,7 @@ impl RenderState {
             || self.core.session_badge_needs_frame_tick()
             || (self.core.motion.idle_hide_ms > 0.0
                 && self.core.visible
-                && self.core.pos.0 >= -100.0
+                && self.core.has_position()
                 && self.core.idle_alpha >= 0.004
                 && self.core.idle_alpha < 1.0)
     }
@@ -603,7 +603,7 @@ impl RenderState {
             && self.core.click_t.is_none()
             && self.core.motion.idle_hide_ms > 0.0
             && self.core.visible
-            && self.core.pos.0 >= -100.0
+            && self.core.has_position()
             && self.core.idle_alpha >= 1.0
     }
 }
@@ -986,7 +986,7 @@ fn composite_dirty(map: &RenderMap) -> Option<DirtyRect> {
         // (mirrors paint_cursor's own visibility early-return).
         let mut current: Option<DirtyRect> = None;
         for rs in map.cursors.values() {
-            if !rs.core.visible || rs.core.pos.0 < -100.0 || rs.core.idle_alpha < 0.004 {
+            if !rs.core.visible || !rs.core.has_position() || rs.core.idle_alpha < 0.004 {
                 continue;
             }
             let cx = (rs.core.pos.0 - map.virt_x as f64).round() as i32;
@@ -1800,7 +1800,11 @@ mod tests {
     fn seed_is_noop_when_cursor_already_on_screen() {
         let mut map = empty_map();
         seed_start_in_map(&mut map, &"sessA".to_owned(), 60.0, 60.0);
-        map.cursors.get_mut("sessA").unwrap().core.pos = (30.0, 30.0);
+        map.cursors
+            .get_mut("sessA")
+            .unwrap()
+            .core
+            .set_position((30.0, 30.0));
         let seeded_again = seed_start_in_map(&mut map, &"sessA".to_owned(), 80.0, 80.0);
         assert!(!seeded_again, "on-screen cursor must not be re-seeded");
         assert_eq!(

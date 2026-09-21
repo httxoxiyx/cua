@@ -380,7 +380,7 @@ fn apply_keyed_command(
     let core = cores
         .entry(key.clone())
         .or_insert_with(|| render_core_for_key(template, &key));
-    // Seed from the off-screen sentinel near the first targeted action so a
+    // Seed an unpositioned cursor near the first targeted action so a
     // spring animation begins on-screen. This mirrors the X11 renderer.
     let seed_target = match &cmd {
         OverlayCommand::MoveTo { x, y, .. }
@@ -390,12 +390,12 @@ fn apply_keyed_command(
         _ => None,
     };
     if let Some((target_x, target_y)) = seed_target {
-        if core.pos.0 < -50.0 {
+        if !core.has_position() {
             const SEED_OFFSET: f64 = 140.0;
-            core.pos = (
+            core.set_position((
                 (target_x - SEED_OFFSET).max(2.0),
                 (target_y - SEED_OFFSET).max(2.0),
-            );
+            ));
         }
     }
 
@@ -493,7 +493,7 @@ fn visible_cores_for_output<'a>(
         .iter()
         .filter(|(_, core)| {
             core.visible
-                && core.pos.0 >= -100.0
+                && core.has_position()
                 && core.idle_alpha >= 0.004
                 && select_output(layouts, core.pos.0, core.pos.1)
                     .is_some_and(|selected| selected.id == output_id)
@@ -792,7 +792,7 @@ fn tick_all_cores(cores: &mut HashMap<CursorKey, RenderStateCore>, dt: f64) {
 }
 
 fn needs_frame_tick(core: &RenderStateCore) -> bool {
-    if !core.visible || core.pos.0 < -100.0 {
+    if !core.visible || !core.has_position() {
         return false;
     }
     let fade_start = core.motion.idle_hide_ms / 1000.0;
@@ -807,7 +807,7 @@ fn needs_frame_tick(core: &RenderStateCore) -> bool {
 
 fn idle_fade_wait(core: &RenderStateCore) -> Option<Duration> {
     if !core.visible
-        || core.pos.0 < -100.0
+        || !core.has_position()
         || core.motion.idle_hide_ms <= 0.0
         || core.path.is_some()
         || core.spring.is_some()
@@ -853,7 +853,7 @@ fn redraw(
     let cursor_positions = state
         .cores
         .values()
-        .filter(|core| core.visible && core.pos.0 >= -100.0 && core.idle_alpha >= 0.004)
+        .filter(|core| core.visible && core.has_position() && core.idle_alpha >= 0.004)
         .map(|core| core.pos);
     let (selected, targets) = frame_plan(
         &layouts,
@@ -1328,7 +1328,7 @@ mod tests {
 
     fn positioned_core() -> RenderStateCore {
         let mut core = RenderStateCore::new(CursorConfig::default());
-        core.pos = (100.0, 100.0);
+        core.set_position((100.0, 100.0));
         core.motion.idle_hide_ms = 1_000.0;
         core
     }
@@ -1415,7 +1415,7 @@ mod tests {
             },
         ];
         let mut core = positioned_core();
-        core.pos = (400.0, 300.0);
+        core.set_position((400.0, 300.0));
         let cores = HashMap::from([("session".to_owned(), core)]);
 
         assert_eq!(select_output(&layouts, 400.0, 300.0).unwrap().id, 4);

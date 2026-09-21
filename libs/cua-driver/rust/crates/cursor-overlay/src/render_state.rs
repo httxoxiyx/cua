@@ -20,7 +20,7 @@
 //!   layer their own behaviour on top (e.g. macOS ShowFocusRect).
 //! - [`render_frame`] — the tiny-skia paint of the selected cursor theme.
 //!   Parametrised by pixmap dimensions and an origin offset so Windows can
-//!   pass `(virt_x, virt_y)` while macOS / Linux pass `(0, 0)`.
+//!   pass a virtual-screen origin and macOS can paint each display separately.
 //!
 //! ## What stays per-platform
 //!
@@ -52,8 +52,10 @@ pub struct RenderStateCore {
     pub cfg: CursorConfig,
     /// Current motion / timing config (mutable via [`OverlayCommand::SetMotion`]).
     pub motion: MotionConfig,
-    /// Current rendered position in screen / overlay-window coordinates.
+    /// Current rendered position in global screen points. Use `set_position`
+    /// for first placement; negative coordinates are valid desktop locations.
     pub pos: (f64, f64),
+    position_initialized: bool,
     /// Visual heading in radians (tip direction = motion_dir + π).
     pub heading: f64,
     /// In-flight planned path; `None` = at rest.
@@ -103,9 +105,8 @@ pub struct RenderStateCore {
 
 impl RenderStateCore {
     /// Build the core from a launch-time CursorConfig.
-    /// `pos` starts at the off-screen sentinel `(-200, -200)` to indicate
-    /// "never placed on screen yet" — the click path uses this to detect
-    /// first-placement and snap rather than animate.
+    /// Placement is tracked independently of coordinates: even `(-200, -200)`
+    /// can be a real point on a display above/left of the primary display.
     pub fn new(cfg: CursorConfig) -> Self {
         let motion = cfg.motion.clone();
         let visual = CursorVisualState {
@@ -130,6 +131,7 @@ impl RenderStateCore {
             theme,
             theme_fallback,
             pos: (-200.0, -200.0),
+            position_initialized: false,
             heading: std::f64::consts::FRAC_PI_4,
             path: None,
             dist: 0.0,
@@ -150,8 +152,18 @@ impl RenderStateCore {
         }
     }
 
+    pub fn has_position(&self) -> bool {
+        self.position_initialized && self.pos.0.is_finite() && self.pos.1.is_finite()
+    }
+
+    /// Place/seed the cursor without changing its animation or semantic state.
+    pub fn set_position(&mut self, position: (f64, f64)) {
+        self.pos = position;
+        self.position_initialized = position.0.is_finite() && position.1.is_finite();
+    }
+
     fn cursor_is_revealed(&self) -> bool {
-        self.visible && self.pos.0 >= -100.0 && self.idle_alpha >= 0.004
+        self.visible && self.has_position() && self.idle_alpha >= 0.004
     }
 
     fn reveal_session_badge(&mut self) {
@@ -511,9 +523,12 @@ impl RenderStateCore {
         let tx = x + end_heading_radians.cos() * CLICK_OFFSET;
         let ty = y + end_heading_radians.sin() * CLICK_OFFSET;
 
-        if move_to_snap_sentinel && self.pos.0 < -50.0 {
-            self.pos = (tx, ty);
+        if move_to_snap_sentinel && !self.has_position() {
+            self.set_position((tx, ty));
         }
+        // Other platforms can retain their first-move path from the seeded
+        // start. From this command onward, placement is explicit on all hosts.
+        self.position_initialized = true;
         let (x0, y0) = self.pos;
         let th0 = self.heading + std::f64::consts::PI;
         let th1 = end_heading_radians + std::f64::consts::PI;
@@ -604,7 +619,7 @@ impl RenderStateCore {
     ///
     /// `move_to_snap_sentinel` controls macOS-only behaviour: when `true`,
     /// `MoveTo` snaps `self.pos` to the offset target if the cursor is
-    /// still at the off-screen sentinel (`pos.0 < -50.0`).  Windows/Linux
+    /// not yet placed on the desktop. Windows/Linux
     /// pass `false` here.
     ///
     /// `click_pulse_sentinel_only` likewise controls macOS-only behaviour:
@@ -641,7 +656,7 @@ impl RenderStateCore {
                 heading_radians,
             } => {
                 let reveal_badge = !self.cursor_is_revealed();
-                self.pos = (x, y);
+                self.set_position((x, y));
                 if let Some(heading) = heading_radians {
                     self.heading = heading;
                 }
@@ -671,17 +686,17 @@ impl RenderStateCore {
                 if click_pulse_sentinel_only {
                     // macOS: only snap position on first placement (sentinel state).
                     // After that the cursor stays where the animation landed.
-                    if self.pos.0 < -50.0 {
+                    if !self.has_position() {
                         // Apply same click offset so tip lands at click point.
                         const CLICK_OFFSET: f64 = 16.0;
                         let angle = std::f64::consts::FRAC_PI_4;
-                        self.pos = (
+                        self.set_position((
                             x + angle.cos() * CLICK_OFFSET,
                             y + angle.sin() * CLICK_OFFSET,
-                        );
+                        ));
                     }
                 } else {
-                    self.pos = (x, y);
+                    self.set_position((x, y));
                 }
                 self.click_t = Some(0.0);
                 if matches!(
@@ -799,8 +814,8 @@ pub struct FocusRect {
 ///
 /// `origin_x`, `origin_y` are subtracted from the cursor `core.pos` before
 /// drawing — Windows passes the virtual-screen `(virt_x, virt_y)` so the
-/// pixmap is laid out in window-local coordinates.  macOS / Linux pass
-/// `(0.0, 0.0)`.
+/// pixmap is laid out in window-local coordinates. macOS passes each display's
+/// global origin; Linux uses its display-local origin.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio
 /// (e.g. 2.0 on a retina display where the pixmap is sized at physical
@@ -825,11 +840,11 @@ pub fn render_frame(
 /// Paint a single cursor (bloom + click-pulse + optional focus-rect + arrow)
 /// into a caller-owned [`tiny_skia::Pixmap`]. tiny-skia's `fill_*` / `stroke_*`
 /// are alpha-over, so painting several cursors into the same pixmap composites
-/// them with later calls drawn on top — this is what lets the macOS overlay
-/// render N owned cursors into one buffer / one NSWindow.
+/// them with later calls drawn on top — this lets each macOS display surface
+/// render the same N owned cursors without advancing their animations twice.
 ///
 /// `origin_x` / `origin_y` are subtracted from `core.pos` before drawing
-/// (Windows passes the virtual-screen origin; macOS / Linux pass `(0.0, 0.0)`).
+/// (Windows passes the virtual-screen origin; macOS passes the display origin).
 /// Both are in **logical** screen points, just like `core.pos`.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio.
@@ -853,7 +868,7 @@ pub fn paint_cursor(
     focus_rect: Option<FocusRect>,
     backing_scale: f32,
 ) {
-    if !core.visible || core.pos.0 < -100.0 || core.idle_alpha < 0.004 {
+    if !core.visible || !core.has_position() || core.idle_alpha < 0.004 {
         return;
     }
 
@@ -878,8 +893,8 @@ pub fn paint_cursor(
         let (cr, cg, cb) = (0x5Eu8, 0xC0u8, 0xE8u8);
 
         if let Some(rect) = tiny_skia::Rect::from_xywh(
-            (fx * s) as f32,
-            (fy * s) as f32,
+            ((fx - origin_x) * s) as f32,
+            ((fy - origin_y) * s) as f32,
             (fw * s) as f32,
             (fh * s) as f32,
         ) {
@@ -948,6 +963,13 @@ pub fn paint_cursor(
         );
     }
 
+    // Clamp the badge only inside the viewport containing its cursor anchor.
+    // Otherwise painting the same global cursor on several displays would
+    // pull a duplicate badge onto every unrelated screen's nearest edge.
+    // Cursor artwork and focus rectangles above may still cross display edges.
+    if px < 0.0 || py < 0.0 || px >= pm.width() as f64 || py >= pm.height() as f64 {
+        return;
+    }
     let (delivery, target) = core.badge_modifiers.unwrap_or((None, None));
     if let Some(layout) = crate::session_badge_layout(crate::SessionBadgeInput {
         label: core.session_label.as_deref(),
@@ -980,7 +1002,7 @@ mod glide_duration_tests {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.motion.glide_duration_ms = glide_ms;
         core.motion.idle_hide_ms = 0.0;
-        core.pos = (0.0, 0.0);
+        core.set_position((0.0, 0.0));
         // Aligned headings → an effectively straight path of length ~dist_pts.
         core.path = Some(PathPlanner::plan(
             0.0, 0.0, 0.0, dist_pts, 0.0, 0.0, 0.0, 80.0,
@@ -1032,7 +1054,7 @@ mod glide_duration_tests {
         for swift in [false, true] {
             let mut core = RenderStateCore::new(CursorConfig::default());
             core.motion.glide_duration_ms = 50.0;
-            core.pos = (0.0, 0.0);
+            core.set_position((0.0, 0.0));
             assert!(core.apply_command_base(
                 OverlayCommand::MoveToThenClickPulse {
                     x: 120.0,
@@ -1067,7 +1089,7 @@ mod glide_duration_tests {
     fn newer_plain_move_cancels_a_deferred_click_pulse() {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.motion.glide_duration_ms = 50.0;
-        core.pos = (0.0, 0.0);
+        core.set_position((0.0, 0.0));
         core.apply_command_base(
             OverlayCommand::MoveToThenClickPulse {
                 x: 120.0,
@@ -1100,7 +1122,7 @@ mod glide_duration_tests {
     fn deferred_pulse_does_not_replace_newer_semantic_action() {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.motion.glide_duration_ms = 50.0;
-        core.pos = (0.0, 0.0);
+        core.set_position((0.0, 0.0));
         core.apply_command_base(
             OverlayCommand::BeginAction {
                 action: CursorAction::Click,
@@ -1250,7 +1272,7 @@ mod session_badge_and_action_tests {
     #[test]
     fn hardware_pointer_hover_reveals_only_while_over_cursor() {
         let mut core = RenderStateCore::new(CursorConfig::default());
-        core.pos = (300.0, 240.0);
+        core.set_position((300.0, 240.0));
         core.apply_command_base(
             OverlayCommand::SetSessionLabel("Research".into()),
             false,
@@ -1272,7 +1294,7 @@ mod session_badge_and_action_tests {
     #[test]
     fn movement_preserves_the_active_semantic_action() {
         let mut core = RenderStateCore::new(CursorConfig::default());
-        core.pos = (20.0, 20.0);
+        core.set_position((20.0, 20.0));
         core.apply_command_base(
             OverlayCommand::BeginAction {
                 action: CursorAction::Text,
@@ -1305,7 +1327,7 @@ mod session_badge_and_action_tests {
     #[test]
     fn modifiers_live_in_the_badge_then_fade_after_action_completion() {
         let mut core = RenderStateCore::new(CursorConfig::default());
-        core.pos = (200.0, 200.0);
+        core.set_position((200.0, 200.0));
         core.apply_command_base(
             OverlayCommand::BeginAction {
                 action: CursorAction::Click,
@@ -1399,6 +1421,151 @@ mod session_badge_and_action_tests {
 }
 
 #[cfg(test)]
+mod multi_display_tests {
+    use super::*;
+
+    #[test]
+    fn unplaced_and_negative_desktop_positions_are_distinct() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        assert!(!core.has_position());
+        let empty = render_frame(&core, 256, 256, -300.0, -300.0, None, 1.0);
+        assert!(empty.data().iter().all(|value| *value == 0));
+
+        // This used to be the sentinel, but is a perfectly valid desktop point.
+        core.set_position((-200.0, -200.0));
+        assert!(core.has_position());
+        let placed = render_frame(&core, 256, 256, -300.0, -300.0, None, 1.0);
+        assert!(placed.data().chunks_exact(4).any(|pixel| pixel[3] > 96));
+        core.session_label = Some("second display".into());
+        core.session_badge_secs = 0.0;
+        assert!(core.session_badge_is_visible());
+        assert!(core.update_session_badge_hover(Some((-200.0, -200.0))));
+    }
+
+    #[test]
+    fn negative_position_does_not_snap_on_the_next_move_or_click() {
+        for start in [(-200.0, -200.0), (-1500.0, 200.0), (500.0, -600.0)] {
+            let mut core = RenderStateCore::new(CursorConfig::default());
+            core.set_position(start);
+            core.apply_command_base(OverlayCommand::ClickPulse { x: 20.0, y: 30.0 }, true, true);
+            assert_eq!(core.pos, start, "a later click is not first placement");
+            core.apply_command_base(
+                OverlayCommand::MoveTo {
+                    x: 100.0,
+                    y: 200.0,
+                    end_heading_radians: 0.0,
+                },
+                true,
+                true,
+            );
+            assert_eq!(
+                core.pos, start,
+                "glide must begin at the existing negative point"
+            );
+            assert!(core.path.is_some());
+        }
+    }
+
+    #[test]
+    fn cursor_and_focus_pixels_translate_with_each_display_origin_and_scale() {
+        for scale in [1.0, 2.0] {
+            let size = (256.0 * scale) as u32;
+            let mut reference = RenderStateCore::new(CursorConfig::default());
+            reference.set_position((100.0, 100.0));
+            let expected = render_frame(
+                &reference,
+                size,
+                size,
+                0.0,
+                0.0,
+                Some(FocusRect {
+                    rect: [30.0, 40.0, 25.0, 10.0],
+                    t: 0.2,
+                }),
+                scale,
+            );
+            for (x, y) in [
+                (-300.0, -300.0),
+                (-192.0, -1080.0),
+                (-1920.0, 0.0),
+                (1728.0, 0.0),
+                (0.0, 1117.0),
+            ] {
+                let mut translated = RenderStateCore::new(CursorConfig::default());
+                translated.set_position((x + 100.0, y + 100.0));
+                let actual = render_frame(
+                    &translated,
+                    size,
+                    size,
+                    x,
+                    y,
+                    Some(FocusRect {
+                        rect: [x + 30.0, y + 40.0, 25.0, 10.0],
+                        t: 0.2,
+                    }),
+                    scale,
+                );
+                assert_eq!(
+                    actual.data(),
+                    expected.data(),
+                    "origin=({x},{y}), scale={scale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offscreen_badges_are_not_clamped_onto_unrelated_displays() {
+        for scale in [1.0, 2.0] {
+            let size = (256.0 * scale) as u32;
+            for point in [
+                (-500.0, 128.0),
+                (128.0, -500.0),
+                (900.0, 128.0),
+                (128.0, 900.0),
+            ] {
+                let mut core = RenderStateCore::new(CursorConfig::default());
+                core.set_position(point);
+                core.session_label = Some("external display".into());
+                core.session_badge_secs = 0.0;
+                core.badge_modifiers =
+                    Some((Some(DeliveryModifier::Background), Some(TargetModifier::Ax)));
+                let unrelated = render_frame(&core, size, size, 0.0, 0.0, None, scale);
+                assert!(
+                    unrelated.data().iter().all(|value| *value == 0),
+                    "{point:?} at {scale}x"
+                );
+                let own = render_frame(
+                    &core,
+                    size,
+                    size,
+                    point.0 - 128.0,
+                    point.1 - 128.0,
+                    None,
+                    scale,
+                );
+                assert!(own.data().chunks_exact(4).any(|pixel| pixel[3] > 96));
+            }
+        }
+    }
+
+    #[test]
+    fn nonfinite_position_is_not_renderable_and_can_be_replaced() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        for point in [(f64::NAN, 1.0), (1.0, f64::INFINITY)] {
+            core.set_position(point);
+            assert!(!core.has_position());
+            assert!(render_frame(&core, 32, 32, 0.0, 0.0, None, 1.0)
+                .data()
+                .iter()
+                .all(|value| *value == 0));
+        }
+        core.set_position((-400.0, -100.0));
+        assert!(core.has_position());
+    }
+}
+
+#[cfg(test)]
 mod backing_scale_tests {
     use super::*;
     use crate::CursorConfig;
@@ -1435,7 +1602,7 @@ mod backing_scale_tests {
         // Place the cursor at the centre of the logical area and disable
         // idle-fade so the arrow paints at full alpha regardless of timing.
         let centre = logical_size as f64 / 2.0;
-        core.pos = (centre, centre);
+        core.set_position((centre, centre));
         core.idle_alpha = 1.0;
         core.visible = true;
 

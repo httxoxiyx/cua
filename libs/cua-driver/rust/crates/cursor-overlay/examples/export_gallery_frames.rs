@@ -137,10 +137,10 @@ fn export_state(output: &Path, state: GalleryState) {
         config.cursor_id = "gallery-session".into();
         let mut core = RenderStateCore::new(config);
         core.motion.idle_hide_ms = 0.0;
-        core.pos = (
+        core.set_position((
             f64::from(SIZE) / (2.0 * f64::from(PREVIEW_BACKING_SCALE)),
             f64::from(SIZE) / (2.0 * f64::from(PREVIEW_BACKING_SCALE)),
-        );
+        ));
         core.heading = f64::from(std::f32::consts::FRAC_PI_4);
         if let Some(session_label) = state.session_label {
             core.apply_command_base(
