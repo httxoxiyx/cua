@@ -207,7 +207,8 @@ impl Tool for SetValueTool {
                 cursor_key.clone(),
                 cursor_overlay::OverlayCommand::PinAbove(window_id as u64),
             );
-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
+            crate::cursor::overlay::animate_input_feedback(cursor_key.clone(), screen_x, screen_y)
+                .await;
             self.state
                 .cursor_registry
                 .update_position(&cursor_key, screen_x, screen_y);

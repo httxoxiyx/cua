@@ -445,7 +445,7 @@ impl Tool for TypeTextTool {
                     cursor_key.clone(),
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
-                crate::cursor::overlay::animate_typing_feedback(
+                crate::cursor::overlay::animate_input_feedback(
                     cursor_key.clone(),
                     screen_x,
                     screen_y,

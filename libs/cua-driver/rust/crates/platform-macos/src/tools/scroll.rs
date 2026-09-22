@@ -600,7 +600,7 @@ impl Tool for ScrollTool {
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
             }
-            crate::cursor::overlay::animate_cursor_to(
+            crate::cursor::overlay::animate_input_feedback(
                 cursor_key.clone(),
                 target.screen_x,
                 target.screen_y,

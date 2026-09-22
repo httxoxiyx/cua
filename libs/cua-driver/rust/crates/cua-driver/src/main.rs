@@ -9,7 +9,8 @@
 //!   --cursor-theme <installed-theme-id>   installed cursor theme
 //!   --cursor-reduced-motion <auto|on|off> accessibility motion preference
 //!   --no-overlay                          start with overlay disabled
-//!   --async-click-feedback                do not wait for decorative click glides
+//!   --async-click-feedback                default: do not wait for decorative glides
+//!   --sync-click-feedback                 wait for decorative glides (demonstrations)
 //!   --glide-ms     <f64>                  glide duration override
 //!   --dwell-ms     <f64>                  post-click dwell override
 //!   --idle-hide-ms <f64>                  idle-hide timeout override
@@ -984,8 +985,9 @@ fn main() {
             experimental_pip,
         } => {
             let startup_started = std::time::Instant::now();
-            let async_click_feedback =
-                cursor_overlay::CursorConfig::from_args().async_click_feedback;
+            let feedback_override = cursor_overlay::CursorConfig::click_feedback_override(
+                &std::env::args().skip(1).collect::<Vec<_>>(),
+            );
             // Long-running MCP proxy — kick off the background update check
             // before connecting to or launching the daemon.
             version_check::maybe_announce_update();
@@ -1011,7 +1013,7 @@ fn main() {
                     claude_code_compat,
                     &grants,
                     experimental_pip,
-                    async_click_feedback,
+                    feedback_override,
                     |daemon, success| {
                         telemetry::capture_mcp_startup_completed(
                             "daemon_proxy",
@@ -1281,8 +1283,9 @@ fn main() -> anyhow::Result<()> {
             experimental_pip,
         } => {
             let startup_started = std::time::Instant::now();
-            let async_click_feedback =
-                cursor_overlay::CursorConfig::from_args().async_click_feedback;
+            let feedback_override = cursor_overlay::CursorConfig::click_feedback_override(
+                &std::env::args().skip(1).collect::<Vec<_>>(),
+            );
             // Long-running MCP proxy — kick off the background update check
             // before connecting to the daemon.
             version_check::maybe_announce_update();
@@ -1303,7 +1306,7 @@ fn main() -> anyhow::Result<()> {
                     claude_code_compat,
                     &grants,
                     experimental_pip,
-                    async_click_feedback,
+                    feedback_override,
                     |daemon, success| {
                         telemetry::capture_mcp_startup_completed(
                             "daemon_proxy",

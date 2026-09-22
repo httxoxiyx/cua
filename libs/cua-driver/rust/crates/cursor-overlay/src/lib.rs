@@ -68,8 +68,8 @@ pub struct CursorConfig {
     /// Pass `--no-overlay` to disable.
     pub enabled: bool,
 
-    /// Whether click-family tools enqueue cursor animation as best-effort
-    /// feedback instead of waiting for the glide before delivering input.
+    /// Whether input tools enqueue cursor animation as best-effort feedback
+    /// instead of waiting for the glide before delivering input (the default).
     pub async_click_feedback: bool,
 }
 
@@ -81,7 +81,7 @@ impl Default for CursorConfig {
             reduced_motion: ReducedMotion::Auto,
             motion: MotionConfig::default(),
             enabled: true,
-            async_click_feedback: false,
+            async_click_feedback: true,
         }
     }
 }
@@ -94,7 +94,8 @@ impl CursorConfig {
     /// --cursor-theme <installed-theme-id>
     /// --cursor-reduced-motion <auto|on|off>
     /// --no-overlay                (start with overlay disabled)
-    /// --async-click-feedback      (do not block input on cursor animation)
+    /// --async-click-feedback      (default: do not block input on cursor animation)
+    /// --sync-click-feedback       (wait for decorative glides, for demonstrations)
     /// --glide-ms     <f64>        (glideDurationMs override)
     /// --dwell-ms     <f64>        (dwellAfterClickMs override)
     /// --idle-hide-ms <f64>        (idleHideMs override)
@@ -102,6 +103,17 @@ impl CursorConfig {
     pub fn from_args() -> Self {
         let args: Vec<String> = std::env::args().collect();
         Self::parse(&args[1..])
+    }
+
+    /// An MCP client only requests a launch-time override when a flag was
+    /// explicitly supplied. The asynchronous default must not prevent a plain
+    /// client from connecting to an already-running daemon.
+    pub fn click_feedback_override(args: &[String]) -> Option<bool> {
+        args.iter().rev().find_map(|arg| match arg.as_str() {
+            "--async-click-feedback" => Some(true),
+            "--sync-click-feedback" => Some(false),
+            _ => None,
+        })
     }
 
     pub fn parse(args: &[String]) -> Self {
@@ -132,7 +144,6 @@ impl CursorConfig {
                     }
                 }
                 "--no-overlay" => cfg.enabled = false,
-                "--async-click-feedback" => cfg.async_click_feedback = true,
                 "--glide-ms" => {
                     if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
                         cfg.motion.glide_duration_ms = v;
@@ -154,6 +165,9 @@ impl CursorConfig {
                 _ => {}
             }
             i += 1;
+        }
+        if let Some(asynchronous) = Self::click_feedback_override(args) {
+            cfg.async_click_feedback = asynchronous;
         }
         cfg
     }
@@ -442,9 +456,29 @@ mod pointer_tracking_tests {
     }
 
     #[test]
-    fn async_click_feedback_is_opt_in() {
-        assert!(!CursorConfig::default().async_click_feedback);
-        let args = vec!["--async-click-feedback".to_owned()];
-        assert!(CursorConfig::parse(&args).async_click_feedback);
+    fn decorative_feedback_is_asynchronous_without_an_explicit_override() {
+        assert!(CursorConfig::default().async_click_feedback);
+        assert!(CursorConfig::parse(&[]).async_click_feedback);
+        assert_eq!(CursorConfig::click_feedback_override(&[]), None);
+    }
+
+    #[test]
+    fn feedback_flags_preserve_explicit_launch_mode_and_last_flag_wins() {
+        for (flags, expected) in [
+            (vec!["--async-click-feedback"], true),
+            (vec!["--sync-click-feedback"], false),
+            (
+                vec!["--async-click-feedback", "--sync-click-feedback"],
+                false,
+            ),
+            (
+                vec!["--sync-click-feedback", "--async-click-feedback"],
+                true,
+            ),
+        ] {
+            let args: Vec<String> = flags.into_iter().map(str::to_owned).collect();
+            assert_eq!(CursorConfig::parse(&args).async_click_feedback, expected);
+            assert_eq!(CursorConfig::click_feedback_override(&args), Some(expected));
+        }
     }
 }

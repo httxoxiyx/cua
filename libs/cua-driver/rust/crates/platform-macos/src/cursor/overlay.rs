@@ -89,6 +89,12 @@ fn take_superseded_arrival(
 
 enum RenderEvent {
     Cursor(OverlayMsg),
+    Feedback {
+        key: CursorKey,
+        x: f64,
+        y: f64,
+        click_pulse: bool,
+    },
     DisplaysChanged,
 }
 
@@ -97,6 +103,9 @@ static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<RenderEvent>> = OnceLock::ne
 static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<RenderEvent>>> = Mutex::new(None);
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 static RENDER_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
+// Immutable after init. Input must not acquire the renderer's painting lock
+// just to learn whether its decorative feedback should be non-blocking.
+static ASYNC_CLICK_FEEDBACK: AtomicBool = AtomicBool::new(true);
 const CURSOR_ARRIVAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The keyed, insertion-ordered collection of owned cursors that the render
@@ -132,6 +141,35 @@ fn publish_display_layout(layout: DisplayLayout) {
 fn apply_render_event(map: &mut RenderMap, event: RenderEvent) -> Option<CursorKey> {
     match event {
         RenderEvent::Cursor(message) => apply_msg(map, message),
+        RenderEvent::Feedback {
+            key,
+            x,
+            y,
+            click_pulse,
+        } => {
+            if key.is_empty() || !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            // First placement and display recovery belong to the renderer too.
+            // Otherwise even an asynchronous action can wait for full-display
+            // painting (or theme loading) before it gets to enqueue its move.
+            seed_start_in_map(map, &key, x, y);
+            if map.ended.contains(&key)
+                || !map
+                    .cursors
+                    .get(&key)
+                    .is_some_and(|state| state.core.cfg.enabled && state.core.has_position())
+            {
+                return None;
+            }
+            apply_msg(
+                map,
+                OverlayMsg::Cmd(KeyedOverlayCommand {
+                    key,
+                    cmd: cursor_feedback_move(x, y, click_pulse),
+                }),
+            )
+        }
         RenderEvent::DisplaysChanged => None,
     }
 }
@@ -198,6 +236,7 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
 pub fn init(cfg: CursorConfig) {
     static INITIALIZED: OnceLock<()> = OnceLock::new();
     INITIALIZED.get_or_init(|| {
+        ASYNC_CLICK_FEEDBACK.store(cfg.async_click_feedback, Ordering::Release);
         let (tx, rx) = std::sync::mpsc::sync_channel(4096);
         CMD_TX
             .set(tx)
@@ -483,25 +522,11 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     }
 }
 
-/// Present decorative click feedback without changing input-delivery timing.
-///
-/// The default synchronized mode preserves the historical contract by waiting
-/// for the cursor glide; the caller then emits its ordinary `ClickPulse` at the
-/// existing point in the action flow. With `--async-click-feedback`, enqueue
-/// one render-thread-owned glide+arrival-pulse command and return immediately
-/// so the real pointer action is not coupled to overlay frame cadence.
-///
-/// Returns `true` when the arrival pulse was queued. The caller must then skip
-/// its ordinary immediate `ClickPulse` command.
-pub fn async_click_feedback_enabled(key: &str) -> bool {
-    {
-        let guard = RENDER.lock().unwrap();
-        guard
-            .as_ref()
-            .and_then(|map| map.cursors.get(key).map(|state| &state.core.cfg))
-            .or_else(|| guard.as_ref().map(|map| &map.template))
-            .is_some_and(|cfg| cfg.async_click_feedback)
-    }
+/// Launch-time feedback mode, shared by every session's cursor. Reading it
+/// never waits for the renderer. Explicit move_cursor/drag keep their own
+/// arrival semantics; input decoration is asynchronous by default.
+pub fn async_click_feedback_enabled(_key: &str) -> bool {
+    ASYNC_CLICK_FEEDBACK.load(Ordering::Acquire)
 }
 
 /// Queue a renderer-owned glide followed by a click pulse. Returns `true`
@@ -529,18 +554,24 @@ fn cursor_feedback_move(x: f64, y: f64, click_pulse: bool) -> OverlayCommand {
 }
 
 fn queue_async_cursor_feedback(key: CursorKey, x: f64, y: f64, click_pulse: bool) -> bool {
-    if key.is_empty() {
+    if !RENDER_LOOP_RUNNING.load(Ordering::Acquire) {
         return false;
     }
-    seed_start_if_sentinel(&key, x, y);
-    let should_animate = {
-        let guard = RENDER.lock().unwrap();
-        matches!(
-            guard.as_ref().and_then(|map| map.cursors.get(&key)),
-            Some(state) if state.core.cfg.enabled && state.core.has_position()
-        )
+    let Some(sender) = CMD_TX.get() else {
+        return false;
     };
-    if !should_animate || !RENDER_LOOP_RUNNING.load(Ordering::Acquire) {
+    enqueue_cursor_feedback(sender, &ARRIVAL_TX, key, x, y, click_pulse)
+}
+
+fn enqueue_cursor_feedback(
+    sender: &std::sync::mpsc::SyncSender<RenderEvent>,
+    arrivals: &Mutex<Option<HashMap<CursorKey, tokio::sync::oneshot::Sender<()>>>>,
+    key: CursorKey,
+    x: f64,
+    y: f64,
+    click_pulse: bool,
+) -> bool {
+    if key.is_empty() || !x.is_finite() || !y.is_finite() {
         return false;
     }
     // Hold the arrival map lock across enqueue + waiter removal. The render
@@ -548,9 +579,16 @@ fn queue_async_cursor_feedback(key: CursorKey, x: f64, y: f64, click_pulse: bool
     // this new asynchronous path's arrival for the superseded synchronous
     // move. If enqueue fails, leave the original waiter untouched.
     let superseded = {
-        let mut arrivals = ARRIVAL_TX.lock().unwrap();
-        let enqueued = send_command(key.clone(), cursor_feedback_move(x, y, click_pulse));
-        if !enqueued {
+        let mut arrivals = arrivals.lock().unwrap();
+        if sender
+            .try_send(RenderEvent::Feedback {
+                key: key.clone(),
+                x,
+                y,
+                click_pulse,
+            })
+            .is_err()
+        {
             return false;
         }
         take_superseded_arrival(&mut arrivals, &key, true)
@@ -561,34 +599,36 @@ fn queue_async_cursor_feedback(key: CursorKey, x: f64, y: f64, click_pulse: bool
     true
 }
 
+/// Return whether a renderer-owned arrival pulse was queued. Callers skip
+/// their immediate pulse in that case, without delaying the actual input.
 pub async fn animate_click_feedback(key: CursorKey, x: f64, y: f64) -> bool {
-    let asynchronous = async_click_feedback_enabled(&key);
-
-    if asynchronous {
-        return queue_async_click_feedback(key, x, y);
-    }
-
-    animate_cursor_to(key, x, y).await;
-    false
+    let wait_key = key.clone();
+    animate_feedback_using(
+        async_click_feedback_enabled(&key),
+        || queue_async_click_feedback(key, x, y),
+        animate_cursor_to(wait_key, x, y),
+    )
+    .await
 }
 
-async fn animate_typing_feedback_using(
+async fn animate_feedback_using(
     asynchronous: bool,
     enqueue_move: impl FnOnce() -> bool,
     wait_for_arrival: impl std::future::Future<Output = ()>,
-) {
+) -> bool {
     if asynchronous {
         // A missing/full renderer must not reintroduce an arrival wait.
-        let _ = enqueue_move();
+        enqueue_move()
     } else {
         wait_for_arrival.await;
+        false
     }
 }
 
-/// Show element-targeted typing feedback without synthesizing a click pulse.
-pub async fn animate_typing_feedback(key: CursorKey, x: f64, y: f64) {
+/// Show input feedback (typing, AXValue or scrolling) without a click pulse.
+pub async fn animate_input_feedback(key: CursorKey, x: f64, y: f64) {
     let wait_key = key.clone();
-    animate_typing_feedback_using(
+    let _ = animate_feedback_using(
         async_click_feedback_enabled(&key),
         || queue_async_cursor_feedback(key, x, y, false),
         animate_cursor_to(wait_key, x, y),
@@ -1205,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn asynchronous_typing_feedback_does_not_wait_for_arrival() {
+    fn asynchronous_input_feedback_does_not_wait_for_arrival_even_when_queue_rejects() {
         use std::{
             cell::Cell,
             future::Future,
@@ -1213,7 +1253,7 @@ mod tests {
         };
         for accepted in [false, true] {
             let queued = Cell::new(false);
-            let mut feedback = Box::pin(animate_typing_feedback_using(
+            let mut feedback = Box::pin(animate_feedback_using(
                 true,
                 || {
                     queued.set(true);
@@ -1222,21 +1262,18 @@ mod tests {
                 std::future::pending(),
             ));
             let mut context = Context::from_waker(Waker::noop());
-            assert!(matches!(
-                feedback.as_mut().poll(&mut context),
-                Poll::Ready(())
-            ));
+            assert_eq!(feedback.as_mut().poll(&mut context), Poll::Ready(accepted));
             assert!(queued.get(), "async mode must attempt one nonblocking move");
         }
     }
 
     #[test]
-    fn synchronous_typing_feedback_still_waits_for_arrival() {
+    fn explicit_synchronous_feedback_still_waits_for_arrival() {
         use std::{
             future::Future,
             task::{Context, Poll, Waker},
         };
-        let mut feedback = Box::pin(animate_typing_feedback_using(
+        let mut feedback = Box::pin(animate_feedback_using(
             false,
             || panic!("synchronous mode must not enqueue an async move"),
             std::future::pending(),
@@ -1296,6 +1333,112 @@ mod tests {
             template: CursorConfig::default(),
             ended: std::collections::HashSet::new(),
         }
+    }
+
+    #[test]
+    fn feedback_enqueue_does_not_wait_for_painting_or_a_renderer_tick() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let arrivals = Mutex::new(None);
+        let (completed, completion) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let painting = RENDER.lock().unwrap();
+            scope.spawn(|| {
+                let asynchronous = async_click_feedback_enabled("session");
+                let queued = enqueue_cursor_feedback(
+                    &sender,
+                    &arrivals,
+                    "session".to_owned(),
+                    60.0,
+                    60.0,
+                    true,
+                );
+                completed.send((asynchronous, queued)).unwrap();
+            });
+            // Keep the rendering mutex held and do not consume its queue.
+            // Release the lock before asserting, so a regression fails instead
+            // of leaving a test worker deadlocked during scope teardown.
+            let result = completion.recv_timeout(Duration::from_secs(2));
+            drop(painting);
+            assert_eq!(result.unwrap(), (true, true));
+        });
+        let mut map = empty_map();
+        assert_eq!(
+            apply_render_event(&mut map, receiver.try_recv().unwrap()),
+            Some("session".to_owned())
+        );
+        let state = &map.cursors["session"].core;
+        assert!(state.has_position());
+        assert!(state.path.is_some(), "first feedback must still glide");
+        assert!(state.click_pulse_on_arrival);
+    }
+
+    #[test]
+    fn full_or_disconnected_feedback_queue_preserves_existing_waiter() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (arrival, mut waiter) = tokio::sync::oneshot::channel();
+        let arrivals = Mutex::new(Some(HashMap::from([("session".to_owned(), arrival)])));
+        sender.try_send(RenderEvent::DisplaysChanged).ok().unwrap();
+        for _ in 0..2 {
+            assert!(!enqueue_cursor_feedback(
+                &sender,
+                &arrivals,
+                "session".to_owned(),
+                60.0,
+                60.0,
+                true,
+            ));
+            assert!(matches!(
+                waiter.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        drop(receiver);
+        assert!(!enqueue_cursor_feedback(
+            &sender,
+            &arrivals,
+            "session".to_owned(),
+            60.0,
+            60.0,
+            true,
+        ));
+        assert!(matches!(
+            waiter.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn queued_feedback_respects_session_removal_and_disabled_cursors() {
+        let mut map = empty_map();
+        apply_msg(&mut map, OverlayMsg::Remove("ended".to_owned()));
+        map.cursors.get_mut("default").unwrap().core.cfg.enabled = false;
+        for key in ["ended", "default"] {
+            assert_eq!(
+                apply_render_event(
+                    &mut map,
+                    RenderEvent::Feedback {
+                        key: key.to_owned(),
+                        x: 60.0,
+                        y: 60.0,
+                        click_pulse: true,
+                    }
+                ),
+                None
+            );
+        }
+        assert!(!map.cursors.contains_key("ended"));
+        assert!(!map.cursors["default"].core.has_position());
+        apply_render_event(
+            &mut map,
+            RenderEvent::Feedback {
+                key: "typing".to_owned(),
+                x: 60.0,
+                y: 60.0,
+                click_pulse: false,
+            },
+        );
+        assert!(map.cursors["typing"].core.path.is_some());
+        assert!(!map.cursors["typing"].core.click_pulse_on_arrival);
     }
 
     #[test]

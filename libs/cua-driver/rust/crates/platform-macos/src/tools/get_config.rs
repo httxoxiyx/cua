@@ -81,6 +81,7 @@ impl Tool for GetConfigTool {
             "max_image_dimension": max_image_dimension,
             "agent_cursor": {
                 "enabled": cursor_enabled,
+                "async_click_feedback": crate::cursor::overlay::async_click_feedback_enabled(&cursor_key),
             },
             "experimental_pip": pip_enabled,
             "experimental_pip_geometry": pip_geometry,
