@@ -15,8 +15,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::bindings::{
     ax_get_window_id, copy_ax_windows, copy_bool_attr, copy_element_attr, copy_string_attr,
-    focused_element_of_pid, kAXErrorSuccess, try_copy_ax_windows, AXUIElementCreateApplication,
-    AXUIElementRef, AXUIElementSetMessagingTimeout,
+    focused_element_of_pid, kAXErrorAttributeUnsupported, kAXErrorSuccess, try_copy_ax_windows,
+    try_copy_bool_attr, AXError, AXUIElementCreateApplication, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
 use crate::windows::{all_automation_windows, resolve_window_owner, WindowOwner};
 
@@ -144,6 +145,27 @@ where
     requested.contains(&window_id).then(read).flatten()
 }
 
+fn resolve_background_minimized(
+    attribute: Result<bool, AXError>,
+    prove_visible_sheet: impl FnOnce() -> bool,
+) -> Option<bool> {
+    match attribute {
+        Ok(value) => Some(value),
+        Err(error) if error == kAXErrorAttributeUnsupported && prove_visible_sheet() => Some(false),
+        Err(_) => None,
+    }
+}
+
+unsafe fn background_window_minimized(
+    pid: i32,
+    window_id: u32,
+    window: AXUIElementRef,
+) -> Option<bool> {
+    resolve_background_minimized(try_copy_bool_attr(window, "AXMinimized"), || {
+        super::attached_sheet::proves_unminimized_focused_sheet(pid, window_id, window)
+    })
+}
+
 /// Map the application's fresh `AXWindows` through `_AXUIElementGetWindow`.
 /// Windows whose id the SPI cannot resolve are omitted: an unmappable window
 /// can never satisfy an exact-target requirement.
@@ -157,7 +179,7 @@ unsafe fn ax_window_records(
         .filter_map(|window| {
             let record = ax_get_window_id(window).map(|window_id| AxWindowRecord {
                 window_id,
-                minimized: copy_bool_attr(window, "AXMinimized"),
+                minimized: background_window_minimized(pid, window_id, window),
             });
             CFRelease(window as CFTypeRef);
             record
@@ -172,7 +194,7 @@ unsafe fn ax_window_records(
         {
             records.push(AxWindowRecord {
                 window_id: target_window_id,
-                minimized: copy_bool_attr(sheet, "AXMinimized"),
+                minimized: background_window_minimized(pid, target_window_id, sheet),
             });
             CFRelease(sheet as CFTypeRef);
         }
@@ -415,7 +437,8 @@ mod tests {
     use super::{
         bounded_ax_window_count, classify_ax_window_lifecycle,
         count_competing_keyboard_destinations, read_minimized_if_requested,
-        AxWindowLifecycleEvidence, AxWindowRecord, AxWindowSnapshot, MAX_LIFECYCLE_AX_WINDOWS,
+        resolve_background_minimized, AxWindowLifecycleEvidence, AxWindowRecord, AxWindowSnapshot,
+        MAX_LIFECYCLE_AX_WINDOWS,
     };
     use std::{cell::Cell, collections::HashSet};
 
@@ -424,6 +447,93 @@ mod tests {
             window_id,
             minimized,
         }
+    }
+
+    #[test]
+    fn only_unsupported_minimized_attribute_uses_independent_sheet_proof() {
+        use super::super::bindings::{
+            kAXErrorAPIDisabled, kAXErrorAttributeUnsupported, kAXErrorCannotComplete,
+            kAXErrorFailure, kAXErrorInvalidUIElement, kAXErrorNoValue,
+        };
+        for state in [
+            Ok(false),
+            Ok(true),
+            Err(kAXErrorAPIDisabled),
+            Err(kAXErrorCannotComplete),
+            Err(kAXErrorFailure),
+            Err(kAXErrorInvalidUIElement),
+            Err(kAXErrorNoValue),
+        ] {
+            assert_eq!(
+                resolve_background_minimized(state, || panic!("unexpected visibility fallback")),
+                state.ok(),
+            );
+        }
+        assert_eq!(
+            resolve_background_minimized(Err(kAXErrorAttributeUnsupported), || false),
+            None,
+        );
+        assert_eq!(
+            resolve_background_minimized(Err(kAXErrorAttributeUnsupported), || true),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn sheet_visibility_allows_exact_pointer_but_preserves_keyboard_and_hidden_guards() {
+        use super::super::bindings::kAXErrorAttributeUnsupported;
+        use cua_driver_core::background_input::{
+            decide_background_input, refusal_codes, BackgroundAction, BackgroundInputDecision,
+            BackgroundTargetFacts, ElementAncestry, ExactWindowTarget, WindowServerOwnership,
+        };
+        let target = ExactWindowTarget {
+            pid: 42,
+            window_id: 900,
+        };
+        let records = [ax_window(700, Some(false)), ax_window(900, Some(false))];
+        let mut facts = BackgroundTargetFacts {
+            window_server: WindowServerOwnership::SamePid,
+            ax_window_present: true,
+            target_minimized: resolve_background_minimized(
+                Err(kAXErrorAttributeUnsupported),
+                || true,
+            ),
+            app_hidden: Some(false),
+            competing_keyboard_destinations: count_competing_keyboard_destinations(
+                42,
+                900,
+                [(42, 700), (42, 900)],
+                &records,
+            ),
+            element: ElementAncestry::ProvenDescendant,
+        };
+        assert!(matches!(
+            decide_background_input(target, &facts, BackgroundAction::WindowPointer),
+            BackgroundInputDecision::Execute { verification } if verification.window_id == 900,
+        ));
+        for action in [BackgroundAction::GenericKey, BackgroundAction::InsertText] {
+            assert!(matches!(
+                decide_background_input(target, &facts, action),
+                BackgroundInputDecision::Refuse(reason)
+                    if reason.code == refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
+            ));
+        }
+        for hidden in [Some(true), None] {
+            facts.app_hidden = hidden;
+            assert!(matches!(
+                decide_background_input(target, &facts, BackgroundAction::WindowPointer),
+                BackgroundInputDecision::Refuse(reason)
+                    if reason.code == refusal_codes::MINIMIZED_OR_HIDDEN,
+            ));
+            assert!(
+                decide_background_input(target, &facts, BackgroundAction::AxSemantic).is_execute()
+            );
+        }
+        facts.app_hidden = Some(false);
+        facts.element = ElementAncestry::OutsideTargetWindow;
+        assert!(
+            !decide_background_input(target, &facts, BackgroundAction::WindowPointer).is_execute()
+        );
     }
 
     #[test]

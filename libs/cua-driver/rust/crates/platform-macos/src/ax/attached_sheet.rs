@@ -4,7 +4,8 @@
 //! AXWindows host proves discovery; it does not alias sheet input to that host.
 
 use super::bindings::{
-    ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorSuccess, try_copy_ax_windows,
+    ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorAttributeUnsupported,
+    kAXErrorSuccess, try_copy_ax_windows, try_copy_bool_attr, AXError,
     AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementGetPid, AXUIElementRef,
     AXUIElementSetMessagingTimeout,
 };
@@ -26,10 +27,21 @@ trait SheetTree {
     fn contains_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
     fn same(&self, left: &Self::Node, right: &Self::Node) -> bool;
     fn owns_window(&self, pid: i32, window_id: u32) -> bool;
+    fn minimized(&self, node: &Self::Node) -> Result<bool, AXError>;
+    fn on_screen(&self, pid: i32, window_id: u32) -> bool;
     fn within_budget(&self) -> bool;
 }
 
 fn prove<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<T::Node> {
+    prove_with_visibility(tree, pid, requested, false)
+}
+
+fn prove_with_visibility<T: SheetTree>(
+    tree: &T,
+    pid: i32,
+    requested: u32,
+    require_unminimized: bool,
+) -> Option<T::Node> {
     let sheet = tree.focused()?;
     if !tree.within_budget()
         || tree.role(&sheet).as_deref() != Some("AXSheet")
@@ -55,6 +67,19 @@ fn prove<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<T::Node> {
     if !windows.iter().any(|candidate| tree.same(candidate, &host))
         || !tree.contains_child(&host, &sheet)
         || !tree.within_budget()
+    {
+        return None;
+    }
+    // Attached AppKit sheets (including Keynote Save) do not necessarily
+    // implement AXMinimized. Only this exact unsupported-attribute case may
+    // inherit the live host's non-minimized state, and only while both native
+    // windows are on screen. Missing/failed reads never establish visibility.
+    if require_unminimized
+        && (tree.minimized(&sheet) != Err(kAXErrorAttributeUnsupported)
+            || tree.minimized(&host) != Ok(false)
+            || !tree.on_screen(pid, requested)
+            || !tree.on_screen(pid, host_id)
+            || !tree.within_budget())
     {
         return None;
     }
@@ -171,6 +196,13 @@ impl SheetTree for NativeTree {
             crate::windows::WindowOwner::SamePid
         )
     }
+    fn minimized(&self, node: &Node) -> Result<bool, AXError> {
+        unsafe { try_copy_bool_attr(node.0, "AXMinimized") }
+    }
+    fn on_screen(&self, pid: i32, window_id: u32) -> bool {
+        crate::windows::window_info_by_id(window_id)
+            .is_some_and(|window| window.pid == pid && window.is_on_screen)
+    }
     fn within_budget(&self) -> bool {
         Instant::now() < self.deadline
     }
@@ -193,6 +225,33 @@ pub(crate) fn copy_focused_attached_sheet(pid: i32, window_id: u32) -> Option<AX
     }
 }
 
+/// Prove the unsupported AXMinimized case for one already retained sheet.
+/// The host supplies visibility evidence only; input remains bound to the
+/// sheet's own CGWindowID. Discovery alone never supplies this extra proof.
+///
+/// # Safety
+///
+/// `expected_sheet` must remain a valid retained AX element for this call.
+pub(crate) unsafe fn proves_unminimized_focused_sheet(
+    pid: i32,
+    window_id: u32,
+    expected_sheet: AXUIElementRef,
+) -> bool {
+    let Some(app) = Node::owned(AXUIElementCreateApplication(pid)) else {
+        return false;
+    };
+    prove_with_visibility(
+        &NativeTree {
+            app,
+            deadline: Instant::now() + Duration::from_secs(2),
+        },
+        pid,
+        window_id,
+        true,
+    )
+    .is_some_and(|sheet| CFEqual(sheet.0 as CFTypeRef, expected_sheet as CFTypeRef) != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +272,10 @@ mod tests {
         focused_reads: Cell<usize>,
         focus_changed: bool,
         owned: bool,
+        sheet_minimized: Result<bool, AXError>,
+        host_minimized: Result<bool, AXError>,
+        sheet_on_screen: bool,
+        host_on_screen: bool,
         budget: Cell<usize>,
     }
     impl SheetTree for Tree {
@@ -254,6 +317,18 @@ mod tests {
         fn owns_window(&self, _pid: i32, _window: u32) -> bool {
             self.owned
         }
+        fn minimized(&self, node: &FakeNode) -> Result<bool, AXError> {
+            if node.identity == self.sheet.identity {
+                self.sheet_minimized
+            } else {
+                self.host_minimized
+            }
+        }
+        fn on_screen(&self, pid: i32, window: u32) -> bool {
+            pid == self.sheet.owner
+                && ((window == self.sheet.window && self.sheet_on_screen)
+                    || (window == self.host.window && self.host_on_screen))
+        }
         fn within_budget(&self) -> bool {
             let n = self.budget.get();
             self.budget.set(n.saturating_sub(1));
@@ -280,6 +355,10 @@ mod tests {
             focused_reads: Cell::new(0),
             focus_changed: false,
             owned: true,
+            sheet_minimized: Err(kAXErrorAttributeUnsupported),
+            host_minimized: Ok(false),
+            sheet_on_screen: true,
+            host_on_screen: true,
             budget: Cell::new(100),
         }
     }
@@ -287,6 +366,79 @@ mod tests {
     fn discovers_focused_sheet_missing_from_top_level_windows() {
         let sheet = prove(&pages(), 42, 900).unwrap();
         assert_eq!(sheet.window, 900);
+    }
+
+    #[test]
+    fn visible_save_sheet_with_unsupported_minimized_state_keeps_its_own_target() {
+        let sheet = prove_with_visibility(&pages(), 42, 900, true).unwrap();
+        assert_eq!(sheet.window, 900);
+        assert!(prove_with_visibility(&pages(), 42, 700, true).is_none());
+        assert!(prove_with_visibility(&pages(), 42, 901, true).is_none());
+    }
+
+    #[test]
+    fn visibility_proof_requires_both_windows_on_screen_and_unminimized_host() {
+        use super::super::bindings::{kAXErrorCannotComplete, kAXErrorNoValue};
+        for state in [Ok(true), Err(kAXErrorCannotComplete), Err(kAXErrorNoValue)] {
+            let mut tree = pages();
+            tree.host_minimized = state;
+            assert!(prove_with_visibility(&tree, 42, 900, true).is_none());
+        }
+        for (sheet, host) in [(false, true), (true, false), (false, false)] {
+            let mut tree = pages();
+            tree.sheet_on_screen = sheet;
+            tree.host_on_screen = host;
+            assert!(prove_with_visibility(&tree, 42, 900, true).is_none());
+        }
+    }
+
+    #[test]
+    fn visibility_proof_never_turns_failed_or_supported_sheet_reads_into_an_omission() {
+        use super::super::bindings::{
+            kAXErrorAPIDisabled, kAXErrorCannotComplete, kAXErrorFailure, kAXErrorInvalidUIElement,
+            kAXErrorNoValue,
+        };
+        for state in [
+            Ok(true),
+            Ok(false),
+            Err(kAXErrorAPIDisabled),
+            Err(kAXErrorCannotComplete),
+            Err(kAXErrorFailure),
+            Err(kAXErrorInvalidUIElement),
+            Err(kAXErrorNoValue),
+        ] {
+            let mut tree = pages();
+            tree.sheet_minimized = state;
+            assert!(prove_with_visibility(&tree, 42, 900, true).is_none());
+        }
+    }
+
+    #[test]
+    fn visibility_proof_preserves_attachment_owner_focus_and_deadline_checks() {
+        for alter in [
+            |tree: &mut Tree| tree.attached = false,
+            |tree: &mut Tree| tree.host_listed = false,
+            |tree: &mut Tree| tree.matching_window_relation = false,
+            |tree: &mut Tree| tree.owned = false,
+            |tree: &mut Tree| tree.sheet.owner = 99,
+            |tree: &mut Tree| tree.host.owner = 99,
+            |tree: &mut Tree| tree.sheet.role = "AXWindow",
+            |tree: &mut Tree| tree.focus_changed = true,
+            |tree: &mut Tree| tree.budget.set(4),
+        ] {
+            let mut tree = pages();
+            alter(&mut tree);
+            assert!(prove_with_visibility(&tree, 42, 900, true).is_none());
+        }
+    }
+
+    #[test]
+    fn discovery_does_not_require_visibility_or_establish_input_eligibility() {
+        let mut tree = pages();
+        tree.sheet_on_screen = false;
+        tree.host_minimized = Ok(true);
+        assert!(prove(&tree, 42, 900).is_some());
+        assert!(prove_with_visibility(&tree, 42, 900, true).is_none());
     }
     #[test]
     fn requested_host_or_sibling_is_not_substituted_with_sheet() {

@@ -212,25 +212,45 @@ pub unsafe fn copy_number_attr(element: AXUIElementRef, attr_name: &str) -> Opti
 /// `element` must be a valid Accessibility object reference for the duration
 /// of this call.
 pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
+    try_copy_bool_attr(element, attr_name).ok()
+}
+
+/// Read a boolean while preserving unsupported attributes versus failed reads.
+/// An AXSheet can omit AXMinimized without being minimized, but a timeout or
+/// disabled accessibility API must not be treated as that omission.
+///
+/// # Safety
+///
+/// `element` must be a valid Accessibility object reference for this call.
+pub(crate) unsafe fn try_copy_bool_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Result<bool, AXError> {
     use core_foundation::boolean::CFBoolean;
     use core_foundation::number::CFNumber;
     let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if err != kAXErrorSuccess || value.is_null() {
-        return None;
+    if err != kAXErrorSuccess {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return Err(err);
+    }
+    if value.is_null() {
+        return Err(kAXErrorNoValue);
     }
     let type_id = core_foundation::base::CFGetTypeID(value);
     if type_id == CFBoolean::type_id() {
         let b = CFBoolean::wrap_under_create_rule(value as _);
-        return Some(b.into());
+        return Ok(b.into());
     }
     if type_id == CFNumber::type_id() {
         let n = CFNumber::wrap_under_create_rule(value as _);
-        return n.to_f64().map(|f| f != 0.0);
+        return n.to_f64().map(|f| f != 0.0).ok_or(kAXErrorFailure);
     }
     CFRelease(value);
-    None
+    Err(kAXErrorFailure)
 }
 
 /// A copied AX attribute represented for both existing string-only consumers
