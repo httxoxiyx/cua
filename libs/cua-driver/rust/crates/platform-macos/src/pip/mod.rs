@@ -32,6 +32,11 @@ struct NativeCGImage {
     _opaque: [u8; 0],
 }
 
+#[repr(C)]
+struct NativeCGEvent {
+    _opaque: [u8; 0],
+}
+
 unsafe impl objc2::RefEncode for CGColor {
     const ENCODING_REF: objc2::Encoding =
         objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGColor", &[]));
@@ -40,6 +45,12 @@ unsafe impl objc2::RefEncode for CGColor {
 unsafe impl objc2::RefEncode for NativeCGImage {
     const ENCODING_REF: objc2::Encoding =
         objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGImage", &[]));
+}
+
+unsafe impl objc2::RefEncode for NativeCGEvent {
+    // AppKit exposes CGEventRef as ^{__CGEvent=}, not a generic void pointer.
+    const ENCODING_REF: objc2::Encoding =
+        objc2::Encoding::Pointer(&objc2::Encoding::Struct("__CGEvent", &[]));
 }
 
 struct NativeHandles {
@@ -3150,11 +3161,21 @@ fn input_cancels_temporary_activation(
     matches!(event_type, 1 | 3 | 25 | 10) && source_pid != Some(driver_pid)
 }
 
-unsafe fn observe_pip_input(event: *mut objc2::runtime::AnyObject) {
+unsafe fn input_event_source_pid(event: *mut objc2::runtime::AnyObject) -> Option<i64> {
     use objc2::msg_send;
     extern "C" {
         fn CGEventGetIntegerValueField(event: *const c_void, field: u32) -> i64;
     }
+    if event.is_null() {
+        return None;
+    }
+    let cg_event: *const NativeCGEvent = msg_send![event, CGEvent];
+    // kCGEventSourceUnixProcessID = 41. Unknown origin is not attributed to us.
+    (!cg_event.is_null()).then(|| CGEventGetIntegerValueField(cg_event.cast(), 41))
+}
+
+unsafe fn observe_pip_input(event: *mut objc2::runtime::AnyObject) {
+    use objc2::msg_send;
     if event.is_null() {
         return;
     }
@@ -3163,9 +3184,7 @@ unsafe fn observe_pip_input(event: *mut objc2::runtime::AnyObject) {
         schedule_cursor_refresh();
         return;
     }
-    let cg_event: *const c_void = msg_send![event, CGEvent];
-    // kCGEventSourceUnixProcessID = 41. Unknown origin is not attributed to us.
-    let source_pid = (!cg_event.is_null()).then(|| CGEventGetIntegerValueField(cg_event, 41));
+    let source_pid = input_event_source_pid(event);
     if input_cancels_temporary_activation(event_type, source_pid, i64::from(std::process::id())) {
         let changed = {
             let mut state = FOREGROUND_VISIBILITY_STATE.lock().unwrap();
@@ -4643,6 +4662,40 @@ mod tests {
             assert!(!input_cancels_temporary_activation(event, Some(123), 123));
         }
         assert!(!input_cancels_temporary_activation(5, Some(0), 123));
+    }
+
+    #[test]
+    fn input_source_pid_reads_an_unposted_native_event() {
+        use core_graphics::event::{CGEvent, CGEventType, CGMouseButton, EventField};
+        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+        use core_graphics::geometry::CGPoint;
+        use foreign_types::ForeignType;
+        use objc2::{class, msg_send};
+
+        // Exercise AppKit's actual Objective-C method encoding. No event is
+        // posted and no input monitor or desktop window is created.
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
+            let event = CGEvent::new_mouse_event(
+                source,
+                CGEventType::LeftMouseDown,
+                CGPoint::new(12.0, 34.0),
+                CGMouseButton::Left,
+            )
+            .unwrap();
+            event.set_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID, 123456);
+            let native: *mut objc2::runtime::AnyObject = msg_send![class!(NSEvent), eventWithCGEvent: event.as_ptr().cast::<NativeCGEvent>()];
+            assert!(!native.is_null());
+            assert_eq!(input_event_source_pid(native), Some(123456));
+        });
+    }
+
+    #[test]
+    fn absent_input_event_has_unknown_source() {
+        assert_eq!(
+            unsafe { input_event_source_pid(std::ptr::null_mut()) },
+            None
+        );
     }
 
     #[test]
