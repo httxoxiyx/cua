@@ -359,7 +359,7 @@ def test_unix_installer_recomputes_the_tarball_after_a_fallback() -> None:
     source = _unix_source()
 
     assert source.index('TARBALL="$(release_tarball_name "$VERSION")"') < source.index(
-        'tar -xzf "$TMP_DIR/$TARBALL"'
+        'extract_release_tarball_safely "$TMP_DIR/$TARBALL" "$TMP_DIR"'
     )
     adopt = source.index('VERSION="$API_VERSION"')
     retag = source.index('TAG="${TAG_PREFIX}${VERSION}"', adopt)

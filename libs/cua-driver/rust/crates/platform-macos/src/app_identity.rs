@@ -4,11 +4,17 @@ use std::path::{Path, PathBuf};
 
 use core_foundation::{
     base::{CFType, TCFType},
+    boolean::CFBoolean,
     data::CFData,
     dictionary::CFDictionary,
     propertylist::{create_with_data, kCFPropertyListImmutable, CFPropertyList},
     string::CFString,
 };
+
+/// Signed Info.plist marker used by plugin-packaged driver bundles. A managed
+/// bundle must never turn an argument-less LaunchServices reopen into an MCP
+/// or default-daemon process.
+pub const PLUGIN_MANAGED_INFO_PLIST_KEY: &str = "CuaPluginManaged";
 
 /// Validated installed-product identity; app folder and display names do not
 /// select the release/local channel.
@@ -18,6 +24,7 @@ pub struct DriverAppIdentity {
     pub bundle_id: &'static str,
     pub executable_name: &'static str,
     pub is_local: bool,
+    pub plugin_managed: bool,
 }
 
 /// Whether a path component has the app-bundle extension, independent of its
@@ -58,6 +65,19 @@ pub fn driver_app_for_executable(executable: &Path) -> Option<DriverAppIdentity>
         let value = unsafe { CFType::wrap_under_get_rule(*value) };
         Some(value.downcast::<CFString>()?.to_string())
     };
+    let plugin_managed = {
+        let key = CFString::new(PLUGIN_MANAGED_INFO_PLIST_KEY);
+        dictionary.find(key.as_CFTypeRef()).is_some_and(|value| {
+            // Presence declares plugin ownership. A wrongly typed marker is
+            // treated as managed so a damaged/misassembled managed bundle
+            // fails closed instead of starting the default runtime.
+            let value = unsafe { CFType::wrap_under_get_rule(*value) };
+            value
+                .downcast::<CFBoolean>()
+                .map(bool::from)
+                .unwrap_or(true)
+        })
+    };
     if string_value("CFBundlePackageType")?.as_str() != "APPL" {
         return None;
     }
@@ -65,10 +85,14 @@ pub fn driver_app_for_executable(executable: &Path) -> Option<DriverAppIdentity>
     let bundle_executable = string_value("CFBundleExecutable")?;
     let (bundle_id, executable_name, is_local) =
         match (bundle_id.as_str(), bundle_executable.as_str()) {
-            ("com.trycua.driver.local", "cua-driver-local") => {
-                ("com.trycua.driver.local", "cua-driver-local", true)
+            ("com.meta.musecode.cua.driver.local", "cua-driver-local") => (
+                "com.meta.musecode.cua.driver.local",
+                "cua-driver-local",
+                true,
+            ),
+            ("com.meta.musecode.cua.driver", "cua-driver") => {
+                ("com.meta.musecode.cua.driver", "cua-driver", false)
             }
-            ("com.trycua.driver", "cua-driver") => ("com.trycua.driver", "cua-driver", false),
             _ => return None,
         };
     if executable.file_name()? != executable_name {
@@ -79,5 +103,6 @@ pub fn driver_app_for_executable(executable: &Path) -> Option<DriverAppIdentity>
         bundle_id,
         executable_name,
         is_local,
+        plugin_managed,
     })
 }

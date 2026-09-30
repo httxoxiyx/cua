@@ -12,6 +12,12 @@
 // 125%/150%/200% scaling and clicks land where screenshots say they do.
 
 fn main() {
+    // These values are embedded in the private build-attestation response.
+    // Cargo must rebuild the binary when an artifact builder changes either
+    // value while reusing the same target directory (for example POC A/B).
+    println!("cargo:rerun-if-env-changed=CUA_DRIVER_RELEASE_VERSION");
+    println!("cargo:rerun-if-env-changed=CUA_DRIVER_SOURCE_SHA");
+
     #[cfg(target_os = "windows")]
     {
         embed_resource::compile("cua-driver.rc", embed_resource::NONE);

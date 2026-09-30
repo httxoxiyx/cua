@@ -229,13 +229,13 @@ def test_tcc_guest_seed_grants_both_driver_permissions() -> None:
     assert "csreq" in sql_body
     assert "allowed" not in sql_body
     assert "auth_value=2" in text
-    assert "com.trycua.driver.local" in text
+    assert "com.meta.musecode.cua.driver.local" in text
 
 
 def test_tcc_guest_seed_sql_executes_against_modern_tcc_schema(tmp_path: Path) -> None:
     sql_body = _guest_seed_assignment("SQL")
     verify_sql = _guest_seed_assignment("VERIFY_SQL")
-    client = "com.trycua.driver.local"
+    client = "com.meta.musecode.cua.driver.local"
     client_type = "0"
     csreq_hex = "01020304"
     substitutions = {

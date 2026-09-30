@@ -36,6 +36,10 @@ pub enum Command {
         /// Forward the process-local experimental PiP request to a daemon
         /// launched by the MCP proxy.
         experimental_pip: bool,
+        /// Require the already-attested service PID selected by an embedding
+        /// host. The persistent control session then pins that daemon
+        /// generation for the lifetime of this proxy.
+        expected_pid: Option<u32>,
     },
     ListTools,
     Describe(String),
@@ -541,7 +545,7 @@ pub fn parse_command() -> Command {
         println!("permissions options (macOS):");
         println!("  cua-driver permissions status   Report Accessibility + Screen Recording status. Read-only (no prompt).");
         println!("                                  Answers via a running daemon, so the result carries the CuaDriver");
-        println!("                                  identity (com.trycua.driver). If no daemon is running it reports");
+        println!("                                  identity (com.meta.musecode.cua.driver). If no daemon is running it reports");
         println!("                                  `unknown` rather than your terminal's grants. Add --json for the payload.");
         println!("  cua-driver permissions grant    Launch CuaDriver via LaunchServices so dialogs attribute to the app,");
         println!("                                  explain and request Accessibility, Screen Recording, and Tahoe's");
@@ -620,6 +624,7 @@ pub fn parse_command() -> Command {
             "  --host-bundle-id <id>   Advisory host bundle id label for check_permissions output."
         );
         println!("  --socket <path>         Select an explicit daemon socket/pipe endpoint.");
+        println!("  --expected-pid <pid>    Require an already-attested daemon PID (mcp/stop).");
         println!("  --claude-code-computer-use-compat");
         println!("                          Select the Claude Code computer-use compat surface.");
         println!(
@@ -742,7 +747,7 @@ pub fn parse_command() -> Command {
         }
     }
 
-    let expected_stop_pid = parse_expected_stop_pid(&args, positionals.first().copied());
+    let expected_daemon_pid = parse_expected_daemon_pid(&args, positionals.first().copied());
 
     if matches!(positionals.first().copied(), None | Some("mcp")) {
         if let Some(flag) = serve_only_authorization_flag(&args) {
@@ -788,6 +793,7 @@ pub fn parse_command() -> Command {
                 claude_code_compat,
                 grants: grants.clone(),
                 experimental_pip,
+                expected_pid: expected_daemon_pid,
             }
         }
         Some("mcp") => Command::Mcp {
@@ -796,13 +802,14 @@ pub fn parse_command() -> Command {
             claude_code_compat,
             grants: grants.clone(),
             experimental_pip,
+            expected_pid: expected_daemon_pid,
         },
         Some("list-tools") => Command::ListTools,
         Some("mcp-config") => Command::McpConfig { client: mcp_client },
         Some("serve") => parse_serve_command(&args, socket, claude_code_compat, grants),
         Some("stop") => Command::Stop {
             socket,
-            expected_pid: expected_stop_pid,
+            expected_pid: expected_daemon_pid,
         },
         Some("revoke") => {
             let all = args.iter().any(|a| a == "--all");
@@ -1049,10 +1056,10 @@ pub fn parse_command() -> Command {
     }
 }
 
-fn parse_expected_stop_pid(args: &[String], command: Option<&str>) -> Option<u32> {
+fn parse_expected_daemon_pid(args: &[String], command: Option<&str>) -> Option<u32> {
     let raw = flag_value(args, "--expected-pid")?;
-    if command != Some("stop") {
-        eprintln!("--expected-pid is valid only with `cua-driver stop`");
+    if !matches!(command, Some("stop") | Some("mcp")) {
+        eprintln!("--expected-pid is valid only with `cua-driver stop` or `cua-driver mcp`");
         process::exit(64);
     }
     match raw.parse::<u32>() {
@@ -1673,6 +1680,17 @@ pub enum McpDaemonStartup {
     UnsupportedRelaunch,
 }
 
+fn verify_expected_daemon_pid(actual_pid: u32, expected_pid: Option<u32>) -> Result<(), String> {
+    if let Some(expected_pid) = expected_pid {
+        if actual_pid != expected_pid {
+            return Err(format!(
+                "Cua Driver daemon pid mismatch (expected {expected_pid}, found {actual_pid})"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl McpDaemonStartup {
     pub const fn telemetry_value(self) -> &'static str {
         match self {
@@ -1688,6 +1706,7 @@ impl McpDaemonStartup {
 
 pub fn run_mcp_via_daemon_proxy<F>(
     socket: Option<String>,
+    expected_pid: Option<u32>,
     claude_code_compat: bool,
     grants: &[String],
     experimental_pip: bool,
@@ -1833,6 +1852,11 @@ where
         }
     }
 
+    if let Some(expected_pid) = expected_pid {
+        let metadata = cua_driver_core::daemon::request_daemon_metadata(&socket_path)?;
+        verify_expected_daemon_pid(metadata.pid, Some(expected_pid)).map_err(anyhow::Error::msg)?;
+    }
+
     if let Some(on_startup) = on_startup.take() {
         on_startup(daemon, true);
     }
@@ -1923,6 +1947,7 @@ pub fn build_manifest() -> serde_json::Value {
               "description": "Run the MCP stdio server: direct runtime on Windows/Linux, app-daemon proxy on macOS, or explicit service with --socket.",
               "args": [
                   { "name": "--socket", "type": "string", "description": "Select an explicit daemon socket or named-pipe endpoint." },
+                  { "name": "--expected-pid", "type": "integer", "description": "Require the exact daemon PID previously attested by the embedding host." },
                   { "name": "--direct", "type": "flag", "description": "Own the runtime in the MCP process; on macOS this explicitly accepts host TCC attribution. Mutually exclusive with --socket." },
                   { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Select the Claude Code computer-use compat tool surface." },
                   { "name": "--embedded", "type": "flag", "description": "Declare embedding-host mode. Without --direct, requires the host's private service through --socket instead of auto-launching the standalone app." },
@@ -3302,7 +3327,7 @@ pub fn run_permissions_cmd(subcommand: &str, json: bool) {
 /// Report the CuaDriver daemon's TCC status — reliably, or not at all.
 ///
 /// macOS attributes Accessibility / Screen-Recording to the *responsible
-/// process*, so the ONLY process that can read `com.trycua.driver`'s real
+/// process*, so the ONLY process that can read `com.meta.musecode.cua.driver`'s real
 /// grants is the daemon running as its own responsible process. When the
 /// daemon is up we query it and report its
 /// `driver-daemon`-attributed answer. When it is NOT up we deliberately
@@ -3317,7 +3342,7 @@ fn run_permissions_status(json: bool) {
     let app_name = crate::bundle::app_name();
     let bundle_id = crate::bundle::bundle_id();
 
-    // Only a listening daemon can answer for com.trycua.driver. A failed/!ok
+    // Only a listening daemon can answer for com.meta.musecode.cua.driver. A failed/!ok
     // response (e.g. daemon still inside its first-launch permission gate) is
     // treated the same as "no daemon" → unknown.
     let daemon_status: Option<serde_json::Value> = if crate::serve::is_daemon_listening(&socket) {
@@ -3484,6 +3509,2216 @@ fn permission_status_request() -> crate::serve::DaemonRequest {
         session_id: None,
         observation_origin: Some(crate::serve::ToolObservationOrigin::Direct),
         client_kind: Some(cua_driver_core::daemon::DaemonClientKind::Cli),
+    }
+}
+
+/// Match only the exact private compatibility-probe invocation.
+#[cfg(target_os = "macos")]
+fn permissions_onboarding_contract_requested(args: &[String]) -> bool {
+    args.len() == 1 && args[0] == platform_macos::permissions::onboarding::ONBOARDING_CONTRACT_ARG
+}
+
+#[cfg(target_os = "macos")]
+const BUILD_ATTESTATION_ARG: &str = "__build-attestation";
+
+#[cfg(target_os = "macos")]
+fn build_attestation_requested(args: &[String]) -> bool {
+    args.len() == 1 && args[0] == BUILD_ATTESTATION_ARG
+}
+
+#[cfg(target_os = "macos")]
+fn build_attestation() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "binary_version": option_env!("CUA_DRIVER_RELEASE_VERSION")
+            .unwrap_or(env!("CARGO_PKG_VERSION")),
+        "source_sha": option_env!("CUA_DRIVER_SOURCE_SHA"),
+        "production_team_id": crate::bundle::PRODUCTION_TEAM_ID,
+        "bundle_id": crate::bundle::bundle_id(),
+        "plugin_managed": crate::bundle::is_plugin_managed_app(),
+    })
+}
+
+/// Emit immutable build and bundle identity without initializing logging,
+/// TCC, AppKit, a socket, or the default daemon.
+#[cfg(target_os = "macos")]
+pub fn run_build_attestation_if_requested() -> Option<i32> {
+    use std::io::Write as _;
+
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if !build_attestation_requested(&args) {
+        return None;
+    }
+    let value = build_attestation();
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    match serde_json::to_writer(&mut output, &value)
+        .map_err(|error| error.to_string())
+        .and_then(|()| writeln!(output).map_err(|error| error.to_string()))
+    {
+        Ok(()) => Some(0),
+        Err(error) => {
+            eprintln!("build attestation: {error}");
+            Some(74)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn plugin_managed_bare_launch_requested(args: &[String], plugin_managed: bool) -> bool {
+    plugin_managed
+        && (args.is_empty() || matches!(args, [legacy_psn] if legacy_psn.starts_with("-psn_")))
+}
+
+/// macOS's Screen Recording "Quit & Reopen" action can reopen an app without
+/// preserving its onboarding arguments. Plugin-managed bundles are supervised
+/// by their launcher, so an argument-less generation must exit before logging,
+/// telemetry, MCP parsing, or default-daemon startup. Ordinary CuaDriver apps
+/// omit the signed marker and retain their existing bare-invocation behavior.
+#[cfg(target_os = "macos")]
+pub fn run_plugin_managed_bare_launch_guard_if_requested() -> Option<i32> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if !plugin_managed_bare_launch_requested(&args, crate::bundle::is_plugin_managed_app()) {
+        return None;
+    }
+    eprintln!(
+        "cua-driver: ignored an argument-less reopen of a plugin-managed driver app; the setup supervisor will relaunch it"
+    );
+    Some(0)
+}
+
+/// Emit the private, static permission-onboarding contract before logging or
+/// any macOS framework probes are initialized.
+#[cfg(target_os = "macos")]
+pub fn run_permissions_onboarding_contract_if_requested() -> Option<i32> {
+    use std::io::Write as _;
+
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if !permissions_onboarding_contract_requested(&args) {
+        return None;
+    }
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    let result = serde_json::to_writer(
+        &mut output,
+        &platform_macos::permissions::onboarding::contract(),
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|()| writeln!(output).map_err(|error| error.to_string()));
+    match result {
+        Ok(()) => Some(0),
+        Err(error) => {
+            eprintln!("permission onboarding contract: {error}");
+            Some(74)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateOnboardingMode {
+    Launch,
+    Host,
+}
+
+#[cfg(target_os = "macos")]
+fn private_onboarding_mode(args: &[String]) -> Option<PrivateOnboardingMode> {
+    match args.first().map(String::as_str) {
+        Some(platform_macos::permissions::onboarding::ONBOARDING_LAUNCH_ARG) => {
+            Some(PrivateOnboardingMode::Launch)
+        }
+        Some(platform_macos::permissions::onboarding::ONBOARDING_HOST_ARG) => {
+            Some(PrivateOnboardingMode::Host)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn private_onboarding_status_path(args: &[String]) -> Result<std::path::PathBuf, String> {
+    private_onboarding_file_path(
+        args,
+        "--status-file",
+        platform_macos::permissions::onboarding::ONBOARDING_STATUS_FILE_PREFIX,
+        ".json",
+        "status",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn private_onboarding_liveness_path(args: &[String]) -> Result<std::path::PathBuf, String> {
+    private_onboarding_file_path(
+        args,
+        "--liveness-file",
+        platform_macos::permissions::onboarding::ONBOARDING_LIVENESS_FILE_PREFIX,
+        ".lock",
+        "liveness",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn private_onboarding_host_pid_path(args: &[String]) -> Result<std::path::PathBuf, String> {
+    private_onboarding_file_path(
+        args,
+        "--host-pid-file",
+        platform_macos::permissions::onboarding::ONBOARDING_HOST_PID_FILE_PREFIX,
+        ".pid",
+        "host PID",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn private_onboarding_host_generation(args: &[String]) -> Result<u8, String> {
+    use platform_macos::permissions::onboarding::ONBOARDING_MAX_HOST_GENERATIONS;
+
+    let raw = args
+        .windows(2)
+        .find(|pair| pair[0] == "--host-generation")
+        .map(|pair| pair[1].as_str())
+        .ok_or_else(|| "permission onboarding host omitted --host-generation".to_owned())?;
+    let generation = raw
+        .parse::<u8>()
+        .map_err(|_| "permission onboarding host generation is invalid".to_owned())?;
+    if !(1..=ONBOARDING_MAX_HOST_GENERATIONS).contains(&generation) {
+        return Err("permission onboarding host generation is out of range".to_owned());
+    }
+    Ok(generation)
+}
+
+#[cfg(target_os = "macos")]
+fn private_onboarding_session_nonce(args: &[String]) -> Result<String, String> {
+    let raw = args
+        .windows(2)
+        .find(|pair| pair[0] == "--session-nonce")
+        .map(|pair| pair[1].as_str())
+        .ok_or_else(|| "permission onboarding host omitted --session-nonce".to_owned())?;
+    let parsed = uuid::Uuid::parse_str(raw)
+        .map_err(|_| "permission onboarding session nonce is invalid".to_owned())?;
+    if parsed.to_string() != raw {
+        return Err("permission onboarding session nonce is not canonical".to_owned());
+    }
+    Ok(raw.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn private_onboarding_deadline_budget(args: &[String]) -> Result<std::time::Duration, String> {
+    use platform_macos::permissions::onboarding::ONBOARDING_DEADLINE;
+
+    let raw = args
+        .windows(2)
+        .find(|pair| pair[0] == "--deadline-after-ms")
+        .map(|pair| pair[1].as_str())
+        .ok_or_else(|| "permission onboarding host omitted --deadline-after-ms".to_owned())?;
+    let millis = raw
+        .parse::<u64>()
+        .map_err(|_| "permission onboarding host deadline is invalid".to_owned())?;
+    if millis == 0 || millis > ONBOARDING_DEADLINE.as_millis() as u64 {
+        return Err("permission onboarding host deadline is out of range".to_owned());
+    }
+    Ok(std::time::Duration::from_millis(millis))
+}
+
+#[cfg(target_os = "macos")]
+fn private_onboarding_file_path(
+    args: &[String],
+    flag: &str,
+    prefix: &str,
+    suffix: &str,
+    label: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let raw = args
+        .windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+        .ok_or_else(|| format!("permission onboarding host omitted {flag}"))?;
+    let path = std::path::PathBuf::from(raw);
+    let expected_parent = std::fs::canonicalize(std::env::temp_dir())
+        .map_err(|error| format!("resolve temporary directory: {error}"))?;
+    let actual_parent = path
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .ok_or_else(|| format!("permission onboarding {label} parent is unavailable"))?;
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(prefix) && name.ends_with(suffix));
+    if !valid_name || actual_parent != expected_parent {
+        return Err(format!(
+            "permission onboarding {label} path is outside the private temporary-file namespace"
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("inspect permission onboarding {label} file: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "permission onboarding {label} path must be a regular file"
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "permission onboarding {label} file must be owned by the current user"
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "permission onboarding {label} file must not be group/world accessible"
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct OnboardingHostIdentity {
+    schema_version: u8,
+    pid: i32,
+    start_seconds: u64,
+    start_microseconds: u64,
+    generation: u8,
+    session_nonce: String,
+    arguments: Vec<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_stamp(pid: i32) -> Option<(u64, u64)> {
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let filled = libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        );
+        (filled == size).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_exists(pid: i32) -> Result<bool, String> {
+    if pid <= 1 {
+        return Ok(false);
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(format!("inspect process {pid} liveness: {error}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_lifetime_is_alive(pid: i32, expected_start: (u64, u64)) -> Result<bool, String> {
+    if pid <= 1 {
+        return Ok(false);
+    }
+    match process_start_stamp(pid) {
+        Some(observed) => Ok(observed == expected_start),
+        None if !process_exists(pid)? => Ok(false),
+        None => Err(format!(
+            "process {pid} is live but its kernel start time is unavailable"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_arguments(pid: i32) -> Option<Vec<String>> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size = 0_usize;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || size < std::mem::size_of::<libc::c_int>()
+    {
+        return None;
+    }
+    let mut bytes = vec![0_u8; size];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    bytes.truncate(size);
+    let argc = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+    if argc <= 0 || argc > 256 {
+        return None;
+    }
+    let mut offset = std::mem::size_of::<libc::c_int>();
+    while offset < bytes.len() && bytes[offset] != 0 {
+        offset += 1;
+    }
+    while offset < bytes.len() && bytes[offset] == 0 {
+        offset += 1;
+    }
+    let mut arguments = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        let end = bytes[offset..].iter().position(|byte| *byte == 0)? + offset;
+        arguments.push(
+            std::ffi::OsString::from_vec(bytes[offset..end].to_vec())
+                .into_string()
+                .ok()?,
+        );
+        offset = end + 1;
+    }
+    Some(arguments)
+}
+
+#[cfg(target_os = "macos")]
+fn publish_onboarding_host_pid(
+    path: &std::path::Path,
+    generation: u8,
+    session_nonce: &str,
+    arguments: Vec<String>,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let pid = i32::try_from(std::process::id())
+        .map_err(|_| "permission onboarding host PID does not fit i32".to_owned())?;
+    let (start_seconds, start_microseconds) = process_start_stamp(pid)
+        .ok_or_else(|| "cannot read permission onboarding host start time".to_owned())?;
+    let identity = OnboardingHostIdentity {
+        schema_version: 1,
+        pid,
+        start_seconds,
+        start_microseconds,
+        generation,
+        session_nonce: session_nonce.to_owned(),
+        arguments,
+    };
+    let payload = serde_json::to_vec(&identity)
+        .map_err(|error| format!("serialize permission onboarding host identity: {error}"))?;
+    let update_path = path.with_file_name(format!(
+        "{}write-{}.tmp",
+        platform_macos::permissions::onboarding::ONBOARDING_HOST_PID_FILE_PREFIX,
+        uuid::Uuid::new_v4()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&update_path)
+        .map_err(|error| format!("open permission onboarding host PID file: {error}"))?;
+    let result = file
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| file.write_all(&payload))
+        .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(0o600)))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&update_path, path));
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&update_path);
+        return Err(format!(
+            "write permission onboarding host PID file: {error}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct OnboardingSerializationLease {
+    file: std::fs::File,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for OnboardingSerializationLease {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_onboarding_serialization_lease() -> Result<OnboardingSerializationLease, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let output = std::process::Command::new("/usr/bin/getconf")
+        .arg("DARWIN_USER_TEMP_DIR")
+        .env_clear()
+        .output()
+        .map_err(|error| format!("query Darwin user temporary directory: {error}"))?;
+    if !output.status.success() {
+        return Err("could not query Darwin user temporary directory".to_owned());
+    }
+    let directory = std::path::PathBuf::from(
+        String::from_utf8(output.stdout)
+            .map_err(|_| "Darwin user temporary directory is not UTF-8".to_owned())?
+            .trim(),
+    );
+    let directory = std::fs::canonicalize(directory)
+        .map_err(|error| format!("resolve Darwin user temporary directory: {error}"))?;
+    let metadata = std::fs::metadata(&directory)
+        .map_err(|error| format!("inspect Darwin user temporary directory: {error}"))?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(
+            "Darwin user temporary directory is not private to the current user".to_owned(),
+        );
+    }
+    let path = directory.join(format!(
+        "{}{}.lock",
+        platform_macos::permissions::onboarding::ONBOARDING_SERIALIZATION_FILE_PREFIX,
+        crate::bundle::bundle_id()
+    ));
+    open_onboarding_serialization_lease_at(&path)
+}
+
+#[cfg(target_os = "macos")]
+fn open_onboarding_serialization_lease_at(
+    path: &std::path::Path,
+) -> Result<OnboardingSerializationLease, String> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|error| format!("open permission onboarding serialization lock: {error}"))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("secure permission onboarding serialization lock: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect permission onboarding serialization lock: {error}"))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Err(
+            "permission onboarding serialization lock is not a current-user private regular file"
+                .to_owned(),
+        );
+    }
+    Ok(OnboardingSerializationLease { file })
+}
+
+#[cfg(target_os = "macos")]
+fn try_lock_onboarding_serialization_lease(
+    lease: &OnboardingSerializationLease,
+) -> Result<bool, String> {
+    use std::os::fd::AsRawFd as _;
+    let result = unsafe { libc::flock(lease.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(format!(
+            "lock permission onboarding serialization file: {error}"
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct OnboardingLivenessLease {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
+
+#[cfg(target_os = "macos")]
+impl OnboardingLivenessLease {
+    fn create(path: std::path::PathBuf) -> Result<Self, String> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("create onboarding liveness file: {error}"))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("lock onboarding liveness file: {error}"));
+        }
+        Ok(Self { path, file })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for OnboardingLivenessLease {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn onboarding_launcher_is_alive(path: &std::path::Path) -> Result<bool, String> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("open onboarding liveness file: {error}")),
+    };
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        let _ = std::fs::remove_file(path);
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(true)
+    } else {
+        Err(format!("inspect onboarding liveness lock: {error}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct OnboardingStatusSink {
+    path: std::path::PathBuf,
+    previous: Option<platform_macos::permissions::onboarding::OnboardingStatus>,
+}
+
+#[cfg(target_os = "macos")]
+impl OnboardingStatusSink {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            previous: None,
+        }
+    }
+
+    fn emit(
+        &mut self,
+        status: platform_macos::permissions::onboarding::OnboardingStatus,
+    ) -> Result<(), String> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        if self.previous.as_ref() == Some(&status) {
+            return Ok(());
+        }
+        let payload = serde_json::to_vec(&status)
+            .map_err(|error| format!("serialize permission onboarding status: {error}"))?;
+        let update_path = self.path.with_file_name(format!(
+            "{}write-{}.tmp",
+            platform_macos::permissions::onboarding::ONBOARDING_STATUS_FILE_PREFIX,
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&update_path)
+            .map_err(|error| format!("open permission onboarding status file: {error}"))?;
+        let write_result = file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .and_then(|()| file.write_all(&payload))
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
+            .and_then(|()| std::fs::rename(&update_path, &self.path));
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&update_path);
+            return Err(format!("write permission onboarding status file: {error}"));
+        }
+        self.previous = Some(status);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn permission_stage_granted(
+    stage: platform_macos::permissions::onboarding::OnboardingStage,
+    status: platform_macos::permissions::PermissionsStatus,
+) -> bool {
+    use platform_macos::permissions::onboarding::OnboardingStage;
+    match stage {
+        OnboardingStage::Accessibility => status.accessibility,
+        OnboardingStage::ScreenRecordingRegistration | OnboardingStage::ScreenRecording => {
+            status.screen_recording
+        }
+        OnboardingStage::DriverRestarting
+        | OnboardingStage::TccPropagation
+        | OnboardingStage::CaptureVerification
+        | OnboardingStage::Ready
+        | OnboardingStage::Failed => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn permission_stage_is_requestable(
+    stage: platform_macos::permissions::onboarding::OnboardingStage,
+    status: platform_macos::permissions::PermissionsStatus,
+) -> bool {
+    use platform_macos::permissions::onboarding::OnboardingStage;
+
+    match stage {
+        OnboardingStage::Accessibility => !status.accessibility,
+        OnboardingStage::ScreenRecording => status.accessibility && !status.screen_recording,
+        OnboardingStage::ScreenRecordingRegistration
+        | OnboardingStage::DriverRestarting
+        | OnboardingStage::TccPropagation
+        | OnboardingStage::CaptureVerification
+        | OnboardingStage::Ready
+        | OnboardingStage::Failed => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn should_restart_before_screen_recording(
+    completed_stage: platform_macos::permissions::onboarding::OnboardingStage,
+    status: platform_macos::permissions::PermissionsStatus,
+) -> bool {
+    use platform_macos::permissions::onboarding::OnboardingStage;
+
+    completed_stage == OnboardingStage::Accessibility
+        && status.accessibility
+        && !status.screen_recording
+}
+
+#[cfg(target_os = "macos")]
+fn resumed_permission_propagation_target(
+    resumed: &platform_macos::permissions::onboarding::OnboardingStatus,
+    current: platform_macos::permissions::PermissionsStatus,
+) -> Option<platform_macos::permissions::onboarding::OnboardingStage> {
+    use platform_macos::permissions::onboarding::{next_permission_stage, OnboardingStage};
+
+    match resumed.stage {
+        OnboardingStage::Accessibility => {
+            (!current.accessibility).then_some(OnboardingStage::Accessibility)
+        }
+        OnboardingStage::ScreenRecordingRegistration | OnboardingStage::ScreenRecording => {
+            (!current.screen_recording).then_some(OnboardingStage::ScreenRecording)
+        }
+        OnboardingStage::DriverRestarting => {
+            // A DriverRestarting snapshot records the grants observed by the
+            // preceding host. Wait only for one of those grants to propagate;
+            // do not mistake the intentionally still-missing next permission
+            // for stale TCC state.
+            if resumed.accessibility && !current.accessibility {
+                Some(OnboardingStage::Accessibility)
+            } else if resumed.screen_recording && !current.screen_recording {
+                Some(OnboardingStage::ScreenRecording)
+            } else {
+                None
+            }
+        }
+        OnboardingStage::TccPropagation => next_permission_stage(current),
+        OnboardingStage::CaptureVerification | OnboardingStage::Ready | OnboardingStage::Failed => {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn restart_permission_host_or_fail(
+    sink: &mut OnboardingStatusSink,
+    status: platform_macos::permissions::PermissionsStatus,
+    generation: u8,
+    failure_code: &str,
+    failure_message: impl Into<String>,
+) -> i32 {
+    use platform_macos::permissions::onboarding::{
+        OnboardingStage, OnboardingStatus, ONBOARDING_MAX_HOST_GENERATIONS,
+        ONBOARDING_RESTART_REQUIRED_EXIT_CODE,
+    };
+
+    let failure_message = failure_message.into();
+    if generation < ONBOARDING_MAX_HOST_GENERATIONS {
+        eprintln!(
+            "permission onboarding: host generation {generation} requested a fresh-host recovery after {failure_code}: {failure_message}"
+        );
+        return match sink.emit(OnboardingStatus::pending(
+            OnboardingStage::DriverRestarting,
+            status,
+        )) {
+            Ok(()) => ONBOARDING_RESTART_REQUIRED_EXIT_CODE,
+            Err(error) => {
+                eprintln!("permission onboarding status: {error}");
+                74
+            }
+        };
+    }
+    let _ = sink.emit(OnboardingStatus::failed(
+        status,
+        None,
+        true,
+        failure_code,
+        failure_message,
+    ));
+    1
+}
+
+#[cfg(target_os = "macos")]
+fn stop_onboarding_if_launcher_gone(
+    liveness_path: &std::path::Path,
+    sink: &mut OnboardingStatusSink,
+    permissions: platform_macos::permissions::PermissionsStatus,
+) -> Option<i32> {
+    use platform_macos::permissions::onboarding::OnboardingStatus;
+
+    match onboarding_launcher_is_alive(liveness_path) {
+        Ok(true) => None,
+        Ok(false) => {
+            let _ = sink.emit(OnboardingStatus::failed(
+                permissions,
+                None,
+                true,
+                "setup_cancelled",
+                "the trusted setup launcher is no longer running",
+            ));
+            Some(130)
+        }
+        Err(error) => {
+            let _ = sink.emit(OnboardingStatus::failed(
+                permissions,
+                None,
+                false,
+                "liveness_check_failed",
+                error,
+            ));
+            Some(74)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_permissions_onboarding_host(
+    path: std::path::PathBuf,
+    liveness_path: std::path::PathBuf,
+    generation: u8,
+    deadline_budget: std::time::Duration,
+) -> i32 {
+    use platform_macos::permissions::gate::{open_system_settings_for, MissingPermission};
+    use platform_macos::permissions::onboarding::{
+        fresh_status, next_permission_stage, persist_live_screen_capture_verification,
+        verify_live_screen_capture_with_cancel, CaptureVerificationOutcome, OnboardingStage,
+        OnboardingStatus, CAPTURE_VERIFICATION_TIMEOUT, ONBOARDING_POLL_INTERVAL,
+        ONBOARDING_RESTART_REQUIRED_EXIT_CODE, ONBOARDING_TCC_PROPAGATION_GRACE,
+    };
+    use platform_macos::permissions::panel::{
+        wait_for_screen_recording_request_host, PermissionHostWaitOutcome,
+    };
+
+    let resumed_status = if generation > 1 {
+        std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<OnboardingStatus>(&bytes).ok())
+    } else {
+        None
+    };
+    let mut sink = OnboardingStatusSink::new(path);
+    let started = std::time::Instant::now();
+
+    // A newly launched app generation can briefly observe the pre-grant TCC
+    // state. Wait without re-requesting or reopening Settings when resuming a
+    // permission stage; this avoids duplicate prompt churn after the system's
+    // "Quit & Reopen" action.
+    if let Some(resumed) = resumed_status.as_ref() {
+        let mut status = fresh_status();
+        log_onboarding_permission_probe(generation, "resume", status);
+        let propagation_target = resumed_permission_propagation_target(resumed, status);
+        if let Some(target) = propagation_target {
+            eprintln!(
+                "permission onboarding: host generation {generation} is waiting for the previous {:?} grant to propagate",
+                target
+            );
+            if let Err(error) = sink.emit(OnboardingStatus::pending(
+                OnboardingStage::TccPropagation,
+                status,
+            )) {
+                eprintln!("permission onboarding status: {error}");
+                return 74;
+            }
+            let grace = ONBOARDING_TCC_PROPAGATION_GRACE.min(deadline_budget);
+            while started.elapsed() < grace && started.elapsed() < deadline_budget {
+                if let Some(code) =
+                    stop_onboarding_if_launcher_gone(&liveness_path, &mut sink, status)
+                {
+                    return code;
+                }
+                platform_macos::permissions::panel::pump_run_loop_briefly(
+                    ONBOARDING_POLL_INTERVAL.as_secs_f64(),
+                );
+                status = fresh_status();
+                if permission_stage_granted(target, status) {
+                    eprintln!(
+                        "permission onboarding: host generation {generation} observed the propagated {:?} grant",
+                        target
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    loop {
+        let mut status = fresh_status();
+        if let Some(code) = stop_onboarding_if_launcher_gone(&liveness_path, &mut sink, status) {
+            return code;
+        }
+        let Some(stage) = next_permission_stage(status) else {
+            break;
+        };
+        log_onboarding_permission_probe(generation, "stage-selection", status);
+        let announced_stage = if stage == OnboardingStage::ScreenRecording {
+            OnboardingStage::ScreenRecordingRegistration
+        } else {
+            stage
+        };
+        if let Err(error) = sink.emit(OnboardingStatus::pending(announced_stage, status)) {
+            eprintln!("permission onboarding status: {error}");
+            return 74;
+        }
+
+        // Ask only for the active stage. Before Screen Recording, briefly
+        // publish the non-user registration stage and activate the real
+        // AppKit host. CGRequestScreenCaptureAccess is the supported request
+        // API and is the first capture-related call. A real ScreenCaptureKit
+        // capture is reserved for verification after the live preflight says
+        // both permissions are granted.
+        let permission = match stage {
+            OnboardingStage::Accessibility => MissingPermission::Accessibility,
+            OnboardingStage::ScreenRecording => {
+                let activation_timeout = std::time::Duration::from_secs(5)
+                    .min(deadline_budget.saturating_sub(started.elapsed()));
+                match wait_for_screen_recording_request_host(activation_timeout, || {
+                    !onboarding_launcher_is_alive(&liveness_path).unwrap_or(false)
+                }) {
+                    Ok(PermissionHostWaitOutcome::Completed(true)) => {}
+                    Ok(PermissionHostWaitOutcome::Cancelled) => {
+                        let _ = sink.emit(OnboardingStatus::failed(
+                            status,
+                            None,
+                            true,
+                            "setup_cancelled",
+                            "the trusted setup launcher is no longer running",
+                        ));
+                        return 130;
+                    }
+                    Ok(PermissionHostWaitOutcome::TimedOut)
+                    | Ok(PermissionHostWaitOutcome::Completed(false)) => {
+                        return restart_permission_host_or_fail(
+                            &mut sink,
+                            status,
+                            generation,
+                            "screen_recording_registration_failed",
+                            "the permission request host did not become active before the deadline",
+                        );
+                    }
+                    Err(error) => {
+                        return restart_permission_host_or_fail(
+                            &mut sink,
+                            status,
+                            generation,
+                            "screen_recording_registration_failed",
+                            error,
+                        );
+                    }
+                }
+                eprintln!(
+                    "permission onboarding: host generation {generation} activated as a regular foreground app for Screen Recording"
+                );
+                MissingPermission::ScreenRecording
+            }
+            _ => unreachable!("next_permission_stage only returns TCC permission stages"),
+        };
+
+        // Re-read both live probes immediately before invoking a request. In
+        // particular, never call CGRequestScreenCaptureAccess unless the
+        // Accessibility grant is already observable by a fresh process.
+        status = fresh_status();
+        if !permission_stage_is_requestable(stage, status) {
+            if should_restart_before_screen_recording(stage, status) {
+                eprintln!(
+                    "permission onboarding: Accessibility became live in host generation {generation}; restarting before Screen Recording"
+                );
+                if let Err(error) = sink.emit(OnboardingStatus::pending(
+                    OnboardingStage::DriverRestarting,
+                    status,
+                )) {
+                    eprintln!("permission onboarding status: {error}");
+                    return 74;
+                }
+                return ONBOARDING_RESTART_REQUIRED_EXIT_CODE;
+            }
+            continue;
+        }
+        if stage == OnboardingStage::ScreenRecording {
+            if let Err(error) = sink.emit(OnboardingStatus::pending(stage, status)) {
+                eprintln!("permission onboarding status: {error}");
+                return 74;
+            }
+        }
+
+        let request_timeout = deadline_budget.saturating_sub(started.elapsed());
+        let request_granted =
+            match platform_macos::permissions::panel::request_permission_from_appkit_host(
+                permission,
+                request_timeout,
+                || !onboarding_launcher_is_alive(&liveness_path).unwrap_or(false),
+            ) {
+                Ok(PermissionHostWaitOutcome::Completed(granted)) => granted,
+                Ok(PermissionHostWaitOutcome::Cancelled) => {
+                    let _ = sink.emit(OnboardingStatus::failed(
+                        status,
+                        None,
+                        true,
+                        "setup_cancelled",
+                        "the trusted setup launcher is no longer running",
+                    ));
+                    return 130;
+                }
+                Ok(PermissionHostWaitOutcome::TimedOut) => {
+                    let _ = sink.emit(OnboardingStatus::failed(
+                        status,
+                        None,
+                        true,
+                        "permission_onboarding_timed_out",
+                        format!(
+                            "timed out waiting for the {} request to finish",
+                            permission.label()
+                        ),
+                    ));
+                    return 1;
+                }
+                Err(error) => {
+                    let code = if stage == OnboardingStage::ScreenRecording {
+                        "screen_recording_registration_failed"
+                    } else {
+                        "driver_app_launch_failed"
+                    };
+                    return restart_permission_host_or_fail(
+                        &mut sink, status, generation, code, error,
+                    );
+                }
+            };
+        let request_api = match permission {
+            MissingPermission::Accessibility => "AXIsProcessTrustedWithOptions",
+            MissingPermission::ScreenRecording => "CGRequestScreenCaptureAccess",
+        };
+        eprintln!("permission onboarding: {request_api} returned {request_granted}");
+        status = fresh_status();
+        log_onboarding_permission_probe(generation, "post-request", status);
+        if !request_granted {
+            if let Err(error) = open_system_settings_for(permission) {
+                let failure = OnboardingStatus::failed(
+                    status,
+                    None,
+                    true,
+                    "settings_open_failed",
+                    format!("could not open {} settings: {error}", permission.label()),
+                );
+                let _ = sink.emit(failure);
+                eprintln!("permission onboarding: {error}");
+                return 1;
+            }
+        }
+
+        loop {
+            if let Some(code) = stop_onboarding_if_launcher_gone(&liveness_path, &mut sink, status)
+            {
+                return code;
+            }
+            if started.elapsed() >= deadline_budget {
+                status = fresh_status();
+                let failure = OnboardingStatus::failed(
+                    status,
+                    None,
+                    true,
+                    "permission_onboarding_timed_out",
+                    format!(
+                        "timed out waiting for {} after {} seconds",
+                        permission.label(),
+                        deadline_budget.as_secs()
+                    ),
+                );
+                let _ = sink.emit(failure);
+                return 1;
+            }
+            platform_macos::permissions::panel::pump_run_loop_briefly(
+                ONBOARDING_POLL_INTERVAL.as_secs_f64(),
+            );
+            status = fresh_status();
+            if let Some(code) = stop_onboarding_if_launcher_gone(&liveness_path, &mut sink, status)
+            {
+                return code;
+            }
+            if stage == OnboardingStage::ScreenRecording && !status.accessibility {
+                let _ = sink.emit(OnboardingStatus::failed(
+                    status,
+                    None,
+                    true,
+                    "permission_changed_during_onboarding",
+                    "Accessibility was revoked while waiting for Screen Recording",
+                ));
+                return 1;
+            }
+            if permission_stage_granted(stage, status) {
+                eprintln!(
+                    "permission onboarding: host generation {generation} confirmed {} from a fresh signed-process probe",
+                    permission.label()
+                );
+                break;
+            }
+            if let Err(error) = sink.emit(OnboardingStatus::pending(stage, status)) {
+                eprintln!("permission onboarding status: {error}");
+                return 74;
+            }
+        }
+
+        if should_restart_before_screen_recording(stage, status) {
+            eprintln!(
+                "permission onboarding: Accessibility granted in host generation {generation}; restarting before Screen Recording"
+            );
+            if let Err(error) = sink.emit(OnboardingStatus::pending(
+                OnboardingStage::DriverRestarting,
+                status,
+            )) {
+                eprintln!("permission onboarding status: {error}");
+                return 74;
+            }
+            return ONBOARDING_RESTART_REQUIRED_EXIT_CODE;
+        }
+
+        if stage == OnboardingStage::ScreenRecording {
+            // Even when the user chooses "Later", ScreenCaptureKit may keep
+            // the old authorization snapshot in this process. Hand control
+            // back to the launcher before attempting capture so both macOS
+            // dialog choices converge on the same supervised restart path.
+            if let Err(error) = sink.emit(OnboardingStatus::pending(
+                OnboardingStage::DriverRestarting,
+                status,
+            )) {
+                eprintln!("permission onboarding status: {error}");
+                return 74;
+            }
+            return ONBOARDING_RESTART_REQUIRED_EXIT_CODE;
+        }
+    }
+
+    let permissions = fresh_status();
+    log_onboarding_permission_probe(generation, "pre-capture", permissions);
+    if let Some(code) = stop_onboarding_if_launcher_gone(&liveness_path, &mut sink, permissions) {
+        return code;
+    }
+    if !permissions.all_granted() {
+        let _ = sink.emit(OnboardingStatus::failed(
+            permissions,
+            None,
+            true,
+            "permission_changed_before_capture_verification",
+            "a required macOS permission was revoked before live capture verification",
+        ));
+        return 1;
+    }
+    if let Err(error) = sink.emit(OnboardingStatus::pending(
+        OnboardingStage::CaptureVerification,
+        permissions,
+    )) {
+        eprintln!("permission onboarding status: {error}");
+        return 74;
+    }
+    let capture_timeout =
+        CAPTURE_VERIFICATION_TIMEOUT.min(deadline_budget.saturating_sub(started.elapsed()));
+    if capture_timeout.is_zero() {
+        let _ = sink.emit(OnboardingStatus::failed(
+            permissions,
+            None,
+            true,
+            "permission_onboarding_timed_out",
+            "the shared permission onboarding deadline elapsed before capture verification",
+        ));
+        return 1;
+    }
+    match verify_live_screen_capture_with_cancel(capture_timeout, || {
+        !onboarding_launcher_is_alive(&liveness_path).unwrap_or(false)
+    }) {
+        CaptureVerificationOutcome::Ready => {
+            let verified_permissions = fresh_status();
+            log_onboarding_permission_probe(generation, "post-capture", verified_permissions);
+            if !verified_permissions.all_granted() {
+                let _ = sink.emit(OnboardingStatus::failed(
+                    verified_permissions,
+                    Some(true),
+                    true,
+                    "permission_changed_during_capture_verification",
+                    "a required macOS permission was revoked during live capture verification",
+                ));
+                return 1;
+            }
+            if let Some(code) =
+                stop_onboarding_if_launcher_gone(&liveness_path, &mut sink, verified_permissions)
+            {
+                return code;
+            }
+            if let Err(error) = persist_live_screen_capture_verification() {
+                eprintln!("permission onboarding evidence: {error}");
+                let _ = sink.emit(OnboardingStatus::capture_verification_store_failed(
+                    verified_permissions,
+                ));
+                return 1;
+            }
+            let ready = OnboardingStatus::ready(verified_permissions)
+                .expect("both live permission probes were checked above");
+            match sink.emit(ready) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("permission onboarding status: {error}");
+                    74
+                }
+            }
+        }
+        CaptureVerificationOutcome::Unavailable => {
+            let _ = sink.emit(OnboardingStatus::failed(
+                permissions,
+                Some(false),
+                true,
+                "direct_capture_unavailable",
+                "ScreenCaptureKit returned no capturable displays",
+            ));
+            1
+        }
+        CaptureVerificationOutcome::TimedOut => {
+            let _ = sink.emit(OnboardingStatus::failed(
+                permissions,
+                None,
+                true,
+                "direct_capture_probe_timed_out",
+                format!(
+                    "ScreenCaptureKit verification did not finish within {} seconds",
+                    capture_timeout.as_secs_f64()
+                ),
+            ));
+            1
+        }
+        CaptureVerificationOutcome::Cancelled => {
+            let _ = sink.emit(OnboardingStatus::failed(
+                permissions,
+                None,
+                true,
+                "setup_cancelled",
+                "the trusted setup launcher is no longer running",
+            ));
+            130
+        }
+        CaptureVerificationOutcome::Failed(error) => {
+            let _ = sink.emit(OnboardingStatus::failed(
+                permissions,
+                None,
+                true,
+                "direct_capture_probe_failed",
+                error,
+            ));
+            1
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn print_onboarding_status(
+    status: &platform_macos::permissions::onboarding::OnboardingStatus,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    let line = serde_json::to_string(status)
+        .map_err(|error| format!("serialize permission onboarding JSONL: {error}"))?;
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output, "{line}")
+        .and_then(|()| output.flush())
+        .map_err(|error| format!("flush permission onboarding JSONL: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn onboarding_host_exited_status(
+    latest: Option<&platform_macos::permissions::onboarding::OnboardingStatus>,
+    fallback: platform_macos::permissions::PermissionsStatus,
+) -> platform_macos::permissions::onboarding::OnboardingStatus {
+    use platform_macos::permissions::onboarding::OnboardingStatus;
+
+    let permissions = latest
+        .map(|status| platform_macos::permissions::PermissionsStatus {
+            accessibility: status.accessibility,
+            screen_recording: status.screen_recording,
+        })
+        .unwrap_or(fallback);
+    let capture_result = latest.and_then(|status| status.screen_recording_capturable);
+    OnboardingStatus::failed(
+        permissions,
+        capture_result,
+        true,
+        "onboarding_host_restart_limit_reached",
+        "the LaunchServices onboarding host did not complete within the bounded restart limit",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn should_relaunch_onboarding_host(
+    latest: Option<&platform_macos::permissions::onboarding::OnboardingStatus>,
+    generation: u8,
+) -> bool {
+    use platform_macos::permissions::onboarding::OnboardingStage;
+
+    generation < platform_macos::permissions::onboarding::ONBOARDING_MAX_HOST_GENERATIONS
+        && latest.is_some_and(|status| {
+            matches!(
+                status.stage,
+                OnboardingStage::Accessibility
+                    | OnboardingStage::ScreenRecordingRegistration
+                    | OnboardingStage::ScreenRecording
+                    | OnboardingStage::DriverRestarting
+                    | OnboardingStage::TccPropagation
+                    | OnboardingStage::CaptureVerification
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn should_retry_unpublished_onboarding_relaunch(
+    latest: Option<&platform_macos::permissions::onboarding::OnboardingStatus>,
+    generation: u8,
+) -> bool {
+    generation > 1 && should_relaunch_onboarding_host(latest, generation)
+}
+
+#[cfg(target_os = "macos")]
+fn log_onboarding_permission_probe(
+    generation: u8,
+    checkpoint: &str,
+    status: platform_macos::permissions::PermissionsStatus,
+) {
+    eprintln!(
+        "permission onboarding: host generation {generation} {checkpoint} fresh signed-process probe accessibility={} screen_recording={}",
+        status.accessibility, status.screen_recording
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn onboarding_launch_arguments(
+    app_path: &str,
+    status_path: &std::path::Path,
+    liveness_path: &std::path::Path,
+    host_pid_path: &std::path::Path,
+    diagnostic_path: &std::path::Path,
+    session_nonce: &str,
+    generation: u8,
+    deadline_budget: std::time::Duration,
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "-n".into(),
+        "-W".into(),
+        "--stderr".into(),
+        diagnostic_path.as_os_str().to_owned(),
+        app_path.into(),
+        "--args".into(),
+        platform_macos::permissions::onboarding::ONBOARDING_HOST_ARG.into(),
+        "--status-file".into(),
+        status_path.as_os_str().to_owned(),
+        "--liveness-file".into(),
+        liveness_path.as_os_str().to_owned(),
+        "--host-pid-file".into(),
+        host_pid_path.as_os_str().to_owned(),
+        "--session-nonce".into(),
+        session_nonce.into(),
+        "--host-generation".into(),
+        generation.to_string().into(),
+        "--deadline-after-ms".into(),
+        (deadline_budget.as_millis().max(1) as u64)
+            .to_string()
+            .into(),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn relay_onboarding_host_diagnostics(
+    path: &std::path::Path,
+    offset: &mut u64,
+) -> Result<(), String> {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open permission onboarding diagnostic log: {error}"))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("inspect permission onboarding diagnostic log: {error}"))?
+        .len();
+    if length < *offset {
+        *offset = 0;
+    }
+    file.seek(std::io::SeekFrom::Start(*offset))
+        .map_err(|error| format!("seek permission onboarding diagnostic log: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(64 * 1024)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read permission onboarding diagnostic log: {error}"))?;
+    *offset += bytes.len() as u64;
+    if !bytes.is_empty() {
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        stderr
+            .write_all(&bytes)
+            .and_then(|()| stderr.flush())
+            .map_err(|error| format!("relay permission onboarding diagnostic log: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn onboarding_host_identity(
+    path: &std::path::Path,
+    expected_executable: &std::path::Path,
+    expected_arguments: &[String],
+    expected_generation: u8,
+    expected_nonce: &str,
+) -> Result<Option<OnboardingHostIdentity>, String> {
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect permission onboarding host identity: {error}"))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > 16 * 1024
+    {
+        return Err("permission onboarding host identity file is unsafe".to_owned());
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("read permission onboarding host identity: {error}"))?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let identity: OnboardingHostIdentity = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse permission onboarding host identity: {error}"))?;
+    if identity.schema_version != 1
+        || identity.pid <= 1
+        || identity.generation != expected_generation
+        || identity.session_nonce != expected_nonce
+        || identity.arguments != expected_arguments
+    {
+        return Err(
+            "permission onboarding host identity does not match this generation".to_owned(),
+        );
+    }
+    let expected_start = (identity.start_seconds, identity.start_microseconds);
+    if !process_lifetime_is_alive(identity.pid, expected_start)? {
+        return Ok(None);
+    }
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length = unsafe {
+        libc::proc_pidpath(
+            identity.pid,
+            buffer.as_mut_ptr().cast(),
+            libc::PROC_PIDPATHINFO_MAXSIZE as u32,
+        )
+    };
+    if length <= 0 {
+        return Err("cannot inspect live permission onboarding host executable".to_owned());
+    }
+    buffer.truncate(length as usize);
+    while buffer.last() == Some(&0) {
+        buffer.pop();
+    }
+    let actual = std::path::PathBuf::from(std::ffi::OsString::from_vec(buffer));
+    let actual = std::fs::canonicalize(actual)
+        .map_err(|error| format!("resolve live permission onboarding host executable: {error}"))?;
+    if actual != expected_executable {
+        return Err("permission onboarding host executable identity changed".to_owned());
+    }
+    let live_arguments = process_arguments(identity.pid)
+        .ok_or_else(|| "cannot inspect live permission onboarding host arguments".to_owned())?;
+    if live_arguments.get(1..) != Some(expected_arguments) {
+        return Err("permission onboarding host argv changed".to_owned());
+    }
+    Ok(Some(identity))
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_onboarding_host_exit(
+    host_pid_path: &std::path::Path,
+    expected_executable: &std::path::Path,
+    expected_arguments: &[String],
+    expected_generation: u8,
+    expected_nonce: &str,
+    timeout: std::time::Duration,
+) -> Result<bool, String> {
+    let started = std::time::Instant::now();
+    loop {
+        if onboarding_host_identity(
+            host_pid_path,
+            expected_executable,
+            expected_arguments,
+            expected_generation,
+            expected_nonce,
+        )?
+        .is_none()
+        {
+            return Ok(true);
+        }
+        if started.elapsed() >= timeout {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_onboarding_host(
+    host_pid_path: &std::path::Path,
+    expected_executable: &std::path::Path,
+    expected_arguments: &[String],
+    expected_generation: u8,
+    expected_nonce: &str,
+) -> Result<(), String> {
+    let signal = |identity: &OnboardingHostIdentity, signal| -> Result<bool, String> {
+        if unsafe { libc::kill(identity.pid, signal) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
+        }
+        Err(format!(
+            "signal permission onboarding host {}: {error}",
+            identity.pid
+        ))
+    };
+    if wait_for_onboarding_host_exit(
+        host_pid_path,
+        expected_executable,
+        expected_arguments,
+        expected_generation,
+        expected_nonce,
+        std::time::Duration::from_secs(1),
+    )? {
+        return Ok(());
+    }
+    let Some(identity) = onboarding_host_identity(
+        host_pid_path,
+        expected_executable,
+        expected_arguments,
+        expected_generation,
+        expected_nonce,
+    )?
+    else {
+        return Ok(());
+    };
+    if !signal(&identity, libc::SIGTERM)? {
+        return match onboarding_host_identity(
+            host_pid_path,
+            expected_executable,
+            expected_arguments,
+            expected_generation,
+            expected_nonce,
+        )? {
+            None => Ok(()),
+            Some(_) => {
+                Err("permission onboarding host remained after ESRCH from SIGTERM".to_owned())
+            }
+        };
+    }
+    if wait_for_onboarding_host_exit(
+        host_pid_path,
+        expected_executable,
+        expected_arguments,
+        expected_generation,
+        expected_nonce,
+        std::time::Duration::from_secs(2),
+    )? {
+        return Ok(());
+    }
+    let Some(current) = onboarding_host_identity(
+        host_pid_path,
+        expected_executable,
+        expected_arguments,
+        expected_generation,
+        expected_nonce,
+    )?
+    else {
+        return Ok(());
+    };
+    if current != identity {
+        return Err("permission onboarding host identity changed before SIGKILL".to_owned());
+    }
+    if !signal(&identity, libc::SIGKILL)? {
+        return match onboarding_host_identity(
+            host_pid_path,
+            expected_executable,
+            expected_arguments,
+            expected_generation,
+            expected_nonce,
+        )? {
+            None => Ok(()),
+            Some(_) => {
+                Err("permission onboarding host remained after ESRCH from SIGKILL".to_owned())
+            }
+        };
+    }
+    if !wait_for_onboarding_host_exit(
+        host_pid_path,
+        expected_executable,
+        expected_arguments,
+        expected_generation,
+        expected_nonce,
+        std::time::Duration::from_secs(1),
+    )? {
+        return Err("permission onboarding host survived SIGKILL".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_permissions_onboarding_launcher() -> i32 {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::process::{Command as ProcessCommand, Stdio};
+
+    use platform_macos::permissions::onboarding::{
+        OnboardingStage, OnboardingStatus, ONBOARDING_DEADLINE, ONBOARDING_DIAGNOSTIC_FILE_PREFIX,
+        ONBOARDING_HOST_PID_FILE_PREFIX, ONBOARDING_HOST_RESTART_DELAY,
+        ONBOARDING_LIVENESS_FILE_PREFIX, ONBOARDING_STATUS_FILE_PREFIX,
+    };
+
+    let unknown_permissions = platform_macos::permissions::PermissionsStatus {
+        accessibility: false,
+        screen_recording: false,
+    };
+    // Capture this before any potentially slow setup. If the Python relay
+    // disappears, getppid() may later become 1 and lose the original parent.
+    let setup_parent_pid = unsafe { libc::getppid() };
+    let setup_parent_start = process_start_stamp(setup_parent_pid);
+    let started = std::time::Instant::now();
+    let parent_is_alive = || {
+        setup_parent_pid > 1
+            && setup_parent_start.is_some()
+            && process_start_stamp(setup_parent_pid) == setup_parent_start
+    };
+    let fail = |code: &str, message: String| {
+        let status = OnboardingStatus::failed(unknown_permissions, None, false, code, message);
+        let _ = print_onboarding_status(&status);
+        1
+    };
+
+    if !crate::bundle::is_executable_inside_cuadriver_app() {
+        return fail(
+            "driver_app_identity_required",
+            "permission onboarding requires an installed CuaDriver app bundle".to_owned(),
+        );
+    }
+
+    let serialization_lease = match open_onboarding_serialization_lease() {
+        Ok(lease) => lease,
+        Err(error) => return fail("onboarding_serialization_failed", error),
+    };
+    let mut serialization_wait_announced = false;
+    loop {
+        match try_lock_onboarding_serialization_lease(&serialization_lease) {
+            Ok(true) => break,
+            Ok(false) => {
+                if !serialization_wait_announced {
+                    let waiting = OnboardingStatus::pending(
+                        OnboardingStage::TccPropagation,
+                        unknown_permissions,
+                    );
+                    let _ = print_onboarding_status(&waiting);
+                    serialization_wait_announced = true;
+                }
+            }
+            Err(error) => return fail("onboarding_serialization_failed", error),
+        }
+        if !parent_is_alive() {
+            let status = OnboardingStatus::failed(
+                unknown_permissions,
+                None,
+                true,
+                "setup_cancelled",
+                "the parent setup process is no longer running",
+            );
+            let _ = print_onboarding_status(&status);
+            return 130;
+        }
+        if started.elapsed() >= ONBOARDING_DEADLINE {
+            let status = OnboardingStatus::failed(
+                unknown_permissions,
+                None,
+                true,
+                "onboarding_launcher_timed_out",
+                "timed out waiting for another Computer Use setup to finish",
+            );
+            let _ = print_onboarding_status(&status);
+            return 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let session_nonce = uuid::Uuid::new_v4().to_string();
+    let result_path = std::env::temp_dir().join(format!(
+        "{}{}-{}.json",
+        ONBOARDING_STATUS_FILE_PREFIX,
+        std::process::id(),
+        session_nonce
+    ));
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&result_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return fail(
+                "status_file_create_failed",
+                format!("could not create private onboarding status file: {error}"),
+            )
+        }
+    };
+    if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&result_path);
+        return fail(
+            "status_file_secure_failed",
+            format!("could not secure private onboarding status file: {error}"),
+        );
+    }
+    drop(file);
+
+    let liveness_path = std::env::temp_dir().join(format!(
+        "{}{}-{}.lock",
+        ONBOARDING_LIVENESS_FILE_PREFIX,
+        std::process::id(),
+        session_nonce
+    ));
+    let mut liveness_lease = match OnboardingLivenessLease::create(liveness_path.clone()) {
+        Ok(lease) => Some(lease),
+        Err(error) => {
+            let _ = std::fs::remove_file(&result_path);
+            return fail("liveness_file_create_failed", error);
+        }
+    };
+    let host_pid_path = std::env::temp_dir().join(format!(
+        "{}{}-{}.pid",
+        ONBOARDING_HOST_PID_FILE_PREFIX,
+        std::process::id(),
+        session_nonce
+    ));
+    let host_pid_file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&host_pid_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&result_path);
+            return fail(
+                "host_pid_file_create_failed",
+                format!("could not create private onboarding host PID file: {error}"),
+            );
+        }
+    };
+    if let Err(error) = host_pid_file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&host_pid_path);
+        let _ = std::fs::remove_file(&result_path);
+        return fail(
+            "host_pid_file_secure_failed",
+            format!("could not secure private onboarding host PID file: {error}"),
+        );
+    }
+    drop(host_pid_file);
+    let diagnostic_path = std::env::temp_dir().join(format!(
+        "{}{}-{}.log",
+        ONBOARDING_DIAGNOSTIC_FILE_PREFIX,
+        std::process::id(),
+        session_nonce
+    ));
+    let diagnostic_file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&diagnostic_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&result_path);
+            let _ = std::fs::remove_file(&host_pid_path);
+            return fail(
+                "status_file_create_failed",
+                format!("could not create private onboarding diagnostic log: {error}"),
+            );
+        }
+    };
+    if let Err(error) = diagnostic_file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&diagnostic_path);
+        let _ = std::fs::remove_file(&result_path);
+        let _ = std::fs::remove_file(&host_pid_path);
+        return fail(
+            "status_file_secure_failed",
+            format!("could not secure private onboarding diagnostic log: {error}"),
+        );
+    }
+    drop(diagnostic_file);
+
+    let app_path = crate::bundle::app_bundle_path();
+    let expected_host_executable = match std::env::current_exe().and_then(std::fs::canonicalize) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = std::fs::remove_file(&diagnostic_path);
+            let _ = std::fs::remove_file(&host_pid_path);
+            let _ = std::fs::remove_file(&result_path);
+            return fail(
+                "driver_app_identity_required",
+                format!("could not resolve onboarding host executable: {error}"),
+            );
+        }
+    };
+    let mut latest: Option<OnboardingStatus> = None;
+    let mut last_line = String::new();
+    let mut diagnostic_offset = 0_u64;
+    let mut last_expected_host_arguments: Option<Vec<String>> = None;
+    let mut last_host_generation = 0_u8;
+    let permissions_from_latest = |latest: Option<&OnboardingStatus>| {
+        latest
+            .map(|status| platform_macos::permissions::PermissionsStatus {
+                accessibility: status.accessibility,
+                screen_recording: status.screen_recording,
+            })
+            .unwrap_or(unknown_permissions)
+    };
+
+    let mut generation = 1_u8;
+    let exit_code = 'generations: loop {
+        if started.elapsed() >= ONBOARDING_DEADLINE {
+            let status = OnboardingStatus::failed(
+                permissions_from_latest(latest.as_ref()),
+                None,
+                true,
+                "onboarding_launcher_timed_out",
+                "the shared permission onboarding deadline elapsed",
+            );
+            let _ = print_onboarding_status(&status);
+            break 1;
+        }
+        if !parent_is_alive() {
+            let status = OnboardingStatus::failed(
+                permissions_from_latest(latest.as_ref()),
+                None,
+                true,
+                "setup_cancelled",
+                "the parent setup process is no longer running",
+            );
+            let _ = print_onboarding_status(&status);
+            break 130;
+        }
+
+        let remaining = ONBOARDING_DEADLINE.saturating_sub(started.elapsed());
+        // Hosts publish by atomically renaming a fresh file, so an inode
+        // change proves this generation reached the private status protocol.
+        // This distinguishes a LaunchServices failure from a normal host exit
+        // while preserving the previous generation's resume state in-place.
+        let status_inode_before = std::fs::metadata(&result_path)
+            .ok()
+            .map(|metadata| metadata.ino());
+        let mut observed_status_this_generation = false;
+        if let Err(error) = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&diagnostic_path)
+        {
+            eprintln!("permission onboarding diagnostics: could not reset log: {error}");
+        }
+        diagnostic_offset = 0;
+        if let Err(error) = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&host_pid_path)
+        {
+            let status = OnboardingStatus::failed(
+                permissions_from_latest(latest.as_ref()),
+                None,
+                false,
+                "host_pid_file_reset_failed",
+                format!("could not reset onboarding host PID file: {error}"),
+            );
+            let _ = print_onboarding_status(&status);
+            break 1;
+        }
+        let launch_arguments = onboarding_launch_arguments(
+            &app_path,
+            &result_path,
+            &liveness_path,
+            &host_pid_path,
+            &diagnostic_path,
+            &session_nonce,
+            generation,
+            remaining,
+        );
+        let args_index = launch_arguments
+            .iter()
+            .position(|argument| argument == "--args")
+            .expect("onboarding launch arguments contain --args");
+        let expected_host_arguments = launch_arguments[args_index + 1..]
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let mut child = match ProcessCommand::new("/usr/bin/open")
+            .args(&launch_arguments)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let status = OnboardingStatus::failed(
+                    permissions_from_latest(latest.as_ref()),
+                    None,
+                    generation > 1,
+                    if generation == 1 {
+                        "driver_app_launch_failed"
+                    } else {
+                        "driver_app_relaunch_failed"
+                    },
+                    format!("could not launch {app_path} through LaunchServices: {error}"),
+                );
+                let _ = print_onboarding_status(&status);
+                break 1;
+            }
+        };
+        last_expected_host_arguments = Some(expected_host_arguments);
+        last_host_generation = generation;
+        eprintln!(
+            "permission onboarding launcher: started supervised host generation {generation}/{}",
+            platform_macos::permissions::onboarding::ONBOARDING_MAX_HOST_GENERATIONS
+        );
+
+        loop {
+            if let Err(error) =
+                relay_onboarding_host_diagnostics(&diagnostic_path, &mut diagnostic_offset)
+            {
+                eprintln!("permission onboarding diagnostics: {error}");
+            }
+            if let Ok(bytes) = std::fs::read(&result_path) {
+                observed_status_this_generation |= std::fs::metadata(&result_path)
+                    .ok()
+                    .map(|metadata| metadata.ino())
+                    != status_inode_before;
+                if let Ok(status) = serde_json::from_slice::<OnboardingStatus>(&bytes) {
+                    if let Ok(line) = serde_json::to_string(&status) {
+                        if line != last_line {
+                            if let Err(error) = print_onboarding_status(&status) {
+                                eprintln!("permission onboarding: {error}");
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break 'generations 74;
+                            }
+                            last_line = line;
+                        }
+                    }
+                    latest = Some(status);
+                }
+            }
+
+            match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    if let Err(error) =
+                        relay_onboarding_host_diagnostics(&diagnostic_path, &mut diagnostic_offset)
+                    {
+                        eprintln!("permission onboarding diagnostics: {error}");
+                    }
+                    // The host may have completed its final atomic write
+                    // between the read above and observing its exit.
+                    if let Ok(bytes) = std::fs::read(&result_path) {
+                        observed_status_this_generation |= std::fs::metadata(&result_path)
+                            .ok()
+                            .map(|metadata| metadata.ino())
+                            != status_inode_before;
+                        if let Ok(status) = serde_json::from_slice::<OnboardingStatus>(&bytes) {
+                            if let Ok(line) = serde_json::to_string(&status) {
+                                if line != last_line {
+                                    let _ = print_onboarding_status(&status);
+                                    last_line = line;
+                                }
+                            }
+                            latest = Some(status);
+                        }
+                    }
+                    if latest
+                        .as_ref()
+                        .is_some_and(|status| status.stage == OnboardingStage::Ready)
+                    {
+                        break 'generations 0;
+                    }
+                    if latest.as_ref().is_some_and(OnboardingStatus::is_terminal) {
+                        break 'generations 1;
+                    }
+                    if !observed_status_this_generation
+                        && !should_retry_unpublished_onboarding_relaunch(
+                            latest.as_ref(),
+                            generation,
+                        )
+                    {
+                        let status = OnboardingStatus::failed(
+                            permissions_from_latest(latest.as_ref()),
+                            None,
+                            generation > 1,
+                            if generation == 1 {
+                                "driver_app_launch_failed"
+                            } else {
+                                "driver_app_relaunch_failed"
+                            },
+                            format!("LaunchServices host generation {generation} exited with {exit_status} without publishing a restartable setup state"),
+                        );
+                        let _ = print_onboarding_status(&status);
+                        break 'generations 1;
+                    }
+                    if !observed_status_this_generation {
+                        eprintln!(
+                            "permission onboarding launcher: LaunchServices host generation {generation} exited with {exit_status} before publishing; retrying within the bounded generation budget"
+                        );
+                    }
+                    if !should_relaunch_onboarding_host(latest.as_ref(), generation) {
+                        let status =
+                            onboarding_host_exited_status(latest.as_ref(), unknown_permissions);
+                        let _ = print_onboarding_status(&status);
+                        break 'generations 1;
+                    }
+
+                    // A grant can terminate the responsible app. Keep the
+                    // same launcher, status nonce, liveness lease, and global
+                    // deadline; only the LaunchServices host generation
+                    // changes. No failure is exposed between generations.
+                    let restarting = OnboardingStatus::pending(
+                        OnboardingStage::DriverRestarting,
+                        permissions_from_latest(latest.as_ref()),
+                    );
+                    if let Ok(line) = serde_json::to_string(&restarting) {
+                        if line != last_line {
+                            let _ = print_onboarding_status(&restarting);
+                            last_line = line;
+                        }
+                    }
+                    generation += 1;
+
+                    let restart_started = std::time::Instant::now();
+                    while restart_started.elapsed() < ONBOARDING_HOST_RESTART_DELAY {
+                        if !parent_is_alive() {
+                            let status = OnboardingStatus::failed(
+                                permissions_from_latest(latest.as_ref()),
+                                None,
+                                true,
+                                "setup_cancelled",
+                                "the parent setup process is no longer running",
+                            );
+                            let _ = print_onboarding_status(&status);
+                            break 'generations 130;
+                        }
+                        if started.elapsed() >= ONBOARDING_DEADLINE {
+                            let status = OnboardingStatus::failed(
+                                permissions_from_latest(latest.as_ref()),
+                                None,
+                                true,
+                                "onboarding_launcher_timed_out",
+                                "the shared permission onboarding deadline elapsed",
+                            );
+                            let _ = print_onboarding_status(&status);
+                            break 'generations 1;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    continue 'generations;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let status = OnboardingStatus::failed(
+                        permissions_from_latest(latest.as_ref()),
+                        None,
+                        false,
+                        "onboarding_host_wait_failed",
+                        format!("could not wait for the LaunchServices onboarding host: {error}"),
+                    );
+                    let _ = print_onboarding_status(&status);
+                    break 'generations 1;
+                }
+            }
+
+            if !parent_is_alive() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let status = OnboardingStatus::failed(
+                    permissions_from_latest(latest.as_ref()),
+                    None,
+                    true,
+                    "setup_cancelled",
+                    "the parent setup process is no longer running",
+                );
+                let _ = print_onboarding_status(&status);
+                break 'generations 130;
+            }
+
+            if started.elapsed() >= ONBOARDING_DEADLINE {
+                let _ = child.kill();
+                let _ = child.wait();
+                let status = OnboardingStatus::failed(
+                    permissions_from_latest(latest.as_ref()),
+                    None,
+                    true,
+                    "onboarding_launcher_timed_out",
+                    "the shared permission onboarding deadline elapsed",
+                );
+                let _ = print_onboarding_status(&status);
+                break 'generations 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    // Release cancellation authority before deleting status paths. The
+    // LaunchServices app is not a child of `open`, so wait for or terminate the
+    // exact PID it published before removing shared files.
+    drop(liveness_lease.take());
+    if let Some(expected_arguments) = last_expected_host_arguments.as_deref() {
+        if let Err(error) = terminate_onboarding_host(
+            &host_pid_path,
+            &expected_host_executable,
+            expected_arguments,
+            last_host_generation,
+            &session_nonce,
+        ) {
+            eprintln!("permission onboarding host cleanup: {error}");
+            let _ = relay_onboarding_host_diagnostics(&diagnostic_path, &mut diagnostic_offset);
+            return 74;
+        }
+    }
+    let _ = relay_onboarding_host_diagnostics(&diagnostic_path, &mut diagnostic_offset);
+    let _ = std::fs::remove_file(&diagnostic_path);
+    let _ = std::fs::remove_file(&host_pid_path);
+    let _ = std::fs::remove_file(&result_path);
+    exit_code
+}
+
+/// Run the private app-owned onboarding route before ordinary CLI dispatch.
+/// This is intentionally absent from help, the CLI manifest, and MCP tools.
+#[cfg(target_os = "macos")]
+pub fn run_permissions_onboarding_if_requested() -> Option<i32> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match private_onboarding_mode(&args)? {
+        PrivateOnboardingMode::Launch => Some(run_permissions_onboarding_launcher()),
+        PrivateOnboardingMode::Host => {
+            if !crate::bundle::is_executable_inside_cuadriver_app() {
+                eprintln!("permission onboarding host requires the installed CuaDriver app bundle");
+                return Some(77);
+            }
+            match (
+                private_onboarding_status_path(&args),
+                private_onboarding_liveness_path(&args),
+                private_onboarding_host_pid_path(&args),
+                private_onboarding_host_generation(&args),
+                private_onboarding_deadline_budget(&args),
+                private_onboarding_session_nonce(&args),
+            ) {
+                (
+                    Ok(path),
+                    Ok(liveness_path),
+                    Ok(host_pid_path),
+                    Ok(generation),
+                    Ok(deadline_budget),
+                    Ok(session_nonce),
+                ) => {
+                    let failure_path = path.clone();
+                    if let Err(error) = publish_onboarding_host_pid(
+                        &host_pid_path,
+                        generation,
+                        &session_nonce,
+                        std::env::args().skip(1).collect(),
+                    ) {
+                        let permissions = platform_macos::permissions::onboarding::fresh_status();
+                        let mut sink = OnboardingStatusSink::new(failure_path);
+                        let _ = sink.emit(
+                            platform_macos::permissions::onboarding::OnboardingStatus::failed(
+                                permissions,
+                                None,
+                                false,
+                                "host_pid_file_publish_failed",
+                                error,
+                            ),
+                        );
+                        return Some(74);
+                    }
+                    Some(
+                        match platform_macos::permissions::panel::run_permission_request_host(
+                            move || {
+                                run_permissions_onboarding_host(
+                                    path,
+                                    liveness_path,
+                                    generation,
+                                    deadline_budget,
+                                )
+                            },
+                        ) {
+                            Ok(code) => code,
+                            Err(error) => {
+                                let permissions =
+                                    platform_macos::permissions::onboarding::fresh_status();
+                                let mut sink = OnboardingStatusSink::new(failure_path);
+                                let _ = sink.emit(
+                                    platform_macos::permissions::onboarding::OnboardingStatus::failed(
+                                        permissions,
+                                        None,
+                                        false,
+                                        "driver_app_launch_failed",
+                                        format!("could not run AppKit permission host: {error}"),
+                                    ),
+                                );
+                                eprintln!("permission onboarding host: {error}");
+                                70
+                            }
+                        },
+                    )
+                }
+                (Err(error), _, _, _, _, _)
+                | (_, Err(error), _, _, _, _)
+                | (_, _, Err(error), _, _, _)
+                | (_, _, _, Err(error), _, _)
+                | (_, _, _, _, Err(error), _)
+                | (_, _, _, _, _, Err(error)) => {
+                    eprintln!("permission onboarding host: {error}");
+                    Some(64)
+                }
+            }
+        }
     }
 }
 
@@ -3654,7 +5889,7 @@ fn request_permissions_via_launchservices(
 }
 
 /// Launch CuaDriver via LaunchServices so the permission prompt attributes to
-/// com.trycua.driver, wait (user-paced) for the daemon to come up — its socket
+/// com.meta.musecode.cua.driver, wait (user-paced) for the daemon to come up — its socket
 /// only appears once the permissions gate passes, i.e. the grant was given —
 /// then report the driver's own status.
 fn run_permissions_grant() {
@@ -4326,7 +6561,7 @@ pub fn run_dump_docs_with_type(tools_list: &serde_json::Value, pretty: bool, doc
 ///   - codesign info (cdhash, team-id, authority) via `codesign -dvvv`
 ///   - AX + screen recording TCC status (check_permissions tool)
 ///   - install layout (/Applications/CuaDriver.app, ~/.local/bin/cua-driver)
-///   - TCC DB rows for com.trycua.driver (sqlite3, best-effort)
+///   - TCC DB rows for com.meta.musecode.cua.driver (sqlite3, best-effort)
 ///   - config + state paths with existence booleans
 pub fn run_diagnose_cmd() {
     let sections = [
@@ -4499,9 +6734,11 @@ fn diagnose_tcc_db_section() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let db = format!("{home}/Library/Application Support/com.apple.TCC/TCC.db");
     let sql = "SELECT service, client, client_type, auth_value, auth_reason, \
-               hex(csreq) AS csreq_hex FROM access WHERE client='com.trycua.driver';";
+               hex(csreq) AS csreq_hex FROM access WHERE client IN (\
+               'com.meta.musecode.cua.driver', 'com.meta.musecode.cua.driver.local', \
+               'com.trycua.driver', 'com.trycua.driver.local', 'com.trycua.cuadriverrs');";
 
-    let mut lines = vec!["## tcc database rows for com.trycua.driver".to_owned()];
+    let mut lines = vec!["## current and legacy Cua Driver TCC database rows".to_owned()];
     lines.push(format!(
         "(reading {db} — best-effort; system TCC DB requires FDA)"
     ));
@@ -4853,6 +7090,579 @@ mod tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_onboarding_entrypoints_are_exact_and_not_public_commands() {
+        use platform_macos::permissions::onboarding::{
+            ONBOARDING_CONTRACT_ARG, ONBOARDING_HOST_ARG, ONBOARDING_LAUNCH_ARG,
+        };
+
+        assert_eq!(
+            private_onboarding_mode(&args(&[ONBOARDING_LAUNCH_ARG])),
+            Some(PrivateOnboardingMode::Launch)
+        );
+        assert_eq!(
+            private_onboarding_mode(&args(&[ONBOARDING_HOST_ARG, "--status-file", "/tmp/x"])),
+            Some(PrivateOnboardingMode::Host)
+        );
+        assert_eq!(
+            private_onboarding_mode(&args(&["permissions", "grant"])),
+            None
+        );
+        assert!(permissions_onboarding_contract_requested(&args(&[
+            ONBOARDING_CONTRACT_ARG
+        ])));
+        assert!(!permissions_onboarding_contract_requested(&args(&[
+            ONBOARDING_CONTRACT_ARG,
+            "unexpected"
+        ])));
+        assert!(build_attestation_requested(&args(&[BUILD_ATTESTATION_ARG])));
+        assert!(!build_attestation_requested(&args(&[
+            BUILD_ATTESTATION_ARG,
+            "unexpected"
+        ])));
+
+        let attestation = build_attestation();
+        assert_eq!(attestation["schema_version"], 1);
+        assert_eq!(
+            attestation["binary_version"],
+            option_env!("CUA_DRIVER_RELEASE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            attestation["source_sha"],
+            serde_json::json!(option_env!("CUA_DRIVER_SOURCE_SHA"))
+        );
+        assert_eq!(
+            attestation["production_team_id"],
+            crate::bundle::PRODUCTION_TEAM_ID
+        );
+        assert!(attestation["bundle_id"].is_string());
+        assert!(attestation["plugin_managed"].is_boolean());
+
+        let manifest = serde_json::to_string(&build_manifest()).unwrap();
+        assert!(!manifest.contains(ONBOARDING_LAUNCH_ARG));
+        assert!(!manifest.contains(ONBOARDING_HOST_ARG));
+        assert!(!manifest.contains(ONBOARDING_CONTRACT_ARG));
+        assert!(!manifest.contains(BUILD_ATTESTATION_ARG));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_onboarding_status_file_must_be_precreated_and_private() {
+        use platform_macos::permissions::onboarding::{
+            ONBOARDING_HOST_ARG, ONBOARDING_STATUS_FILE_PREFIX,
+        };
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let path = std::env::temp_dir().join(format!(
+            "{}test-{}.json",
+            ONBOARDING_STATUS_FILE_PREFIX,
+            uuid::Uuid::new_v4()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        drop(file);
+        let argv = vec![
+            ONBOARDING_HOST_ARG.to_owned(),
+            "--status-file".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(private_onboarding_status_path(&argv).unwrap(), path);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(private_onboarding_status_path(&argv)
+            .unwrap_err()
+            .contains("group/world"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_onboarding_relaunches_the_exact_app_through_launchservices() {
+        use platform_macos::permissions::onboarding::ONBOARDING_HOST_ARG;
+
+        let status = std::path::Path::new("/tmp/cua-driver-onboarding-test.json");
+        let liveness = std::path::Path::new("/tmp/cua-driver-onboarding-live-test.lock");
+        let host_pid = std::path::Path::new("/tmp/cua-driver-onboarding-host-test.pid");
+        let diagnostic = std::path::Path::new("/tmp/cua-driver-onboarding-log-test.log");
+        let argv = onboarding_launch_arguments(
+            "/private/plugin/MuseCodeCuaDriverLocal.app",
+            status,
+            liveness,
+            host_pid,
+            diagnostic,
+            "11111111-1111-4111-8111-111111111111",
+            2,
+            std::time::Duration::from_millis(123_456),
+        );
+        let expected = [
+            "-n",
+            "-W",
+            "--stderr",
+            "/tmp/cua-driver-onboarding-log-test.log",
+            "/private/plugin/MuseCodeCuaDriverLocal.app",
+            "--args",
+            ONBOARDING_HOST_ARG,
+            "--status-file",
+            "/tmp/cua-driver-onboarding-test.json",
+            "--liveness-file",
+            "/tmp/cua-driver-onboarding-live-test.lock",
+            "--host-pid-file",
+            "/tmp/cua-driver-onboarding-host-test.pid",
+            "--session-nonce",
+            "11111111-1111-4111-8111-111111111111",
+            "--host-generation",
+            "2",
+            "--deadline-after-ms",
+            "123456",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+        assert_eq!(argv, expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn screen_recording_request_requires_a_live_accessibility_grant() {
+        use platform_macos::permissions::onboarding::OnboardingStage;
+
+        let permissions =
+            |accessibility, screen_recording| platform_macos::permissions::PermissionsStatus {
+                accessibility,
+                screen_recording,
+            };
+
+        assert!(permission_stage_is_requestable(
+            OnboardingStage::Accessibility,
+            permissions(false, false),
+        ));
+        assert!(!permission_stage_is_requestable(
+            OnboardingStage::Accessibility,
+            permissions(true, false),
+        ));
+        assert!(!permission_stage_is_requestable(
+            OnboardingStage::ScreenRecording,
+            permissions(false, false),
+        ));
+        assert!(permission_stage_is_requestable(
+            OnboardingStage::ScreenRecording,
+            permissions(true, false),
+        ));
+        assert!(!permission_stage_is_requestable(
+            OnboardingStage::ScreenRecording,
+            permissions(true, true),
+        ));
+        assert!(!permission_stage_is_requestable(
+            OnboardingStage::ScreenRecordingRegistration,
+            permissions(true, false),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accessibility_completion_always_restarts_before_screen_recording() {
+        use platform_macos::permissions::onboarding::OnboardingStage;
+
+        let status = platform_macos::permissions::PermissionsStatus {
+            accessibility: true,
+            screen_recording: false,
+        };
+        assert!(should_restart_before_screen_recording(
+            OnboardingStage::Accessibility,
+            status,
+        ));
+        assert!(!should_restart_before_screen_recording(
+            OnboardingStage::ScreenRecording,
+            status,
+        ));
+        assert!(!should_restart_before_screen_recording(
+            OnboardingStage::Accessibility,
+            platform_macos::permissions::PermissionsStatus {
+                accessibility: true,
+                screen_recording: true,
+            },
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restart_resume_waits_only_for_a_previously_observed_grant() {
+        use platform_macos::permissions::onboarding::{OnboardingStage, OnboardingStatus};
+
+        let access_only = platform_macos::permissions::PermissionsStatus {
+            accessibility: true,
+            screen_recording: false,
+        };
+        let after_access =
+            OnboardingStatus::pending(OnboardingStage::DriverRestarting, access_only);
+        assert_eq!(
+            resumed_permission_propagation_target(&after_access, access_only),
+            None,
+            "the next missing permission is not grant propagation",
+        );
+        assert_eq!(
+            resumed_permission_propagation_target(
+                &after_access,
+                platform_macos::permissions::PermissionsStatus {
+                    accessibility: false,
+                    screen_recording: false,
+                },
+            ),
+            Some(OnboardingStage::Accessibility),
+        );
+
+        let both = platform_macos::permissions::PermissionsStatus {
+            accessibility: true,
+            screen_recording: true,
+        };
+        let after_screen = OnboardingStatus::pending(OnboardingStage::DriverRestarting, both);
+        assert_eq!(
+            resumed_permission_propagation_target(&after_screen, access_only),
+            Some(OnboardingStage::ScreenRecording),
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_permission_boundaries_fit_the_existing_host_generation_budget() {
+        use platform_macos::permissions::onboarding::{
+            ONBOARDING_EXPECTED_HOST_GENERATIONS, ONBOARDING_MAX_HOST_GENERATIONS,
+        };
+        assert_eq!(ONBOARDING_EXPECTED_HOST_GENERATIONS, 3);
+        assert!(ONBOARDING_MAX_HOST_GENERATIONS > ONBOARDING_EXPECTED_HOST_GENERATIONS);
+        // Generation 1 requests Accessibility, generation 2 requests Screen
+        // Recording, and generation 3 performs post-grant capture verification;
+        // later generations are a bounded recovery reserve.
+        let pending = platform_macos::permissions::onboarding::OnboardingStatus::pending(
+            platform_macos::permissions::onboarding::OnboardingStage::DriverRestarting,
+            platform_macos::permissions::PermissionsStatus {
+                accessibility: true,
+                screen_recording: false,
+            },
+        );
+        assert!(should_relaunch_onboarding_host(Some(&pending), 1));
+        assert!(should_relaunch_onboarding_host(Some(&pending), 2));
+        assert!(should_relaunch_onboarding_host(
+            Some(&pending),
+            ONBOARDING_EXPECTED_HOST_GENERATIONS,
+        ));
+        assert!(!should_relaunch_onboarding_host(
+            Some(&pending),
+            ONBOARDING_MAX_HOST_GENERATIONS,
+        ));
+        assert!(!should_relaunch_onboarding_host(None, 1));
+        assert!(!should_retry_unpublished_onboarding_relaunch(
+            Some(&pending),
+            1,
+        ));
+        assert!(should_retry_unpublished_onboarding_relaunch(
+            Some(&pending),
+            2,
+        ));
+        assert!(!should_retry_unpublished_onboarding_relaunch(
+            Some(&pending),
+            ONBOARDING_MAX_HOST_GENERATIONS,
+        ));
+        assert!(!should_retry_unpublished_onboarding_relaunch(None, 2));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn onboarding_restart_exhaustion_is_retryable_and_preserves_latest_permission_state() {
+        use platform_macos::permissions::onboarding::{OnboardingStage, OnboardingStatus};
+
+        let fallback = platform_macos::permissions::PermissionsStatus {
+            accessibility: false,
+            screen_recording: false,
+        };
+        let latest = OnboardingStatus::pending(
+            OnboardingStage::ScreenRecording,
+            platform_macos::permissions::PermissionsStatus {
+                accessibility: true,
+                screen_recording: false,
+            },
+        );
+        let failure = onboarding_host_exited_status(Some(&latest), fallback);
+
+        assert_eq!(failure.stage, OnboardingStage::Failed);
+        assert!(failure.retryable);
+        assert!(failure.accessibility);
+        assert!(!failure.screen_recording);
+        assert_eq!(
+            failure.error.as_ref().map(|error| error.code.as_str()),
+            Some("onboarding_host_restart_limit_reached")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn onboarding_relaunches_only_nonterminal_hosts_within_the_generation_budget() {
+        use platform_macos::permissions::onboarding::{
+            OnboardingStage, OnboardingStatus, ONBOARDING_MAX_HOST_GENERATIONS,
+        };
+
+        let permissions = platform_macos::permissions::PermissionsStatus {
+            accessibility: true,
+            screen_recording: false,
+        };
+        let pending = OnboardingStatus::pending(OnboardingStage::ScreenRecording, permissions);
+        assert!(should_relaunch_onboarding_host(Some(&pending), 1));
+        assert!(should_relaunch_onboarding_host(
+            Some(&pending),
+            ONBOARDING_MAX_HOST_GENERATIONS - 1
+        ));
+        assert!(!should_relaunch_onboarding_host(
+            Some(&pending),
+            ONBOARDING_MAX_HOST_GENERATIONS
+        ));
+
+        let failed = OnboardingStatus::failed(permissions, None, true, "test_failure", "terminal");
+        assert!(!should_relaunch_onboarding_host(Some(&failed), 1));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_onboarding_generation_and_deadline_are_bounded() {
+        let valid = args(&[
+            platform_macos::permissions::onboarding::ONBOARDING_HOST_ARG,
+            "--host-generation",
+            "2",
+            "--deadline-after-ms",
+            "45000",
+        ]);
+        assert_eq!(private_onboarding_host_generation(&valid).unwrap(), 2);
+        assert_eq!(
+            private_onboarding_deadline_budget(&valid).unwrap(),
+            std::time::Duration::from_secs(45)
+        );
+
+        for invalid in ["0", "7", "not-a-number"] {
+            let argv = args(&["--host-generation", invalid]);
+            assert!(private_onboarding_host_generation(&argv).is_err());
+        }
+        for invalid in ["0", "600001", "not-a-number"] {
+            let argv = args(&["--deadline-after-ms", invalid]);
+            assert!(private_onboarding_deadline_budget(&argv).is_err());
+        }
+        let nonce = args(&[
+            platform_macos::permissions::onboarding::ONBOARDING_HOST_ARG,
+            "--session-nonce",
+            "11111111-1111-4111-8111-111111111111",
+        ]);
+        assert_eq!(
+            private_onboarding_session_nonce(&nonce).unwrap(),
+            "11111111-1111-4111-8111-111111111111"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plugin_managed_bare_reopen_guard_is_exact() {
+        assert!(plugin_managed_bare_launch_requested(&[], true));
+        assert!(!plugin_managed_bare_launch_requested(&[], false));
+        assert!(plugin_managed_bare_launch_requested(
+            &args(&["-psn_0_12345"]),
+            true
+        ));
+        assert!(!plugin_managed_bare_launch_requested(
+            &args(&["-psn_0_12345", "mcp"]),
+            true
+        ));
+        assert!(!plugin_managed_bare_launch_requested(&args(&["mcp"]), true));
+        assert!(!plugin_managed_bare_launch_requested(
+            &args(&[platform_macos::permissions::onboarding::ONBOARDING_HOST_ARG]),
+            true
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_liveness_lock_detects_launcher_exit() {
+        use platform_macos::permissions::onboarding::ONBOARDING_LIVENESS_FILE_PREFIX;
+
+        let path = std::env::temp_dir().join(format!(
+            "{}test-{}.lock",
+            ONBOARDING_LIVENESS_FILE_PREFIX,
+            uuid::Uuid::new_v4()
+        ));
+        let lease = OnboardingLivenessLease::create(path.clone()).unwrap();
+        let argv = vec![
+            platform_macos::permissions::onboarding::ONBOARDING_HOST_ARG.to_owned(),
+            "--liveness-file".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(private_onboarding_liveness_path(&argv).unwrap(), path);
+        assert!(onboarding_launcher_is_alive(&path).unwrap());
+        drop(lease);
+        assert!(!onboarding_launcher_is_alive(&path).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn onboarding_serialization_lock_allows_only_one_launcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("onboarding.lock");
+        let first = open_onboarding_serialization_lease_at(&path).unwrap();
+        let second = open_onboarding_serialization_lease_at(&path).unwrap();
+        assert!(try_lock_onboarding_serialization_lease(&first).unwrap());
+        assert!(!try_lock_onboarding_serialization_lease(&second).unwrap());
+        drop(first);
+        assert!(try_lock_onboarding_serialization_lease(&second).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn onboarding_host_termination_is_bound_to_lifetime_generation_and_nonce() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("host.pid");
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let expected = std::fs::canonicalize("/bin/sleep").unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let (start_seconds, start_microseconds) = process_start_stamp(pid).unwrap();
+        let arguments = vec!["30".to_owned()];
+        let identity = OnboardingHostIdentity {
+            schema_version: 1,
+            pid,
+            start_seconds,
+            start_microseconds,
+            generation: 2,
+            session_nonce: "11111111-1111-4111-8111-111111111111".to_owned(),
+            arguments: arguments.clone(),
+        };
+        std::fs::write(&pid_path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        std::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(onboarding_host_identity(
+            &pid_path,
+            &expected,
+            &arguments,
+            2,
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap()
+        .is_some());
+        assert!(onboarding_host_identity(
+            &pid_path,
+            &expected,
+            &arguments,
+            3,
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .is_err());
+        terminate_onboarding_host(
+            &pid_path,
+            &expected,
+            &arguments,
+            2,
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let _ = child.wait();
+        assert!(onboarding_host_identity(
+            &pid_path,
+            &expected,
+            &arguments,
+            2,
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn empty_host_identity_means_not_published_but_malformed_content_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("host.pid");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        assert!(onboarding_host_identity(
+            &path,
+            &executable,
+            &["30".to_owned()],
+            1,
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap()
+        .is_none());
+        std::fs::write(&path, b"not-json").unwrap();
+        assert!(onboarding_host_identity(
+            &path,
+            &executable,
+            &["30".to_owned()],
+            1,
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn orphan_or_reused_parent_is_not_alive() {
+        assert!(!process_lifetime_is_alive(1, (0, 0)).unwrap());
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let stamp = process_start_stamp(pid).unwrap();
+        assert!(process_lifetime_is_alive(pid, stamp).unwrap());
+        assert!(!process_lifetime_is_alive(pid, (stamp.0, stamp.1.saturating_add(1))).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_liveness_lock_emits_retryable_cancellation() {
+        use platform_macos::permissions::onboarding::{
+            OnboardingStage, OnboardingStatus, ONBOARDING_LIVENESS_FILE_PREFIX,
+            ONBOARDING_STATUS_FILE_PREFIX,
+        };
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let nonce = uuid::Uuid::new_v4();
+        let status_path = std::env::temp_dir().join(format!(
+            "{}test-{nonce}.json",
+            ONBOARDING_STATUS_FILE_PREFIX
+        ));
+        let liveness_path = std::env::temp_dir().join(format!(
+            "{}test-{nonce}.lock",
+            ONBOARDING_LIVENESS_FILE_PREFIX
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&status_path)
+            .unwrap();
+        drop(file);
+
+        let mut sink = OnboardingStatusSink::new(status_path.clone());
+        let result = stop_onboarding_if_launcher_gone(
+            &liveness_path,
+            &mut sink,
+            platform_macos::permissions::PermissionsStatus {
+                accessibility: true,
+                screen_recording: false,
+            },
+        );
+        assert_eq!(result, Some(130));
+        let status: OnboardingStatus =
+            serde_json::from_slice(&std::fs::read(&status_path).unwrap()).unwrap();
+        assert_eq!(status.stage, OnboardingStage::Failed);
+        assert_eq!(status.code, "computer_use_setup_failed");
+        assert!(status.retryable);
+        assert_eq!(status.error.unwrap().code, "setup_cancelled");
+        std::fs::remove_file(status_path).unwrap();
+    }
+
     #[test]
     fn serve_pid_file_value_flag_is_parsed_in_both_supported_forms() {
         assert_eq!(
@@ -5001,10 +7811,13 @@ mod tests {
     #[test]
     fn renamed_app_launch_uses_exact_path_as_one_argument() {
         let app = "/Users/developer/My Apps/cua.app";
-        assert_eq!(daemon_launch_target("CuaDriverLocal", app, true), app);
         assert_eq!(
-            daemon_launch_target("CuaDriverLocal", app, false),
-            "CuaDriverLocal"
+            daemon_launch_target("MuseCodeCuaDriverLocal", app, true),
+            app
+        );
+        assert_eq!(
+            daemon_launch_target("MuseCodeCuaDriverLocal", app, false),
+            "MuseCodeCuaDriverLocal"
         );
         let state = crate::history_runtime::DaemonLaunchState::default();
         let launch = daemon_launch_arguments(app, "/tmp/cua.sock", &state, false, true);
@@ -5054,20 +7867,42 @@ mod tests {
     fn expected_pid_keeps_stop_as_the_subcommand() {
         let argv = args(&["--expected-pid", "42", "stop"]);
         assert_eq!(positional_args(&argv), vec!["stop"]);
-        assert_eq!(parse_expected_stop_pid(&argv, Some("stop")), Some(42));
+        assert_eq!(parse_expected_daemon_pid(&argv, Some("stop")), Some(42));
 
         let with_socket = args(&["--socket", "/tmp/cua.sock", "--expected-pid", "42", "stop"]);
         assert_eq!(positional_args(&with_socket), vec!["stop"]);
         assert_eq!(
-            parse_expected_stop_pid(&with_socket, Some("stop")),
+            parse_expected_daemon_pid(&with_socket, Some("stop")),
+            Some(42)
+        );
+
+        let embedded_mcp = args(&[
+            "--embedded",
+            "mcp",
+            "--socket",
+            "/tmp/cua.sock",
+            "--expected-pid",
+            "42",
+        ]);
+        assert_eq!(positional_args(&embedded_mcp), vec!["mcp"]);
+        assert_eq!(
+            parse_expected_daemon_pid(&embedded_mcp, Some("mcp")),
             Some(42)
         );
     }
 
     #[test]
+    fn expected_mcp_pid_rejects_a_rebound_daemon_generation() {
+        assert!(verify_expected_daemon_pid(42, Some(42)).is_ok());
+        let error = verify_expected_daemon_pid(43, Some(42)).unwrap_err();
+        assert!(error.contains("expected 42, found 43"));
+        assert!(verify_expected_daemon_pid(43, None).is_ok());
+    }
+
+    #[test]
     fn expected_pid_is_absent_for_an_ordinary_stop() {
         let argv = args(&["stop"]);
-        assert_eq!(parse_expected_stop_pid(&argv, Some("stop")), None);
+        assert_eq!(parse_expected_daemon_pid(&argv, Some("stop")), None);
     }
 
     #[test]

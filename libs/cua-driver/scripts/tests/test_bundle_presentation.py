@@ -7,6 +7,7 @@ from pathlib import Path
 
 DRIVER_ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = DRIVER_ROOT / "rust/scripts/CuaDriverBundle"
+ENTITLEMENTS = DRIVER_ROOT / "rust/scripts/CuaDriver.entitlements"
 
 
 class BundlePresentationTest(unittest.TestCase):
@@ -16,9 +17,9 @@ class BundlePresentationTest(unittest.TestCase):
 
     def test_display_name_and_permission_copy(self):
         for key in ("CFBundleName", "CFBundleDisplayName"):
-            self.assertEqual(self.info[key], "cua")
+            self.assertEqual(self.info[key], "Computer Use")
         for key in ("NSScreenCaptureUsageDescription", "NSAppleEventsUsageDescription"):
-            self.assertTrue(self.info[key].startswith("cua "))
+            self.assertTrue(self.info[key].startswith("Computer Use "))
 
     def test_no_custom_icon_in_template(self):
         self.assertFalse(any(key.startswith("CFBundleIcon") for key in self.info))
@@ -28,9 +29,9 @@ class BundlePresentationTest(unittest.TestCase):
         }
         self.assertEqual(files, {"Contents/Info.plist", "Contents/MacOS/.gitkeep"})
 
-    def test_runtime_identity_and_capabilities_are_unchanged(self):
+    def test_runtime_identity_and_capabilities_match_muse_code(self):
         expected = {
-            "CFBundleIdentifier": "com.trycua.driver",
+            "CFBundleIdentifier": "com.meta.musecode.cua.driver",
             "CFBundleExecutable": "cua-driver",
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": "0.0.0-dev",
@@ -49,11 +50,24 @@ class BundlePresentationTest(unittest.TestCase):
         for key, value in {
             "CFBundleName": "cua",
             "CFBundleDisplayName": "cua",
-            "CFBundleIdentifier": "com.trycua.driver.local",
+            "CFBundleIdentifier": "com.meta.musecode.cua.driver.local",
             "CFBundleExecutable": "cua-driver-local",
         }.items():
             self.assertIn(f'plutil -replace {key} -string "{value}"', source)
-        self.assertIn('APP_DEST="/Applications/CuaDriverLocal.app"', source)
+        self.assertIn('APP_DEST="/Applications/MuseCodeCuaDriverLocal.app"', source)
+
+    def test_production_history_entitlements_match_muse_code_identity(self):
+        with ENTITLEMENTS.open("rb") as reader:
+            entitlements = plistlib.load(reader)
+        application_identifier = "4W5TH4RKQ2.com.meta.musecode.cua.driver"
+        self.assertEqual(
+            entitlements["com.apple.application-identifier"],
+            application_identifier,
+        )
+        self.assertEqual(
+            entitlements["keychain-access-groups"],
+            [application_identifier],
+        )
 
 
 if __name__ == "__main__":

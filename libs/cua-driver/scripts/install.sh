@@ -21,7 +21,8 @@
 #   CUA_DRIVER_RS_INSTALL_DIR=PATH same as --bin-dir
 #   CUA_DRIVER_BIN_DIR=PATH        legacy alias for --bin-dir
 #   CUA_DRIVER_NO_MODIFY_PATH=1    same as --no-modify-path
-#   CUA_DRIVER_RS_HOME=PATH        package and release-channel state home
+#   CUA_DRIVER_RS_HOME=PATH        absolute, non-symlink package and
+#                                  release-channel state home below HOME
 #
 # Uninstall:
 #   /bin/bash -c "$(curl -fsSL https://cua.ai/driver/uninstall.sh)"

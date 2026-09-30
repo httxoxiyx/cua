@@ -1,9 +1,11 @@
 //! macOS TCC permission checks + first-launch CLI gate.
 //!
-//! Two layers:
-//! - [`status`] — low-level booleans for Accessibility / Screen Recording.
-//! - [`gate`]   — startup-time interactive flow that walks the user through
+//! Three layers:
+//! - [`status`] -- low-level booleans for Accessibility / Screen Recording.
+//! - [`gate`]   -- startup-time interactive flow that walks the user through
 //!   granting the missing permissions before `serve` binds.
+//! - [`onboarding`] -- private bootstrap state and live-capture verification
+//!   for the app-owned, sequential first-use flow.
 //!
 //! The gate is a Rust port of Swift's `PermissionsGate` (SwiftUI panel).
 //! Two presentation surfaces:
@@ -17,6 +19,7 @@
 //! - `PermissionsGate.swift`  → `permissions::gate` + `permissions::panel`
 
 pub mod gate;
+pub mod onboarding;
 pub mod status;
 
 #[cfg(target_os = "macos")]

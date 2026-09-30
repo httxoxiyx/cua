@@ -57,13 +57,44 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
 
 use crate::permissions::gate::MissingPermission;
-use crate::permissions::status::PermissionsStatus;
+use crate::permissions::status::{
+    request_accessibility, request_screen_recording, PermissionsStatus,
+};
+
+const PERMISSION_HOST_MAIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+const PERMISSION_HOST_STOP_GRACE: Duration = Duration::from_secs(2);
+const PERMISSION_HOST_ACTIVATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const NS_APPLICATION_ACTIVATION_POLICY_REGULAR: i64 = 0;
+const NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY: i64 = 1;
+const SCREEN_RECORDING_WINDOW_WIDTH: f64 = 420.0;
+const SCREEN_RECORDING_WINDOW_HEIGHT: f64 = 112.0;
+
+thread_local! {
+    // Created, inspected, and destroyed only by the AppKit main thread. Keeping
+    // the owned window here makes its lifetime span both foreground activation
+    // and the subsequent synchronous TCC request.
+    static SCREEN_RECORDING_PERMISSION_WINDOW: RefCell<Option<usize>> = const { RefCell::new(None) };
+}
+
+#[link(name = "dispatch", kind = "dylib")]
+extern "C" {
+    static _dispatch_main_q: u8;
+    fn dispatch_async_f(
+        queue: *const c_void,
+        context: *mut c_void,
+        work: unsafe extern "C" fn(*mut c_void),
+    );
+}
 
 // ── Public API ──────────────────────────────────────────────────────────
 
@@ -186,6 +217,593 @@ pub fn pump_run_loop_briefly(seconds: f64) {
         let default_mode = ns_string("NSDefaultRunLoopMode");
         let _: bool = msg_send![run_loop, runMode: default_mode beforeDate: date];
     }
+}
+
+/// Establish the LaunchServices-hosted process as an AppKit application
+/// before it asks ScreenCaptureKit/CoreGraphics for capture consent.
+///
+/// A Rust executable launched from an app bundle does not call
+/// `NSApplicationMain`, so LaunchServices registration alone is not enough to
+/// create `NSApplication.shared`. Recent macOS releases can otherwise accept
+/// the API call without adding the bundle to the Screen Recording privacy
+/// pane. The onboarding entrypoint calls this on its main thread and keeps the
+/// run loop pumping while the asynchronous ScreenCaptureKit request runs.
+pub fn prepare_permission_request_host() -> Result<(), String> {
+    if MainThreadMarker::new().is_none() {
+        return Err("permission request host is not running on the main thread".to_owned());
+    }
+    if !crate::session::has_graphic_access() {
+        return Err("permission request host has no access to the graphical session".to_owned());
+    }
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return Err("NSApplication.sharedApplication returned null".to_owned());
+        }
+        // NSApplicationActivationPolicyAccessory = 1. The app stays out of
+        // the Dock while still participating in a real AppKit lifecycle.
+        let _: bool =
+            msg_send![app, setActivationPolicy: NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY];
+        let _: () = msg_send![app, finishLaunching];
+        let process_info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+        if !process_info.is_null() {
+            let reason = ns_string("Computer Use permission onboarding is active");
+            let _: () = msg_send![process_info, disableAutomaticTermination: reason];
+        }
+        // The private onboarding app is launched specifically to present a
+        // system-owned permission request. `open -g` and an accessory policy
+        // can otherwise leave it registered with LaunchServices but inactive,
+        // which recent macOS releases do not reliably accept as the requesting
+        // application for ScreenCaptureKit/TCC registration.
+        let _: () = msg_send![app, activateIgnoringOtherApps: true];
+    }
+    pump_run_loop_briefly(0.25);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PermissionHostMainAction {
+    Activate,
+    ActivateForScreenRecording,
+    Request(MissingPermission),
+}
+
+struct PermissionHostMainJob {
+    action: PermissionHostMainAction,
+    started: mpsc::SyncSender<()>,
+    reply: mpsc::SyncSender<Result<bool, String>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct DispatchedPermissionHostMainAction {
+    started: mpsc::Receiver<()>,
+    result: mpsc::Receiver<Result<bool, String>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+fn dispatch_permission_host_main_action(
+    action: PermissionHostMainAction,
+) -> DispatchedPermissionHostMainAction {
+    let (started_tx, started) = mpsc::sync_channel(1);
+    let (reply, result) = mpsc::sync_channel(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let job = Box::new(PermissionHostMainJob {
+        action,
+        started: started_tx,
+        reply,
+        cancelled: Arc::clone(&cancelled),
+    });
+    unsafe {
+        dispatch_async_f(
+            &raw const _dispatch_main_q as *const c_void,
+            Box::into_raw(job).cast(),
+            permission_host_main_action_callback,
+        );
+    }
+    DispatchedPermissionHostMainAction {
+        started,
+        result,
+        cancelled,
+    }
+}
+
+fn perform_permission_host_main_action(action: PermissionHostMainAction) -> Result<bool, String> {
+    perform_permission_host_main_action_with_timeout(action, PERMISSION_HOST_MAIN_QUEUE_TIMEOUT)
+}
+
+fn perform_permission_host_main_action_with_timeout(
+    action: PermissionHostMainAction,
+    timeout: Duration,
+) -> Result<bool, String> {
+    if MainThreadMarker::new().is_some() {
+        return unsafe { perform_permission_host_main_action_unsafe(action) };
+    }
+
+    let dispatched = dispatch_permission_host_main_action(action);
+    match wait_for_dispatched_permission_host_main_action(dispatched, timeout, || false)? {
+        PermissionHostWaitOutcome::Completed(value) => Ok(value),
+        PermissionHostWaitOutcome::Cancelled => {
+            Err("permission request AppKit main action was cancelled".to_owned())
+        }
+        PermissionHostWaitOutcome::TimedOut => Err(
+            "permission request AppKit main action did not finish before its deadline".to_owned(),
+        ),
+    }
+}
+
+unsafe fn perform_permission_host_main_action_unsafe(
+    action: PermissionHostMainAction,
+) -> Result<bool, String> {
+    let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+    if app.is_null() {
+        return Err("NSApplication.sharedApplication returned null".to_owned());
+    }
+    match action {
+        PermissionHostMainAction::Activate => {
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
+            Ok(true)
+        }
+        PermissionHostMainAction::ActivateForScreenRecording => {
+            activate_screen_recording_request_host_unsafe(app)
+        }
+        PermissionHostMainAction::Request(MissingPermission::Accessibility) => {
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
+            Ok(request_accessibility())
+        }
+        PermissionHostMainAction::Request(MissingPermission::ScreenRecording) => {
+            // Repeat the policy/foreground transition in the same main-queue
+            // callback as CGRequestScreenCaptureAccess. This closes the gap in
+            // which System Settings can retake focus after the earlier
+            // registration stage was published.
+            if !activate_screen_recording_request_host_unsafe(app)? {
+                return Err(
+                    "permission request host did not become active before Screen Recording request"
+                        .to_owned(),
+                );
+            }
+            eprintln!(
+                "permission onboarding host: invoking CGRequestScreenCaptureAccess as a foreground NSApplicationActivationPolicyRegular app"
+            );
+            Ok(request_screen_recording())
+        }
+    }
+}
+
+unsafe fn activate_screen_recording_request_host_unsafe(
+    app: *mut AnyObject,
+) -> Result<bool, String> {
+    let requested_policy = permission_request_activation_policy(MissingPermission::ScreenRecording);
+    let _: bool = msg_send![app, setActivationPolicy: requested_policy];
+    let policy: i64 = msg_send![app, activationPolicy];
+    if policy != requested_policy {
+        return Err(format!(
+            "permission request host retained activation policy {policy} instead of NSApplicationActivationPolicyRegular"
+        ));
+    }
+
+    let window = ensure_screen_recording_permission_window_unsafe()?;
+
+    // Activate through both NSRunningApplication and NSApplication. The
+    // former asks LaunchServices to foreground this exact bundle identity;
+    // the latter raises its AppKit application after the policy transition.
+    let running: *mut AnyObject = msg_send![class!(NSRunningApplication), currentApplication];
+    if !running.is_null() {
+        // NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps.
+        let _: bool = msg_send![running, activateWithOptions: 3usize];
+    }
+    let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+    let _: () = msg_send![window, orderFrontRegardless];
+    let _: () = msg_send![app, activateIgnoringOtherApps: true];
+    let active: bool = msg_send![app, isActive];
+    let visible: bool = msg_send![window, isVisible];
+    let key: bool = msg_send![window, isKeyWindow];
+    eprintln!(
+        "permission onboarding host: activation policy=regular active={active} window_visible={visible} window_key={key}"
+    );
+    Ok(screen_recording_permission_surface_ready(
+        active, visible, key,
+    ))
+}
+
+fn screen_recording_permission_surface_ready(active: bool, visible: bool, key: bool) -> bool {
+    active && visible && key
+}
+
+unsafe fn ensure_screen_recording_permission_window_unsafe() -> Result<*mut AnyObject, String> {
+    if let Some(address) = SCREEN_RECORDING_PERMISSION_WINDOW.with(|cell| *cell.borrow()) {
+        let window = address as *mut AnyObject;
+        if !window.is_null() {
+            return Ok(window);
+        }
+    }
+
+    let content_rect = NSRect {
+        origin: NSPoint { x: 0.0, y: 0.0 },
+        size: NSSize {
+            width: SCREEN_RECORDING_WINDOW_WIDTH,
+            height: SCREEN_RECORDING_WINDOW_HEIGHT,
+        },
+    };
+    // A titled, non-closable NSWindow is a real activation surface without
+    // duplicating the legacy modal permission panel.
+    let allocated: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+    if allocated.is_null() {
+        return Err("could not allocate Screen Recording onboarding window".to_owned());
+    }
+    let window: *mut AnyObject = msg_send![allocated,
+        initWithContentRect: content_rect
+        styleMask: 1_u64
+        backing: 2_u64
+        defer: false
+    ];
+    if window.is_null() {
+        return Err("could not initialize Screen Recording onboarding window".to_owned());
+    }
+    let _: () = msg_send![window, setReleasedWhenClosed: false];
+    let _: () = msg_send![window, setHidesOnDeactivate: false];
+    let _: () = msg_send![window, setTitle: ns_string("Computer Use Setup")];
+    let content_view: *mut AnyObject = msg_send![window, contentView];
+    if content_view.is_null() {
+        let _: () = msg_send![window, release];
+        return Err("Screen Recording onboarding window has no content view".to_owned());
+    }
+    let label = build_label(
+        "Allow Screen Recording for Computer Use in the macOS prompt.",
+        14.0,
+        false,
+        NSPoint { x: 20.0, y: 30.0 },
+        NSSize {
+            width: SCREEN_RECORDING_WINDOW_WIDTH - 40.0,
+            height: 52.0,
+        },
+    );
+    if label.is_null() {
+        let _: () = msg_send![window, release];
+        return Err("could not create Screen Recording onboarding label".to_owned());
+    }
+    let _: () = msg_send![content_view, addSubview: label];
+    let _: () = msg_send![label, release];
+    let _: () = msg_send![window, center];
+    SCREEN_RECORDING_PERMISSION_WINDOW.with(|cell| {
+        *cell.borrow_mut() = Some(window as usize);
+    });
+    eprintln!("permission onboarding host: created temporary Screen Recording window");
+    Ok(window)
+}
+
+unsafe fn close_screen_recording_permission_window_unsafe() {
+    SCREEN_RECORDING_PERMISSION_WINDOW.with(|cell| {
+        let Some(address) = cell.borrow_mut().take() else {
+            return;
+        };
+        let window = address as *mut AnyObject;
+        if window.is_null() {
+            return;
+        }
+        let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![window, close];
+        let _: () = msg_send![window, release];
+        eprintln!("permission onboarding host: closed temporary Screen Recording window");
+    });
+}
+
+fn permission_request_activation_policy(permission: MissingPermission) -> i64 {
+    match permission {
+        MissingPermission::Accessibility => NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY,
+        MissingPermission::ScreenRecording => NS_APPLICATION_ACTIVATION_POLICY_REGULAR,
+    }
+}
+
+unsafe extern "C" fn permission_host_main_action_callback(context: *mut c_void) {
+    // `dispatch_async_f` owns this exact allocation until the callback runs.
+    let job = unsafe { Box::from_raw(context.cast::<PermissionHostMainJob>()) };
+    let _ = job.started.send(());
+    let result = if job.cancelled.load(Ordering::Acquire) {
+        Err("permission request AppKit main action was cancelled before dispatch".to_owned())
+    } else {
+        panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+            perform_permission_host_main_action_unsafe(job.action)
+        }))
+        .unwrap_or_else(|_| Err("permission request AppKit main action panicked".to_owned()))
+    };
+    let _ = job.reply.send(result);
+}
+
+/// Bring the private permission host forward immediately before a system-owned
+/// consent request. System Settings can become active between onboarding
+/// stages, so launch-time activation alone is not sufficient.
+pub fn activate_permission_request_host() -> Result<(), String> {
+    perform_permission_host_main_action(PermissionHostMainAction::Activate).map(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionHostWaitOutcome {
+    Completed(bool),
+    Cancelled,
+    TimedOut,
+}
+
+/// Repeatedly request foreground activation while allowing AppKit to process
+/// the asynchronous activation transition between attempts. A false
+/// `isActive` result is never treated as sufficient for Screen Recording.
+pub fn wait_for_screen_recording_request_host(
+    timeout: Duration,
+    cancelled: impl FnMut() -> bool,
+) -> Result<PermissionHostWaitOutcome, String> {
+    wait_for_screen_recording_request_host_with(timeout, cancelled, |remaining| {
+        perform_permission_host_main_action_with_timeout(
+            PermissionHostMainAction::ActivateForScreenRecording,
+            remaining,
+        )
+    })
+}
+
+fn wait_for_screen_recording_request_host_with(
+    timeout: Duration,
+    mut cancelled: impl FnMut() -> bool,
+    mut activate: impl FnMut(Duration) -> Result<bool, String>,
+) -> Result<PermissionHostWaitOutcome, String> {
+    let started = std::time::Instant::now();
+    loop {
+        if cancelled() {
+            return Ok(PermissionHostWaitOutcome::Cancelled);
+        }
+        if started.elapsed() >= timeout {
+            return Ok(PermissionHostWaitOutcome::TimedOut);
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if activate(remaining)? {
+            return Ok(PermissionHostWaitOutcome::Completed(true));
+        }
+        std::thread::sleep(
+            PERMISSION_HOST_ACTIVATION_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())),
+        );
+    }
+}
+
+/// Execute a potentially user-blocking TCC request on the actual AppKit main
+/// thread. Queue dispatch retains its short bound, while the request itself may
+/// use the caller's complete onboarding budget and remains cancellable.
+pub fn request_permission_from_appkit_host(
+    permission: MissingPermission,
+    timeout: Duration,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<PermissionHostWaitOutcome, String> {
+    if MainThreadMarker::new().is_some() {
+        if cancelled() {
+            return Ok(PermissionHostWaitOutcome::Cancelled);
+        }
+        return unsafe {
+            perform_permission_host_main_action_unsafe(PermissionHostMainAction::Request(
+                permission,
+            ))
+        }
+        .map(PermissionHostWaitOutcome::Completed);
+    }
+
+    let dispatched =
+        dispatch_permission_host_main_action(PermissionHostMainAction::Request(permission));
+    wait_for_dispatched_permission_host_main_action(dispatched, timeout, cancelled)
+}
+
+fn wait_for_dispatched_permission_host_main_action(
+    dispatched: DispatchedPermissionHostMainAction,
+    timeout: Duration,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<PermissionHostWaitOutcome, String> {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let queue_deadline = (started + PERMISSION_HOST_MAIN_QUEUE_TIMEOUT).min(deadline);
+    loop {
+        if cancelled() {
+            dispatched.cancelled.store(true, Ordering::Release);
+            return Ok(PermissionHostWaitOutcome::Cancelled);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            dispatched.cancelled.store(true, Ordering::Release);
+            return Ok(PermissionHostWaitOutcome::TimedOut);
+        }
+        if now >= queue_deadline {
+            dispatched.cancelled.store(true, Ordering::Release);
+            return Err("permission request AppKit main queue did not start the action".to_owned());
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let queue_remaining = queue_deadline.saturating_duration_since(now);
+        match dispatched.started.recv_timeout(
+            remaining
+                .min(queue_remaining)
+                .min(PERMISSION_HOST_ACTIVATION_POLL_INTERVAL),
+        ) {
+            Ok(()) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                dispatched.cancelled.store(true, Ordering::Release);
+                return Err("permission request AppKit main action disconnected".to_owned());
+            }
+        }
+    }
+
+    loop {
+        if cancelled() {
+            dispatched.cancelled.store(true, Ordering::Release);
+            return Ok(PermissionHostWaitOutcome::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            dispatched.cancelled.store(true, Ordering::Release);
+            return Ok(PermissionHostWaitOutcome::TimedOut);
+        }
+        match dispatched
+            .result
+            .recv_timeout(remaining.min(PERMISSION_HOST_ACTIVATION_POLL_INTERVAL))
+        {
+            Ok(result) => return result.map(PermissionHostWaitOutcome::Completed),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                dispatched.cancelled.store(true, Ordering::Release);
+                return Err("permission request AppKit main action disconnected".to_owned());
+            }
+        }
+    }
+}
+
+struct PermissionHostStart {
+    reply: mpsc::SyncSender<Result<(), String>>,
+}
+
+unsafe extern "C" fn permission_host_start_callback(context: *mut c_void) {
+    // The callback running proves `NSApplication.run()` is actively servicing
+    // the main queue before the worker can enter any TCC or ScreenCaptureKit
+    // operation.
+    let start = unsafe { Box::from_raw(context.cast::<PermissionHostStart>()) };
+    let activated = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        perform_permission_host_main_action_unsafe(PermissionHostMainAction::Activate)
+    }))
+    .unwrap_or_else(|_| Err("permission request AppKit activation panicked".to_owned()))
+    .map(|_| ());
+    let _ = start.reply.send(activated);
+}
+
+struct PermissionHostStop {
+    app_address: usize,
+}
+
+unsafe extern "C" fn permission_host_stop_callback(context: *mut c_void) {
+    let stop = unsafe { Box::from_raw(context.cast::<PermissionHostStop>()) };
+    unsafe {
+        close_screen_recording_permission_window_unsafe();
+        let app = stop.app_address as *mut AnyObject;
+        if !app.is_null() {
+            let _: () = msg_send![app, stop: std::ptr::null_mut::<AnyObject>()];
+            // `stop:` takes effect after the current event. Post one private
+            // application-defined event so a run loop waiting for its next
+            // event observes the stop immediately instead of relying on the
+            // emergency process-exit watchdog.
+            let wake: *mut AnyObject = msg_send![class!(NSEvent),
+                otherEventWithType: 15_u64
+                location: NSPoint { x: 0.0, y: 0.0 }
+                modifierFlags: 0_u64
+                timestamp: 0.0_f64
+                windowNumber: 0_i64
+                context: std::ptr::null_mut::<AnyObject>()
+                subtype: 0_i16
+                data1: 0_i64
+                data2: 0_i64
+            ];
+            if !wake.is_null() {
+                let _: () = msg_send![app, postEvent: wake atStart: true];
+            }
+        }
+    }
+}
+
+fn stop_permission_host_on_main(app_address: usize) {
+    let stop = Box::new(PermissionHostStop { app_address });
+    unsafe {
+        // Dispatching to the main queue closes the retained window before
+        // stopping NSApplication. The callback itself wakes the event loop.
+        dispatch_async_f(
+            &raw const _dispatch_main_q as *const c_void,
+            Box::into_raw(stop).cast(),
+            permission_host_stop_callback,
+        );
+    }
+}
+
+fn permission_host_work_result(work: impl FnOnce() -> i32) -> Result<i32, String> {
+    panic::catch_unwind(AssertUnwindSafe(work))
+        .map_err(|_| "permission onboarding worker panicked".to_owned())
+}
+
+fn permission_host_emergency_exit_code(result: &Result<i32, String>) -> i32 {
+    result.as_ref().copied().unwrap_or(70)
+}
+
+fn arm_permission_host_stop_watchdog(run_loop_exited: Arc<AtomicBool>, exit_code: i32) {
+    let _ = std::thread::Builder::new()
+        .name("cua-permission-host-stop-watchdog".to_owned())
+        .spawn(move || {
+            std::thread::sleep(PERMISSION_HOST_STOP_GRACE);
+            if !run_loop_exited.load(Ordering::Acquire) {
+                eprintln!(
+                    "permission onboarding host: AppKit run loop did not stop within {} seconds; forcing host exit",
+                    PERMISSION_HOST_STOP_GRACE.as_secs_f64()
+                );
+                // This process is a finite, private LaunchServices host. The
+                // worker has already published its status and delivered its
+                // result, so a stuck AppKit/TCC call must not outlive the
+                // supervising launcher or block the next host generation.
+                unsafe { libc::_exit(exit_code) }
+            }
+        });
+}
+
+/// Run a finite permission-onboarding state machine behind a genuine AppKit
+/// application lifecycle.
+///
+/// The caller must be the process main thread. The state machine runs on one
+/// worker only after a main-queue callback proves `NSApplication.run()` is
+/// live. Permission requests dispatch synchronously back to that main loop.
+/// Completion schedules `stop:` on the same loop and returns the worker's
+/// exact exit code to the supervising LaunchServices launcher.
+pub fn run_permission_request_host(
+    work: impl FnOnce() -> i32 + Send + 'static,
+) -> Result<i32, String> {
+    if MainThreadMarker::new().is_none() {
+        return Err("permission request host is not running on the main thread".to_owned());
+    }
+    prepare_permission_request_host()?;
+
+    let app: *mut AnyObject = unsafe { msg_send![class!(NSApplication), sharedApplication] };
+    if app.is_null() {
+        return Err("NSApplication.sharedApplication returned null".to_owned());
+    }
+    let app_address = app as usize;
+    let (start_reply, start_result) = mpsc::sync_channel(1);
+    let (work_reply, work_result) = mpsc::sync_channel(1);
+    let run_loop_exited = Arc::new(AtomicBool::new(false));
+    let worker_run_loop_exited = Arc::clone(&run_loop_exited);
+    let worker = std::thread::Builder::new()
+        .name("cua-permission-onboarding".to_owned())
+        .spawn(move || {
+            let result = match start_result.recv_timeout(PERMISSION_HOST_MAIN_QUEUE_TIMEOUT) {
+                Ok(Ok(())) => permission_host_work_result(work),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err("permission request AppKit lifecycle did not start".to_owned()),
+            };
+            let emergency_exit_code = permission_host_emergency_exit_code(&result);
+            let _ = work_reply.send(result);
+            stop_permission_host_on_main(app_address);
+            arm_permission_host_stop_watchdog(worker_run_loop_exited, emergency_exit_code);
+        })
+        .map_err(|error| format!("could not start permission onboarding worker: {error}"))?;
+
+    let start = Box::new(PermissionHostStart { reply: start_reply });
+    unsafe {
+        dispatch_async_f(
+            &raw const _dispatch_main_q as *const c_void,
+            Box::into_raw(start).cast(),
+            permission_host_start_callback,
+        );
+        let _: () = msg_send![app, run];
+        run_loop_exited.store(true, Ordering::Release);
+        let process_info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+        if !process_info.is_null() {
+            let reason = ns_string("Computer Use permission onboarding is active");
+            let _: () = msg_send![process_info, enableAutomaticTermination: reason];
+        }
+    }
+
+    let result = work_result
+        .recv()
+        .map_err(|_| "permission onboarding worker exited without a result".to_owned())?;
+    worker
+        .join()
+        .map_err(|_| "permission onboarding worker could not be joined".to_owned())?;
+    result
 }
 
 // ── Implementation ──────────────────────────────────────────────────────
@@ -881,6 +1499,151 @@ mod tests {
         let _guard = env_lock();
         std::env::remove_var("CUA_DRIVER_RS_PERMISSIONS_PANEL");
         assert!(!env_on("CUA_DRIVER_RS_PERMISSIONS_PANEL"));
+    }
+
+    #[test]
+    fn permission_host_worker_preserves_the_supervised_exit_code() {
+        assert_eq!(
+            permission_host_work_result(|| {
+                crate::permissions::onboarding::ONBOARDING_RESTART_REQUIRED_EXIT_CODE
+            }),
+            Ok(crate::permissions::onboarding::ONBOARDING_RESTART_REQUIRED_EXIT_CODE),
+        );
+    }
+
+    #[test]
+    fn permission_host_emergency_exit_preserves_results_and_maps_internal_failures() {
+        assert_eq!(permission_host_emergency_exit_code(&Ok(0)), 0);
+        assert_eq!(
+            permission_host_emergency_exit_code(&Ok(
+                crate::permissions::onboarding::ONBOARDING_RESTART_REQUIRED_EXIT_CODE,
+            )),
+            crate::permissions::onboarding::ONBOARDING_RESTART_REQUIRED_EXIT_CODE,
+        );
+        assert_eq!(
+            permission_host_emergency_exit_code(&Err("worker failed".to_owned())),
+            70,
+        );
+    }
+
+    #[test]
+    fn screen_recording_request_uses_regular_activation_policy() {
+        assert_eq!(
+            permission_request_activation_policy(MissingPermission::ScreenRecording),
+            NS_APPLICATION_ACTIVATION_POLICY_REGULAR,
+        );
+        assert_eq!(
+            permission_request_activation_policy(MissingPermission::Accessibility),
+            NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY,
+        );
+    }
+
+    #[test]
+    fn screen_recording_activation_wait_requires_observed_active_state() {
+        let mut attempts = 0;
+        let outcome = wait_for_screen_recording_request_host_with(
+            Duration::from_secs(1),
+            || false,
+            |_| {
+                attempts += 1;
+                Ok(attempts == 3)
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, PermissionHostWaitOutcome::Completed(true));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn screen_recording_surface_requires_visible_key_window_and_active_app() {
+        for (active, visible, key) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            assert!(!screen_recording_permission_surface_ready(
+                active, visible, key
+            ));
+        }
+        assert!(screen_recording_permission_surface_ready(true, true, true));
+    }
+
+    #[test]
+    fn dispatched_permission_request_has_separate_start_and_completion_waits() {
+        let (started_tx, started) = mpsc::sync_channel(1);
+        let (reply, result) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let dispatched = DispatchedPermissionHostMainAction {
+            started,
+            result,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let sender = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+            reply.send(Ok(true)).unwrap();
+        });
+        let outcome = wait_for_dispatched_permission_host_main_action(
+            dispatched,
+            Duration::from_secs(1),
+            || false,
+        )
+        .unwrap();
+        sender.join().unwrap();
+        assert_eq!(outcome, PermissionHostWaitOutcome::Completed(true));
+        assert!(!cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancelling_queued_permission_request_marks_callback_cancelled() {
+        let (_started_tx, started) = mpsc::sync_channel(1);
+        let (_reply, result) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let dispatched = DispatchedPermissionHostMainAction {
+            started,
+            result,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let outcome = wait_for_dispatched_permission_host_main_action(
+            dispatched,
+            Duration::from_secs(1),
+            || true,
+        )
+        .unwrap();
+        assert_eq!(outcome, PermissionHostWaitOutcome::Cancelled);
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_after_dispatch_returns_immediately_for_watchdog_cleanup() {
+        let (started_tx, started) = mpsc::sync_channel(1);
+        let (reply, result) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let dispatched = DispatchedPermissionHostMainAction {
+            started,
+            result,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let sender = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            let _ = reply.send(Ok(true));
+        });
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let started_wait = Instant::now();
+        let outcome = wait_for_dispatched_permission_host_main_action(
+            dispatched,
+            Duration::from_secs(1),
+            || checks.fetch_add(1, Ordering::AcqRel) > 0,
+        )
+        .unwrap();
+        let wait_elapsed = started_wait.elapsed();
+        sender.join().unwrap();
+        assert_eq!(outcome, PermissionHostWaitOutcome::Cancelled);
+        assert!(wait_elapsed < Duration::from_millis(200));
+        assert!(cancelled.load(Ordering::Acquire));
     }
 
     #[test]

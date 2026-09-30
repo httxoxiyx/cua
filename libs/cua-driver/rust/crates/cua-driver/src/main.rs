@@ -590,6 +590,12 @@ mod mcp_runtime_selection_tests {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if let Some(code) = cli::run_build_attestation_if_requested() {
+        std::process::exit(code);
+    }
+    if let Some(code) = cli::run_permissions_onboarding_contract_if_requested() {
+        std::process::exit(code);
+    }
     if let Some(code) = platform_macos::permissions::gate::run_permission_probe_if_requested() {
         std::process::exit(code);
     }
@@ -598,7 +604,13 @@ fn main() {
     if let Some(code) = history_runtime::run_offline_purge_if_requested() {
         std::process::exit(code);
     }
+    if let Some(code) = cli::run_plugin_managed_bare_launch_guard_if_requested() {
+        std::process::exit(code);
+    }
     init_logging();
+    if let Some(code) = cli::run_permissions_onboarding_if_requested() {
+        std::process::exit(code);
+    }
     if let Some(code) = cli::run_permissions_host_request_if_requested() {
         std::process::exit(code);
     }
@@ -766,7 +778,7 @@ fn main() {
             // Bind the Unix socket FIRST, on a background thread, BEFORE
             // running the (blocking) permissions gate (#1761).
             //
-            // The gate's `wait_for_grants` blocks while `com.trycua.driver`
+            // The gate's `wait_for_grants` blocks while `com.meta.musecode.cua.driver`
             // is ungranted. Fresh helper processes poll TCC until the user
             // grants or the deadline elapses. If serve ran after the gate,
             // the daemon's socket wouldn't appear for minutes on first
@@ -983,6 +995,7 @@ fn main() {
             claude_code_compat,
             grants,
             experimental_pip,
+            expected_pid,
         } => {
             let startup_started = std::time::Instant::now();
             let feedback_override = cursor_overlay::CursorConfig::click_feedback_override(
@@ -991,38 +1004,45 @@ fn main() {
             // Long-running MCP proxy — kick off the background update check
             // before connecting to or launching the daemon.
             version_check::maybe_announce_update();
-            let result = match mcp_uses_direct_runtime(socket.as_deref(), direct) {
-                Ok(true) => {
-                    if let Err(error) =
-                        configure_startup_permission_mode(None, false, None, false, &grants)
-                    {
-                        Err(error)
-                    } else {
-                        telemetry::capture_mcp_startup_completed(
-                            "sdk_owned_runtime",
-                            "not_applicable",
-                            true,
-                            startup_started.elapsed(),
-                        );
-                        run_mcp_direct(claude_code_compat)
+            let result = if expected_pid.is_some() && (direct || socket.is_none()) {
+                Err(anyhow::anyhow!(
+                    "--expected-pid requires daemon-backed `mcp --socket <path>`"
+                ))
+            } else {
+                match mcp_uses_direct_runtime(socket.as_deref(), direct) {
+                    Ok(true) => {
+                        if let Err(error) =
+                            configure_startup_permission_mode(None, false, None, false, &grants)
+                        {
+                            Err(error)
+                        } else {
+                            telemetry::capture_mcp_startup_completed(
+                                "sdk_owned_runtime",
+                                "not_applicable",
+                                true,
+                                startup_started.elapsed(),
+                            );
+                            run_mcp_direct(claude_code_compat)
+                        }
                     }
+                    Err(error) => Err(error),
+                    Ok(false) => cli::run_mcp_via_daemon_proxy(
+                        socket,
+                        expected_pid,
+                        claude_code_compat,
+                        &grants,
+                        experimental_pip,
+                        feedback_override,
+                        |daemon, success| {
+                            telemetry::capture_mcp_startup_completed(
+                                "daemon_proxy",
+                                daemon.telemetry_value(),
+                                success,
+                                startup_started.elapsed(),
+                            )
+                        },
+                    ),
                 }
-                Err(error) => Err(error),
-                Ok(false) => cli::run_mcp_via_daemon_proxy(
-                    socket,
-                    claude_code_compat,
-                    &grants,
-                    experimental_pip,
-                    feedback_override,
-                    |daemon, success| {
-                        telemetry::capture_mcp_startup_completed(
-                            "daemon_proxy",
-                            daemon.telemetry_value(),
-                            success,
-                            startup_started.elapsed(),
-                        )
-                    },
-                ),
             };
             if let Err(e) = result {
                 eprintln!("cua-driver-rs: {e}");
@@ -1281,6 +1301,7 @@ fn main() -> anyhow::Result<()> {
             claude_code_compat,
             grants,
             experimental_pip,
+            expected_pid,
         } => {
             let startup_started = std::time::Instant::now();
             let feedback_override = cursor_overlay::CursorConfig::click_feedback_override(
@@ -1289,33 +1310,40 @@ fn main() -> anyhow::Result<()> {
             // Long-running MCP proxy — kick off the background update check
             // before connecting to the daemon.
             version_check::maybe_announce_update();
-            let result = match mcp_uses_direct_runtime(socket.as_deref(), direct) {
-                Ok(true) => {
-                    configure_startup_permission_mode(None, false, None, false, &grants)?;
-                    telemetry::capture_mcp_startup_completed(
-                        "sdk_owned_runtime",
-                        "not_applicable",
-                        true,
-                        startup_started.elapsed(),
-                    );
-                    run_mcp_direct(claude_code_compat)
-                }
-                Err(error) => Err(error),
-                Ok(false) => cli::run_mcp_via_daemon_proxy(
-                    socket,
-                    claude_code_compat,
-                    &grants,
-                    experimental_pip,
-                    feedback_override,
-                    |daemon, success| {
+            let result = if expected_pid.is_some() && (direct || socket.is_none()) {
+                Err(anyhow::anyhow!(
+                    "--expected-pid requires daemon-backed `mcp --socket <path>`"
+                ))
+            } else {
+                match mcp_uses_direct_runtime(socket.as_deref(), direct) {
+                    Ok(true) => {
+                        configure_startup_permission_mode(None, false, None, false, &grants)?;
                         telemetry::capture_mcp_startup_completed(
-                            "daemon_proxy",
-                            daemon.telemetry_value(),
-                            success,
+                            "sdk_owned_runtime",
+                            "not_applicable",
+                            true,
                             startup_started.elapsed(),
-                        )
-                    },
-                ),
+                        );
+                        run_mcp_direct(claude_code_compat)
+                    }
+                    Err(error) => Err(error),
+                    Ok(false) => cli::run_mcp_via_daemon_proxy(
+                        socket,
+                        expected_pid,
+                        claude_code_compat,
+                        &grants,
+                        experimental_pip,
+                        feedback_override,
+                        |daemon, success| {
+                            telemetry::capture_mcp_startup_completed(
+                                "daemon_proxy",
+                                daemon.telemetry_value(),
+                                success,
+                                startup_started.elapsed(),
+                            )
+                        },
+                    ),
+                }
             };
             if let Err(e) = result {
                 eprintln!("cua-driver-rs: {e}");

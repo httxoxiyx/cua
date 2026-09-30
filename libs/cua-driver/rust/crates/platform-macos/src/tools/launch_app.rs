@@ -105,10 +105,12 @@ impl Tool for LaunchAppTool {
         let webkit_inspector_port = args.opt_u64("webkit_inspector_port").map(|v| v as u16);
         let creates_new_instance = args.bool_or("creates_new_application_instance", false);
         let additional_arguments: Vec<String> = args.str_array("additional_arguments");
-        if additional_arguments
-            .iter()
-            .any(|argument| argument == super::check_permissions::PERMISSIONS_HOST_REQUEST_ARG)
-        {
+        if additional_arguments.iter().any(|argument| {
+            argument == super::check_permissions::PERMISSIONS_HOST_REQUEST_ARG
+                || argument == crate::permissions::onboarding::ONBOARDING_CONTRACT_ARG
+                || argument == crate::permissions::onboarding::ONBOARDING_LAUNCH_ARG
+                || argument == crate::permissions::onboarding::ONBOARDING_HOST_ARG
+        }) {
             return protected_host_launch_refusal();
         }
         if additional_arguments
@@ -452,7 +454,14 @@ fn contains_remote_debugging_flag(value: &str) -> bool {
 }
 
 fn is_cua_driver_bundle_id(bundle_id: &str) -> bool {
-    matches!(bundle_id, "com.trycua.driver" | "com.trycua.driver.local")
+    matches!(
+        bundle_id,
+        "com.meta.musecode.cua.driver"
+            | "com.meta.musecode.cua.driver.local"
+            | "com.trycua.driver"
+            | "com.trycua.driver.local"
+            | "com.trycua.cuadriverrs"
+    )
 }
 
 fn protected_host_launch_refusal() -> ToolResult {
@@ -830,8 +839,13 @@ mod tests {
 
     #[test]
     fn recognizes_release_and_local_protected_host_bundle_ids() {
+        assert!(is_cua_driver_bundle_id("com.meta.musecode.cua.driver"));
+        assert!(is_cua_driver_bundle_id(
+            "com.meta.musecode.cua.driver.local"
+        ));
         assert!(is_cua_driver_bundle_id("com.trycua.driver"));
         assert!(is_cua_driver_bundle_id("com.trycua.driver.local"));
+        assert!(is_cua_driver_bundle_id("com.trycua.cuadriverrs"));
         assert!(!is_cua_driver_bundle_id("com.trycua.harness.tauri"));
     }
 
@@ -882,24 +896,31 @@ mod tests {
 
     #[tokio::test]
     async fn launch_app_cannot_reach_private_permission_host_entrypoint() {
-        let result = LaunchAppTool
-            .invoke(json!({
-                "bundle_id": "com.example.not-installed",
-                "additional_arguments": [
-                    "__permissions-host-request",
-                    "--result-file",
-                    "/tmp/cua-driver-permissions-forged.json"
-                ]
-            }))
-            .await;
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(
-            result.structured_content.unwrap()["error"],
-            "PROTECTED_HOST_ENTRYPOINT"
-        );
+        for private_argument in [
+            "__permissions-host-request",
+            crate::permissions::onboarding::ONBOARDING_CONTRACT_ARG,
+            crate::permissions::onboarding::ONBOARDING_LAUNCH_ARG,
+            crate::permissions::onboarding::ONBOARDING_HOST_ARG,
+        ] {
+            let result = LaunchAppTool
+                .invoke(json!({
+                    "bundle_id": "com.example.not-installed",
+                    "additional_arguments": [
+                        private_argument,
+                        "--result-file",
+                        "/tmp/cua-driver-permissions-forged.json"
+                    ]
+                }))
+                .await;
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result.structured_content.unwrap()["error"],
+                "PROTECTED_HOST_ENTRYPOINT"
+            );
+        }
 
         let result = LaunchAppTool
-            .invoke(json!({ "bundle_id": "com.trycua.driver" }))
+            .invoke(json!({ "bundle_id": "com.meta.musecode.cua.driver" }))
             .await;
         assert_eq!(result.is_error, Some(true));
         assert_eq!(

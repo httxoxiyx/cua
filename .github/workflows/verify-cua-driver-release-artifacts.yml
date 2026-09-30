@@ -1,0 +1,37 @@
+name: "Reusable: verify Cua Driver release artifacts"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Exact Cua Driver release version without a tag prefix"
+        required: true
+        type: string
+      artifact_name:
+        description: "Current-run artifact containing the complete release archive set"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  verify-release-archives:
+    name: Verify published archive contract before release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download current-run release archives
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: release-artifacts
+      - name: Verify every release archive and member
+        env:
+          CUA_RELEASE_VERSION: ${{ inputs.version }}
+        run: >-
+          python3 .github/scripts/verify_cua_driver_release_archives.py
+          --artifacts release-artifacts
+          --version "$CUA_RELEASE_VERSION"

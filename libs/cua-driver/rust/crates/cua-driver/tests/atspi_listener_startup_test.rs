@@ -20,6 +20,9 @@ fn serve_binds_while_reachable_atspi_initialization_is_stalled() {
         .expect("temporary startup-test directory");
     let bus_path = directory.path().join("stalled-session-bus.sock");
     let daemon_socket = directory.path().join("driver.sock");
+    // Nix builds use an unwritable HOME, and PID publication is intentionally
+    // fail-closed. Keep every daemon lifecycle path inside this test's root.
+    let daemon_pid = directory.path().join("driver.pid");
     let bus = UnixListener::bind(&bus_path).expect("bind reachable stalled bus");
     bus.set_nonblocking(true)
         .expect("make stalled bus listener nonblocking");
@@ -52,6 +55,8 @@ fn serve_binds_while_reachable_atspi_initialization_is_stalled() {
             "serve",
             "--socket",
             daemon_socket.to_str().expect("UTF-8 daemon socket"),
+            "--pid-file",
+            daemon_pid.to_str().expect("UTF-8 daemon PID path"),
             "--no-overlay",
             "--no-permissions-gate",
         ])

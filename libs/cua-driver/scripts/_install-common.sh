@@ -30,9 +30,9 @@
 # Style:
 #   * No `set -e` — sourced helpers shouldn't change the caller's shell
 #     options. Caller scripts are already `set -euo pipefail`.
-#   * Best-effort everywhere: every external command is suffixed with
-#     `|| true` (or wrapped in a subshell) so a kill failure never
-#     aborts the surrounding install.
+#   * Linux supervisor/process shutdown is fail-closed before runtime swaps;
+#     legacy macOS cleanup remains best-effort for callers that do not perform
+#     identity-changing work.
 #   * Bash 3.2 compatible (macOS default). No associative arrays, no
 #     `[[ =~ ]]` patterns that need bash 4+.
 
@@ -50,9 +50,9 @@
 #      also clears the KeepAlive flag so launchd doesn't immediately
 #      respawn the process we're about to kill. No-op (with stderr
 #      suppressed) when the plist isn't installed.
-#      Linux: `systemctl --user stop cua-driver-rs.service` for the
-#      install-local --autostart path. Same shape — politely stop the
-#      supervisor first so it doesn't restart the process.
+#      Linux: stop both the current cua-driver.service and the retired
+#      cua-driver-rs.service, then verify inactive state so Restart cannot
+#      repopulate the process set during the swap. Enablement is preserved.
 #   2. `pkill -x cua-driver` as the backstop for processes that weren't
 #      launchd/systemd-supervised (e.g. a manual `cua-driver serve`
 #      from a dev shell, or `cua-driver mcp` spawned by an editor that
@@ -64,15 +64,63 @@
 #   libs/cua-driver/rust/crates/cua-driver-uia/) and never exists on
 #   macOS/Linux, so no pkill for it here.
 #
-# Returns: always 0. Caller threads this through unconditionally; the
-# behaviour is "kill what we can, never block the install".
+# Return a three-way systemd state without treating manager/query failures as
+# "inactive". 0 = active, 1 = inactive/not found, 2 = unknown.
+cua_systemd_active_state() {
+    local service="$1" status=0
+    command -v systemctl >/dev/null 2>&1 || return 2
+    systemctl --user is-active --quiet "$service" >/dev/null 2>&1 || status=$?
+    case "$status" in
+        0) return 0 ;;
+        3|4) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+stop_and_verify_cua_systemd_service() {
+    local service="$1" unit_path="$2"
+    local active_state=0
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        if [ -e "$unit_path" ] || [ -L "$unit_path" ]; then
+            printf 'error: systemctl is unavailable; cannot quiesce %s\n' "$service" >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    active_state=0
+    cua_systemd_active_state "$service" || active_state=$?
+    if [ "$active_state" = "1" ]; then
+        return 0
+    fi
+    if [ "$active_state" = "2" ]; then
+        printf 'error: could not inspect systemd user service %s\n' "$service" >&2
+        return 1
+    fi
+    if ! systemctl --user stop "$service" >/dev/null 2>&1; then
+        printf 'error: could not stop systemd user service %s\n' "$service" >&2
+        return 1
+    fi
+
+    active_state=0
+    cua_systemd_active_state "$service" || active_state=$?
+    if [ "$active_state" != "1" ]; then
+        printf 'error: systemd user service %s remains active or unverifiable\n' "$service" >&2
+        return 1
+    fi
+}
+
+# Returns non-zero on Linux when the supported systemd supervisors or daemon
+# process cannot be proven quiescent. Other platforms retain the legacy
+# best-effort behavior; macOS identity-changing callers use their stricter,
+# path-authenticated shutdown before reaching this helper.
 stop_cua_driver_daemons() {
     printf '==> stopping any running cua-driver daemons before swap\n'
 
-    # Wrap the whole thing in a subshell so any unexpected non-zero exit
-    # (e.g. a `pkill` returning 1 when no process matches under a
-    # `set -e` caller — we shouldn't be `set -e` here, but defence in
-    # depth) never escapes.
+    # Keep temporary locals and platform branches isolated. Expected no-match
+    # statuses are handled explicitly; verification failures escape so callers
+    # cannot replace a supervised runtime.
     (
         case "$(uname -s 2>/dev/null || echo unknown)" in
             Darwin)
@@ -89,14 +137,16 @@ stop_cua_driver_daemons() {
                 fi
                 ;;
             Linux)
-                # systemctl --user is the only supported supervisor on
-                # Linux today (install-local-rust.sh --autostart writes
-                # ~/.config/systemd/user/cua-driver-rs.service). `command
-                # -v` so we don't error on systemd-less hosts (musl
-                # containers, NixOS without user services, etc.).
-                if command -v systemctl >/dev/null 2>&1; then
-                    systemctl --user stop cua-driver-rs.service >/dev/null 2>&1 || true
-                fi
+                # Cover both the current unit and its retired Rust name. A
+                # process kill is not sufficient while Restart can respawn it.
+                stop_and_verify_cua_systemd_service \
+                    cua-driver.service \
+                    "$HOME/.config/systemd/user/cua-driver.service" \
+                    || exit 1
+                stop_and_verify_cua_systemd_service \
+                    cua-driver-rs.service \
+                    "$HOME/.config/systemd/user/cua-driver-rs.service" \
+                    || exit 1
                 ;;
             *)
                 # Other Unixes (FreeBSD, etc.) — no supervisor we know
@@ -117,9 +167,30 @@ stop_cua_driver_daemons() {
             # covers both.
             pkill -x cua-driver >/dev/null 2>&1 || true
         fi
-    ) || true
-
-    return 0
+        if [ "$(uname -s 2>/dev/null || echo unknown)" = "Linux" ]; then
+            sleep 0.2 2>/dev/null || sleep 1
+            if ! command -v pgrep >/dev/null 2>&1; then
+                printf 'error: pgrep is unavailable; cannot verify cua-driver daemon shutdown\n' >&2
+                exit 1
+            fi
+            local uid candidates="" pgrep_status=0
+            uid="$(id -u 2>/dev/null || true)"
+            case "$uid" in ''|*[!0-9]*) exit 1 ;; esac
+            candidates="$(pgrep -U "$uid" -x cua-driver 2>/dev/null)" || pgrep_status=$?
+            case "$pgrep_status" in
+                1) ;;
+                0)
+                    printf 'error: cua-driver daemon remains after supervisor shutdown: %s\n' \
+                        "$(printf '%s' "$candidates" | tr '\n' ' ')" >&2
+                    exit 1
+                    ;;
+                *)
+                    printf 'error: could not inspect cua-driver processes after supervisor shutdown\n' >&2
+                    exit 1
+                    ;;
+            esac
+        fi
+    )
 }
 
 # Print a yellow warning if cua-driver processes are still running after

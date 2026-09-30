@@ -17,6 +17,8 @@
 #                install the visible symlink to <path> instead of
 #                ~/.local/bin. Takes precedence over
 #                CUA_DRIVER_LOCAL_INSTALL_DIR; must be absolute.
+#   CUA_DRIVER_LOCAL_HOME must be an absolute, non-symlink directory below
+#   HOME and must not overlap the release-owned $HOME/.cua-driver directory.
 #
 # Not for end-users — scripts/install.sh fetches a built release from
 # GitHub. This script is for the developer loop (rapid edit/build/test
@@ -30,14 +32,20 @@
 #   ${CUA_DRIVER_LOCAL_INSTALL_DIR:-$HOME/.local/bin}/cua-driver-local
 #
 # macOS layout produced:
-#   /Applications/CuaDriverLocal.app/Contents/MacOS/cua-driver-local
-#   $HOME/.local/bin/cua-driver-local -> .../CuaDriverLocal.app/Contents/MacOS/cua-driver-local
+#   /Applications/MuseCodeCuaDriverLocal.app/Contents/MacOS/cua-driver-local
+#   $HOME/.local/bin/cua-driver-local -> .../MuseCodeCuaDriverLocal.app/Contents/MacOS/cua-driver-local
 #
 # The version string carries `-local-debug` / `-local-release` so it
 # never collides with a real release dir and is trivial to GC.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Shared process, supervisor, and macOS signing helpers have no top-level side
+# effects. Load them before staging so Linux can prove the old supervised
+# daemon is quiescent before replacing its executable.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=_local-signing.sh
+. "$SCRIPT_DIR/_local-signing.sh"
 # Rust workspace root: scripts/ is the cross-cutting installer dir at
 # libs/cua-driver/scripts/; the Cargo workspace lives one level deeper
 # under libs/cua-driver/rust/.
@@ -76,6 +84,69 @@ if [ "$(id -u)" -eq 0 ] || [ -n "${SUDO_USER:-}" ]; then
     echo "It prompts for sudo on the specific operations that need it."
     exit 1
 fi
+
+validate_local_install_home_dir() {
+    local home_dir="$1" user_home="${2%/}" resolved_home resolved_dir
+    local relative prefix component child old_ifs="$IFS"
+    local components=()
+
+    case "$user_home" in
+        /*) ;;
+        *) echo "error: HOME must be an absolute path" >&2; return 1 ;;
+    esac
+    [ -n "$user_home" ] && [ "$user_home" != "/" ] || {
+        echo "error: refusing unsafe HOME: ${user_home:-<empty>}" >&2
+        return 1
+    }
+    case "$home_dir" in
+        /*) ;;
+        *) echo "error: CUA_DRIVER_LOCAL_HOME must be an absolute path" >&2; return 1 ;;
+    esac
+    case "$home_dir" in
+        /|"$user_home"|"$user_home"/|"$user_home/.cua-driver"|"$user_home/.cua-driver"/|*//*|*/../*|*/..|*/./*|*/.)
+            echo "error: refusing unsafe or release-owned local home: $home_dir" >&2
+            return 1
+            ;;
+    esac
+    [[ "$home_dir" != *$'\n'* && "$home_dir" != *$'\r'* ]] || {
+        echo "error: refusing local home containing a line break" >&2
+        return 1
+    }
+    resolved_home="$(CDPATH= cd -- "$user_home" 2>/dev/null && pwd -P)" || {
+        echo "error: could not resolve HOME safely: $user_home" >&2
+        return 1
+    }
+    case "$home_dir" in
+        "$user_home"/*) ;;
+        *) echo "error: CUA_DRIVER_LOCAL_HOME must remain inside HOME ($resolved_home): $home_dir" >&2; return 1 ;;
+    esac
+
+    relative="${home_dir#"$user_home"/}"
+    prefix="$user_home"
+    IFS='/' read -r -a components <<< "$relative"
+    IFS="$old_ifs"
+    for component in "${components[@]}"; do
+        [ -n "$component" ] && [ "$component" != "." ] && [ "$component" != ".." ] || return 1
+        prefix="$prefix/$component"
+        if [ -L "$prefix" ] || { [ -e "$prefix" ] && [ ! -d "$prefix" ]; }; then
+            echo "error: refusing symlink or non-directory local home component: $prefix" >&2
+            return 1
+        fi
+    done
+    if [ -d "$home_dir" ]; then
+        resolved_dir="$(CDPATH= cd -- "$home_dir" 2>/dev/null && pwd -P)" || return 1
+        case "$resolved_dir" in
+            "$resolved_home"/*) ;;
+            *) echo "error: local home resolves outside HOME: $resolved_dir" >&2; return 1 ;;
+        esac
+    fi
+    for child in "$home_dir/packages" "$home_dir/packages/releases"; do
+        if [ -L "$child" ] || { [ -e "$child" ] && [ ! -d "$child" ]; }; then
+            echo "error: refusing unsafe managed local install directory: $child" >&2
+            return 1
+        fi
+    done
+}
 
 # --- Parse arguments ----------------------------------------------------
 
@@ -126,7 +197,7 @@ while [ "$#" -gt 0 ]; do
             echo "                  macOS: LaunchAgent under ~/Library/LaunchAgents"
             echo "                  Linux: systemd --user unit"
             echo "                On macOS this also fixes TCC: a launchd-started daemon"
-            echo "                is attributed to com.trycua.driver.local (not your terminal),"
+            echo "                is attributed to com.meta.musecode.cua.driver.local (not your terminal),"
             echo "                so you grant Accessibility + Screen Recording once and"
             echo "                every cua-driver-local call/mcp routes through it correctly."
             echo "  --bin-dir <path>"
@@ -163,6 +234,7 @@ case "$OS" in
 esac
 
 HOME_DIR="${CUA_DRIVER_LOCAL_HOME:-$HOME/.cua-driver-local}"
+validate_local_install_home_dir "$HOME_DIR" "$HOME" || exit 2
 BIN_DIR="${BIN_DIR_OVERRIDE:-${CUA_DRIVER_LOCAL_INSTALL_DIR:-$HOME/.local/bin}}"
 # The symlink is created after this script cds into the Cargo workspace, so a
 # relative path would silently land inside rust/ — and uninstall-local.sh
@@ -177,6 +249,7 @@ case "$BIN_DIR" in
 esac
 RELEASES_DIR="$HOME_DIR/packages/releases"
 CURRENT_LINK="$HOME_DIR/packages/current"
+LOCAL_SYSTEMD_UNIT="$HOME/.config/systemd/user/cua-driver-local.service"
 
 VERSION_TAG="0.0.0-local-$BUILD_CONFIG"
 VERSIONED_DIR="$RELEASES_DIR/$VERSION_TAG-$TARGET_TRIPLE"
@@ -248,6 +321,37 @@ if [ ! -x "$BUILT_THEME_BINARY" ]; then
     exit 1
 fi
 echo ""
+
+stop_local_linux_daemons_before_runtime_change() {
+    local candidate resolved records="" status=0
+    local owned_paths=(
+        "$BIN_DIR/cua-driver-local"
+        "$CURRENT_LINK/cua-driver-local"
+    )
+    stop_and_verify_local_systemd_service \
+        "cua-driver-local.service" "$LOCAL_SYSTEMD_UNIT" || return 1
+    for candidate in "$HOME_DIR"/packages/releases/*/cua-driver-local; do
+        [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+        owned_paths+=("$candidate")
+    done
+    for candidate in "${owned_paths[@]}"; do
+        resolved="$(realpath "$candidate" 2>/dev/null || true)"
+        [ -n "$resolved" ] && owned_paths+=("$resolved")
+    done
+    stop_verified_local_processes 0 "${owned_paths[@]}" || return 1
+    stop_and_verify_local_systemd_service \
+        "cua-driver-local.service" "$LOCAL_SYSTEMD_UNIT" || return 1
+    records="$(local_owned_process_records 0 "${owned_paths[@]}")" || status=$?
+    if [ "$status" != "0" ] || [ -n "$records" ]; then
+        echo "${RED:-}Error: local daemon respawned or could not be inspected after systemd shutdown.${NORMAL:-}" >&2
+        return 1
+    fi
+}
+
+if [ "$OS" = "Linux" ] \
+   && ! stop_local_linux_daemons_before_runtime_change; then
+    exit 1
+fi
 
 # --- Stage into versioned release dir + repoint `current` --------------
 
@@ -359,15 +463,13 @@ echo ""
 # --- macOS: stable local code-signing identity (so TCC grants survive rebuilds) ---
 #
 # Keep policy in a sourceable helper so strict/fallback behavior can be tested
-# without building or installing the app.
-# shellcheck source-path=SCRIPTDIR
-# shellcheck source=_local-signing.sh
-. "$SCRIPT_DIR/_local-signing.sh"
+# without building or installing the app. The helper is sourced above because
+# Linux shutdown must run before the versioned runtime is replaced.
 
-# --- macOS: wrap the binary in CuaDriverLocal.app for a stable TCC identity ---
+# --- macOS: wrap the binary in MuseCodeCuaDriverLocal.app for a stable TCC identity ---
 #
 # TCC keys Accessibility / Screen-Recording grants on the bundle
-# identifier (com.trycua.driver.local), not the bare executable path. A loose
+# identifier (com.meta.musecode.cua.driver.local), not the bare executable path. A loose
 # binary gets grants attributed to its ad-hoc cdhash, which changes on
 # every rebuild — so permissions silently reset and never appear cleanly
 # under System Settings. Mirror the production path (install.sh) + the CD
@@ -375,14 +477,137 @@ echo ""
 # CuaDriverBundle skeleton, install the bundle to /Applications, and point
 # the visible bin at the binary INSIDE the bundle. Linux/Windows have no
 # .app concept and keep the bare-binary symlink below.
-APP_DEST="/Applications/CuaDriverLocal.app"
+APP_DEST="/Applications/MuseCodeCuaDriverLocal.app"
+LEGACY_LOCAL_APP="/Applications/CuaDriverLocal.app"
+LOCAL_HISTORY_ROOT="$HOME/Library/Application Support/cua-driver-local/computer-history"
+LOCAL_APP_SWAP_STARTED=0
+LOCAL_APP_HAD_PREVIOUS=0
+LOCAL_APP_INSTALL_COMMITTED=0
+LOCAL_APP_BACKUP=""
+LEGACY_LOCAL_APP_OWNED=0
+LEGACY_LOCAL_APP_REMOVAL_STARTED=0
+LEGACY_LOCAL_APP_BACKUP=""
+
+rollback_local_app_on_exit() {
+    [ "$LOCAL_APP_SWAP_STARTED" = "1" ] || return 0
+
+    if [ "$LOCAL_APP_INSTALL_COMMITTED" = "1" ]; then
+        if ! remove_authenticated_local_app_backup "$LOCAL_APP_BACKUP" \
+            "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
+            echo "${RED:-}Error: committed local app is usable, but its authenticated install backup could not be removed.${NORMAL:-}" >&2
+            return 1
+        fi
+        LOCAL_APP_SWAP_STARTED=0
+        return 0
+    fi
+
+    if ! restore_local_app_backup "$APP_DEST" "$LOCAL_APP_BACKUP" \
+        "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
+        echo "${RED:-}Error: interrupted local app replacement could not be rolled back safely; inspect $LOCAL_APP_BACKUP before retrying.${NORMAL:-}" >&2
+        return 1
+    fi
+    LOCAL_APP_SWAP_STARTED=0
+    if [ "$LOCAL_APP_HAD_PREVIOUS" = "1" ]; then
+        echo "${YELLOW:-}warning: restored the previous MuseCodeCuaDriverLocal.app after an interrupted installation.${NORMAL:-}" >&2
+    fi
+}
+
+rollback_legacy_local_app_on_exit() {
+    [ "$LEGACY_LOCAL_APP_REMOVAL_STARTED" = "1" ] || return 0
+
+    if [ "$LOCAL_APP_INSTALL_COMMITTED" = "1" ]; then
+        if ! remove_authenticated_local_app_backup "$LEGACY_LOCAL_APP_BACKUP" \
+            "com.trycua.driver.local" "cua-driver-local"; then
+            echo "${RED:-}Error: committed local install is usable, but its authenticated legacy-app backup could not be removed.${NORMAL:-}" >&2
+            return 1
+        fi
+        LEGACY_LOCAL_APP_REMOVAL_STARTED=0
+        return 0
+    fi
+
+    if [ -e "$LEGACY_LOCAL_APP_BACKUP" ] || [ -L "$LEGACY_LOCAL_APP_BACKUP" ]; then
+        if ! verify_local_app_identity "$LEGACY_LOCAL_APP_BACKUP" \
+            "com.trycua.driver.local" "cua-driver-local"; then
+            echo "${RED:-}Error: refusing to restore unauthenticated legacy local-app backup at $LEGACY_LOCAL_APP_BACKUP.${NORMAL:-}" >&2
+            return 1
+        fi
+        if [ -e "$LEGACY_LOCAL_APP" ] || [ -L "$LEGACY_LOCAL_APP" ]; then
+            echo "${RED:-}Error: refusing to overwrite $LEGACY_LOCAL_APP while restoring its authenticated backup.${NORMAL:-}" >&2
+            return 1
+        fi
+        if ! mv "$LEGACY_LOCAL_APP_BACKUP" "$LEGACY_LOCAL_APP" \
+           || ! register_legacy_local_app "$LEGACY_LOCAL_APP"; then
+            echo "${RED:-}Error: could not restore and register legacy local app $LEGACY_LOCAL_APP.${NORMAL:-}" >&2
+            return 1
+        fi
+    elif [ -e "$LEGACY_LOCAL_APP" ] || [ -L "$LEGACY_LOCAL_APP" ]; then
+        # Preparation can fail after unregistering but before the atomic move.
+        if ! verify_local_app_identity "$LEGACY_LOCAL_APP" \
+            "com.trycua.driver.local" "cua-driver-local"; then
+            echo "${RED:-}Error: refusing to re-register unauthenticated legacy local app $LEGACY_LOCAL_APP.${NORMAL:-}" >&2
+            return 1
+        fi
+        if ! register_legacy_local_app "$LEGACY_LOCAL_APP"; then
+            echo "${RED:-}Error: could not re-register preserved legacy local app $LEGACY_LOCAL_APP.${NORMAL:-}" >&2
+            return 1
+        fi
+    fi
+    LEGACY_LOCAL_APP_REMOVAL_STARTED=0
+    echo "${YELLOW:-}warning: restored the legacy local app after an interrupted installation.${NORMAL:-}" >&2
+}
+
+local_install_exit() {
+    local status=$?
+    trap - EXIT INT TERM
+    if ! rollback_local_app_on_exit; then
+        status=1
+    fi
+    if ! rollback_legacy_local_app_on_exit; then
+        status=1
+    fi
+    exit "$status"
+}
+
+# The EXIT handler covers ordinary errors, including failures inside explicit
+# `if`/`||` checks. Signal handlers convert INT/TERM into conventional exit
+# statuses and let EXIT perform exactly one rollback.
+trap local_install_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+stop_local_daemons_before_identity_check() {
+    local candidate resolved
+    local owned_paths=(
+        "$BIN_DIR/cua-driver-local"
+        "$CURRENT_LINK/cua-driver-local"
+        "$APP_DEST/Contents/MacOS/cua-driver-local"
+    )
+    if ! stop_and_verify_local_launchagent \
+        "$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist" \
+        "com.trycua.cua-driver-local"; then
+        return 1
+    fi
+    if [ "${LEGACY_LOCAL_APP_OWNED:-0}" = "1" ]; then
+        owned_paths+=("$LEGACY_LOCAL_APP/Contents/MacOS/cua-driver-local")
+    fi
+    for candidate in "$HOME_DIR"/packages/releases/*/cua-driver-local; do
+        [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+        owned_paths+=("$candidate")
+    done
+    for candidate in "${owned_paths[@]}"; do
+        resolved="$(realpath "$candidate" 2>/dev/null || true)"
+        [ -n "$resolved" ] && owned_paths+=("$resolved")
+    done
+    stop_verified_local_processes 0 "${owned_paths[@]}"
+}
+
 if [ "$OS" = "Darwin" ]; then
     SKELETON="$REPO_ROOT/scripts/CuaDriverBundle"
     if [ ! -d "$SKELETON/Contents" ]; then
         echo "${RED}Error: bundle skeleton missing at $SKELETON${NORMAL}" >&2
         exit 1
     fi
-    APP_STAGE="$VERSIONED_DIR/CuaDriverLocal.app"
+    APP_STAGE="$VERSIONED_DIR/MuseCodeCuaDriverLocal.app"
     rm -rf "$APP_STAGE"
     mkdir -p "$APP_STAGE/Contents/MacOS"
     cp -R "$SKELETON/Contents/." "$APP_STAGE/Contents/"
@@ -391,9 +616,30 @@ if [ "$OS" = "Darwin" ]; then
     chmod +x "$APP_STAGE/Contents/MacOS/cua-driver-local"
     chmod +x "$APP_STAGE/Contents/MacOS/cua-cursor-theme"
     rm -f "$APP_STAGE/Contents/MacOS/.gitkeep"
+    if ! command -v codesign >/dev/null 2>&1; then
+        echo "${RED}Error: codesign is required to install MuseCodeCuaDriverLocal.app safely.${NORMAL}" >&2
+        exit 1
+    fi
     PREVIOUS_REQUIREMENT=""
-    if [ -d "$APP_DEST" ] && command -v codesign >/dev/null 2>&1; then
-        PREVIOUS_REQUIREMENT="$(designated_requirement "$APP_DEST")"
+    if [ -e "$APP_DEST" ] || [ -L "$APP_DEST" ]; then
+        if ! verify_local_app_identity "$APP_DEST" \
+            "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
+            echo "${RED}Error: refusing to replace unauthenticated shared app path $APP_DEST.${NORMAL}" >&2
+            exit 1
+        fi
+        if ! PREVIOUS_REQUIREMENT="$(designated_requirement "$APP_DEST")" \
+           || [ -z "$PREVIOUS_REQUIREMENT" ]; then
+            echo "${RED}Error: could not read the installed local app's designated requirement; refusing a TCC-unsafe replacement.${NORMAL}" >&2
+            exit 1
+        fi
+    fi
+    if [ -e "$LEGACY_LOCAL_APP" ] || [ -L "$LEGACY_LOCAL_APP" ]; then
+        if ! verify_local_app_identity "$LEGACY_LOCAL_APP" \
+            "com.trycua.driver.local" "cua-driver-local"; then
+            echo "${RED}Error: refusing to modify unauthenticated legacy app path $LEGACY_LOCAL_APP.${NORMAL}" >&2
+            exit 1
+        fi
+        LEGACY_LOCAL_APP_OWNED=1
     fi
     # Stamp the local build version so the bundle reports something sane.
     if command -v plutil >/dev/null 2>&1; then
@@ -403,7 +649,7 @@ if [ "$OS" = "Darwin" ]; then
             "$APP_STAGE/Contents/Info.plist" 2>/dev/null || true
         plutil -replace CFBundleExecutable -string "cua-driver-local" \
             "$APP_STAGE/Contents/Info.plist"
-        plutil -replace CFBundleIdentifier -string "com.trycua.driver.local" \
+        plutil -replace CFBundleIdentifier -string "com.meta.musecode.cua.driver.local" \
             "$APP_STAGE/Contents/Info.plist"
         plutil -replace CFBundleName -string "cua" \
             "$APP_STAGE/Contents/Info.plist"
@@ -415,18 +661,57 @@ if [ "$OS" = "Darwin" ]; then
     # Prefer the STABLE self-signed identity so TCC grants survive rebuilds;
     # never downgrade an existing certificate-signed installation to ad-hoc,
     # because that would invalidate its working TCC grants.
-    if command -v codesign >/dev/null 2>&1; then
-        if ! sign_staged_local_app "$APP_STAGE" "$APP_DEST"; then
+    if ! sign_staged_local_app "$APP_STAGE" "$APP_DEST"; then
+        exit 1
+    fi
+    if ! verify_local_app_identity "$APP_STAGE" \
+        "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
+        echo "${RED}Error: staged MuseCodeCuaDriverLocal.app failed identity verification; live installation was not changed.${NORMAL}" >&2
+        exit 1
+    fi
+    STAGED_REQUIREMENT="$(designated_requirement "$APP_STAGE")"
+    STAGED_SIGNING_CLASS="$(classify_designated_requirement "$STAGED_REQUIREMENT")"
+    REQUIREMENT_COMPATIBILITY="first-install"
+    if [ -n "$PREVIOUS_REQUIREMENT" ]; then
+        REQUIREMENT_COMPATIBILITY="$(local_requirement_compatibility \
+            "$PREVIOUS_REQUIREMENT" "$APP_STAGE")"
+        if [ "$REQUIREMENT_COMPATIBILITY" = "unknown" ]; then
+            echo "${RED}Error: could not evaluate the existing local app's signing requirement; refusing a TCC-unsafe replacement.${NORMAL}" >&2
             exit 1
         fi
-        if ! codesign --verify --deep --strict "$APP_STAGE" 2>/dev/null; then
-            echo "${RED}Error: staged CuaDriverLocal.app failed signature verification; live installation was not changed.${NORMAL}" >&2
-            exit 1
-        fi
-        STAGED_REQUIREMENT="$(designated_requirement "$APP_STAGE")"
-        STAGED_SIGNING_CLASS="$(classify_designated_requirement "$STAGED_REQUIREMENT")"
-    else
-        echo "${RED}Error: codesign is required to install CuaDriverLocal.app safely.${NORMAL}" >&2
+    fi
+    if ! stop_local_daemons_before_identity_check; then
+        exit 1
+    fi
+    if [ "$REQUIREMENT_COMPATIBILITY" = "incompatible" ] \
+       && ! refuse_local_history_identity_transition \
+            "$LOCAL_HISTORY_ROOT" "$APP_DEST" \
+            "replace the current local signer identity"; then
+        exit 1
+    fi
+    if [ "$LEGACY_LOCAL_APP_OWNED" = "1" ] \
+       && ! refuse_local_history_identity_transition \
+            "$LOCAL_HISTORY_ROOT" "$LEGACY_LOCAL_APP" \
+            "remove the legacy local app identity"; then
+        exit 1
+    fi
+
+    # Re-check both the supervisor and exact process generations immediately
+    # before the first bundle move. A failed/unloaded KeepAlive job must not
+    # respawn into the gap between history preflight and signer replacement.
+    if ! stop_local_daemons_before_identity_check; then
+        exit 1
+    fi
+    if [ "$REQUIREMENT_COMPATIBILITY" = "incompatible" ] \
+       && ! refuse_local_history_identity_transition \
+            "$LOCAL_HISTORY_ROOT" "$APP_DEST" \
+            "replace the current local signer identity"; then
+        exit 1
+    fi
+    if [ "$LEGACY_LOCAL_APP_OWNED" = "1" ] \
+       && ! refuse_local_history_identity_transition \
+            "$LOCAL_HISTORY_ROOT" "$LEGACY_LOCAL_APP" \
+            "remove the legacy local app identity"; then
         exit 1
     fi
 
@@ -434,13 +719,25 @@ if [ "$OS" = "Darwin" ]; then
     # install.sh). Keep the prior bundle available until the copy completes so
     # an interrupted install cannot leave a corrupt live app.
     APP_BACKUP="${APP_DEST}.install-backup.$$"
-    rm -rf "$APP_BACKUP"
+    if [ -e "$APP_BACKUP" ] || [ -L "$APP_BACKUP" ]; then
+        echo "${RED}Error: refusing to overwrite existing install backup path $APP_BACKUP.${NORMAL}" >&2
+        exit 1
+    fi
     if [ -d "$APP_DEST" ]; then
-        mv "$APP_DEST" "$APP_BACKUP"
+        LOCAL_APP_HAD_PREVIOUS=1
+    fi
+    LOCAL_APP_BACKUP="$APP_BACKUP"
+    LOCAL_APP_SWAP_STARTED=1
+    if [ "$LOCAL_APP_HAD_PREVIOUS" = "1" ] \
+       && ! mv "$APP_DEST" "$APP_BACKUP"; then
+        LOCAL_APP_SWAP_STARTED=0
+        echo "${RED}Error: could not move the authenticated local app into its rollback slot.${NORMAL}" >&2
+        exit 1
     fi
     install_valid=false
     if ditto "$APP_STAGE" "$APP_DEST" \
-       && codesign --verify --deep --strict "$APP_DEST" 2>/dev/null; then
+       && verify_local_app_identity "$APP_DEST" \
+            "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
         INSTALLED_REQUIREMENT="$(designated_requirement "$APP_DEST")"
         INSTALLED_SIGNING_CLASS="$(classify_designated_requirement "$INSTALLED_REQUIREMENT")"
         if [ "$INSTALLED_REQUIREMENT" = "$STAGED_REQUIREMENT" ] \
@@ -449,14 +746,8 @@ if [ "$OS" = "Darwin" ]; then
             install_valid=true
         fi
     fi
-    if [ "$install_valid" = true ]; then
-        rm -rf "$APP_BACKUP"
-    else
-        rm -rf "$APP_DEST"
-        if [ -d "$APP_BACKUP" ]; then
-            mv "$APP_BACKUP" "$APP_DEST"
-        fi
-        echo "${RED}Error: installed CuaDriverLocal.app did not preserve its verified signing identity; restored the previous bundle.${NORMAL}" >&2
+    if [ "$install_valid" != true ]; then
+        echo "${RED}Error: installed MuseCodeCuaDriverLocal.app did not preserve its verified signing identity; rolling back.${NORMAL}" >&2
         exit 1
     fi
     echo "${GREEN}installed $APP_DEST${NORMAL}"
@@ -469,13 +760,24 @@ if [ "$OS" = "Darwin" ]; then
     # --- Force LaunchServices registration of the freshly-copied bundle ----
     #
     # `ditto` drops the bundle on disk, but LaunchServices registers the new
-    # com.trycua.driver.local identity ASYNCHRONOUSLY (seconds later). Until it
-    # does, `open -n -g -a CuaDriverLocal` (what `permissions grant` / MCP use to
+    # com.meta.musecode.cua.driver.local identity ASYNCHRONOUSLY (seconds later). Until it
+    # does, `open -n -g -a MuseCodeCuaDriverLocal` (what `permissions grant` / MCP use to
     # launch the daemon) fails with -1728. A synchronous `lsregister -f` closes
     # that race so both the reset and the first launch resolve the bundle id.
-    LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
-    if [ -x "$LSREGISTER" ]; then
-        "$LSREGISTER" -f "$APP_DEST" >/dev/null 2>&1 || true
+    if ! register_local_app "$APP_DEST"; then
+        echo "${RED}Error: could not register MuseCodeCuaDriverLocal.app with LaunchServices; rolling back.${NORMAL}" >&2
+        exit 1
+    fi
+
+    if [ -n "$PREVIOUS_REQUIREMENT" ]; then
+        INSTALLED_COMPATIBILITY="$(local_requirement_compatibility \
+            "$PREVIOUS_REQUIREMENT" "$APP_DEST")"
+        if [ "$INSTALLED_COMPATIBILITY" != "$REQUIREMENT_COMPATIBILITY" ]; then
+            echo "${RED}Error: installed local app's signing compatibility changed during copy; rolling back.${NORMAL}" >&2
+            exit 1
+        fi
+    else
+        INSTALLED_COMPATIBILITY="first-install"
     fi
 
 fi
@@ -483,7 +785,7 @@ fi
 # --- Visible-bin symlink ------------------------------------------------
 #
 # On macOS point at the binary INSIDE the installed bundle so the process
-# that actually runs carries the com.trycua.driver.local identity (TCC keys
+# that actually runs carries the com.meta.musecode.cua.driver.local identity (TCC keys
 # grants on it). On Linux/Windows point at the versioned-store binary.
 mkdir -p "$BIN_DIR"
 if [ "$OS" = "Darwin" ]; then
@@ -499,40 +801,69 @@ INSTALLED_BIN="$BIN_DIR/cua-driver-local"
 
 # --- Stop any pre-swap cua-driver daemons ------------------------------
 #
-# Mirror of install-local.ps1's daemon kill — the new binary is now
-# under packages/current/, but any LaunchAgent / systemd user unit /
-# manual `serve` shell is still running off the OLD binary. Stop them
-# so the next invocation picks up this build. Best-effort, never
-# fails the install. Survivors (rare on Unix — `pkill` reaches all
-# user-owned procs without elevation) get a yellow hint.
+# Re-check after publishing the new binary. The pre-stage Linux shutdown above
+# prevents replacement under an active Restart unit; this second pass catches
+# an independently started process before optional autostart is re-enabled.
 #
-# NOTE: do not use `pkill -x cua-driver-local`. `-x` compares against the
-# kernel's truncated process name — 15 chars on Linux (`comm`) — and
-# `cua-driver-local` is 16, so on Linux it silently matched nothing and
-# every pre-swap daemon survived the install. Match argv[0] instead, and
-# anchor it: an unanchored `-f` pattern also matches the launcher shells
-# whose script *text* contains the daemon path, killing the surrounding
-# session rather than the daemon.
 if [ "$OS" = "Darwin" ]; then
-    launchctl unload "$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist" 2>/dev/null || true
-elif [ "$OS" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl --user stop cua-driver-local.service >/dev/null 2>&1 || true
-fi
-for _daemon_bin in "$INSTALLED_BIN" "$BIN_TARGET"; do
-    [ -n "$_daemon_bin" ] || continue
-    pkill -f "^${_daemon_bin}([[:space:]]|\$)" >/dev/null 2>&1 || true
-done
-unset _daemon_bin
-
-# A changed ad-hoc cdhash leaves the old csreq attached to this bundle's TCC
-# rows. Once the new bundle is registered and old daemons are stopped, reset
-# only its Accessibility and ScreenCapture rows so `permissions grant` can
-# create entries for the new identity.
-if [ "$OS" = "Darwin" ]; then
-    if ! reset_local_tcc_after_ad_hoc_change \
-        "$PREVIOUS_REQUIREMENT" "$INSTALLED_REQUIREMENT"; then
+    if ! stop_local_daemons_before_identity_check; then
         exit 1
     fi
+elif [ "$OS" = "Linux" ]; then
+    if ! stop_local_linux_daemons_before_runtime_change; then
+        exit 1
+    fi
+fi
+
+# An incompatible signing transition leaves the old csreq attached to this
+# bundle's TCC rows. Once the new bundle is registered and old daemons are
+# stopped, reset all services used by the local driver.
+if [ "$OS" = "Darwin" ]; then
+    if ! reset_local_tcc_after_requirement_change "$INSTALLED_COMPATIBILITY"; then
+        exit 1
+    fi
+
+    # Retire the legacy identity transactionally before the replacement becomes
+    # committed or any KeepAlive job can launch it. The authenticated old app
+    # stays in a rollback slot until both identities have completed their TCC
+    # and LaunchServices transitions.
+    if [ "$LEGACY_LOCAL_APP_OWNED" = "1" ]; then
+        if ! stop_local_daemons_before_identity_check; then
+            exit 1
+        fi
+        if ! refuse_local_history_identity_transition \
+            "$LOCAL_HISTORY_ROOT" "$LEGACY_LOCAL_APP" \
+            "remove the legacy local app identity"; then
+            exit 1
+        fi
+        LEGACY_LOCAL_APP_BACKUP="${LEGACY_LOCAL_APP}.install-backup.$$"
+        if [ -e "$LEGACY_LOCAL_APP_BACKUP" ] || [ -L "$LEGACY_LOCAL_APP_BACKUP" ]; then
+            echo "${RED}Error: refusing to overwrite legacy local-app backup path $LEGACY_LOCAL_APP_BACKUP.${NORMAL}" >&2
+            exit 1
+        fi
+        LEGACY_LOCAL_APP_REMOVAL_STARTED=1
+        if ! prepare_legacy_local_app_removal "$LEGACY_LOCAL_APP" 1; then
+            exit 1
+        fi
+        if ! mv "$LEGACY_LOCAL_APP" "$LEGACY_LOCAL_APP_BACKUP"; then
+            echo "${RED}Error: could not move the authenticated legacy local app into its rollback slot.${NORMAL}" >&2
+            exit 1
+        fi
+        echo "${YELLOW}staged retired local app $LEGACY_LOCAL_APP for removal${NORMAL}" >&2
+    fi
+
+    LOCAL_APP_INSTALL_COMMITTED=1
+    if ! remove_authenticated_local_app_backup "$APP_BACKUP" \
+        "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
+        exit 1
+    fi
+    if [ "$LEGACY_LOCAL_APP_REMOVAL_STARTED" = "1" ] \
+       && ! remove_authenticated_local_app_backup "$LEGACY_LOCAL_APP_BACKUP" \
+            "com.trycua.driver.local" "cua-driver-local"; then
+        exit 1
+    fi
+    LOCAL_APP_SWAP_STARTED=0
+    LEGACY_LOCAL_APP_REMOVAL_STARTED=0
 fi
 
 # Agent skill pack symlinks: NOT auto-created. Run
@@ -635,7 +966,7 @@ if [ "$INSTALL_AUTOSTART" != true ]; then
     echo ""
     if [ "$OS" = "Darwin" ]; then
         echo "Auto-start (recommended on macOS): re-run with --autostart to register a LaunchAgent."
-        echo "  A launchd-started daemon is attributed to com.trycua.driver.local (not your terminal),"
+        echo "  A launchd-started daemon is attributed to com.meta.musecode.cua.driver.local (not your terminal),"
         echo "  so permission prompts say \"cua\" and grants stick — grant Accessibility +"
         echo "  Screen Recording once and every cua-driver-local call/mcp routes through it correctly."
         echo "  (Without it, a prompt raised from a terminal attributes to the terminal instead.)"

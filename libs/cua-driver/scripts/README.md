@@ -71,6 +71,28 @@ once. When the dedicated default keychain above exists, the installer prefers
 it automatically; exporting `CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN` remains the
 most explicit choice.
 
+Older installers imported this identity with an all-applications private-key
+ACL. The current installer no longer does that, but it cannot safely rewrite an
+existing key's ACL without the keychain password. Remove and recreate an older
+`CuaDriver Local Signing (cua-driver-rs)` identity in Keychain Access before
+using it for security-sensitive testing, then reset and re-grant the local
+bundle's TCC permissions.
+
+## Production macOS signing identity
+
+Production uses the Muse Code Apple Team ID `4W5TH4RKQ2`. The value is embedded
+into Computer History admission policy, and the install scripts require an
+Apple-anchored, notarized app with that team and the exact
+`com.meta.musecode.cua.driver` identity. `CUA_DRIVER_PRODUCTION_TEAM_ID` is an
+optional release/test assertion and is rejected if it differs from the pinned
+value; end users do not need to configure it.
+
+The one-time migration from `com.trycua.driver` defaults its old signer to
+`YCK386LBJ7`; a different reviewed legacy signer may be supplied through
+`CUA_DRIVER_LEGACY_TEAM_ID`. Migration stops before replacing the old app when
+encrypted Computer History is present. Purge that history with the verified old
+helper or use a separately reviewed key-migration tool before retrying.
+
 Released installers show a telemetry notice before asking the installed binary
 to record anything. Telemetry is enabled by default and can be persistently
 disabled with `cua-driver telemetry disable`. Installation events use the same
@@ -93,7 +115,7 @@ libs/cua-driver/scripts/uninstall-local.ps1
 
 The local uninstaller leaves `cua-driver`, `CuaDriver.app`, release services,
 release state, and release TCC grants untouched. On macOS it revokes only
-`com.trycua.driver.local`; pass `--keep-tcc` to retain that local grant.
+`com.meta.musecode.cua.driver.local`; pass `--keep-tcc` to retain that local grant.
 
 The release Unix uninstaller shuts down the release service before removing
 anything. It first requires the systemd/launchd supervisor to stop, then uses

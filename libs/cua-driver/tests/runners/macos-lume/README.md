@@ -31,7 +31,7 @@ that exact commit.
 - Put no repository credentials, signing secrets, or maintainer private SSH
   keys in the guest. A host public key is sufficient for source sync.
 - For reusable private seeds, request the app-owned Accessibility and Screen
-  Recording grants through `CuaDriverLocal.app`. For disposable SIP-off workers
+  Recording grants through `MuseCodeCuaDriverLocal.app`. For disposable SIP-off workers
   that are not cloned from a granted seed, use the checked-in `seed-tcc.sh`
   helper below. Do not hand-edit `TCC.db`.
 - Require a certificate-backed local signature. An ad-hoc signature invalidates
@@ -40,7 +40,7 @@ that exact commit.
 
 SIP-off alone does not grant Accessibility, Screen Recording, Automation, or
 direct-capture consent. The reusable private seed still carries grants approved
-through the normal `CuaDriverLocal.app` prompt flow. The helper below is only for
+through the normal `MuseCodeCuaDriverLocal.app` prompt flow. The helper below is only for
 disposable SIP-off workers that need the same app-owned Accessibility and Screen
 Recording grants without preserving a granted seed. The SIP-on check below proves
 the normal user-facing permission flow still works with platform protection.
@@ -202,7 +202,7 @@ for the life of the seed:
 ```bash
 security find-certificate \
   -c 'CuaDriver Local Signing (cua-driver-rs)' -Z "$SIGNING_KEYCHAIN"
-codesign -d -r- /Applications/CuaDriverLocal.app 2>&1 \
+codesign -d -r- /Applications/MuseCodeCuaDriverLocal.app 2>&1 \
   | grep 'certificate leaf'
 ```
 
@@ -227,8 +227,8 @@ osascript -e \
 ~/.local/bin/cua-driver-local permissions grant
 ```
 
-Choose Allow for `Terminal` -> `System Events` and on the CuaDriverLocal
-direct-capture prompt. CuaDriverLocal app enumeration must not ask for System
+Choose Allow for `Terminal` -> `System Events` and on the MuseCodeCuaDriverLocal
+direct-capture prompt. MuseCodeCuaDriverLocal app enumeration must not ask for System
 Events. Target-specific Automation prompts may still appear later when a user
 explicitly requests an Apple Events-backed browser or app operation; do not
 pre-grant those in the seed. These are normal macOS consent flows; do not edit
@@ -241,7 +241,7 @@ observes the new grant:
 
 ```bash
 ~/.local/bin/cua-driver-local stop
-open -a CuaDriverLocal
+open -a MuseCodeCuaDriverLocal
 ```
 
 Then verify the daemon's own identity and the read-only status contract before
@@ -265,9 +265,9 @@ the second is intentionally prompt-capable and must be run by the human:
   and .direct_capture_status == "not_checked"
   and .direct_capture_verification.source == "permissions_grant"
   and (.direct_capture_verification.verified_at | endswith("Z"))
-  and .direct_capture_verification.bundle_id == "com.trycua.driver.local"
+  and .direct_capture_verification.bundle_id == "com.meta.musecode.cua.driver.local"
 '
-codesign -d -r- /Applications/CuaDriverLocal.app 2>&1 | grep 'certificate leaf'
+codesign -d -r- /Applications/MuseCodeCuaDriverLocal.app 2>&1 | grep 'certificate leaf'
 csrutil status
 ```
 
@@ -278,7 +278,7 @@ All five commands must succeed, and `csrutil status` must report disabled.
 The public [Run Cua Driver in a macOS Lume VM](https://cua.ai/docs/how-to-guides/driver/run-in-macos-lume-vm)
 guide grants macOS consent through the VM display. Keep using that prompt flow
 for reusable private seeds. For automated disposable workers that are not cloned
-from a granted seed, run the host helper after `CuaDriverLocal.app` is installed
+from a granted seed, run the host helper after `MuseCodeCuaDriverLocal.app` is installed
 in each running worker with a certificate-backed identity:
 
 ```bash
@@ -297,16 +297,16 @@ Use the default `lume` SSH password, set `LUME_SSH_PASSWORD`, or pass
 empty when the VM accepts host SSH keys.
 The guest helper refuses to write unless `sysctl -n hw.model` reports a
 `VirtualMac*` VM and `csrutil status` reports disabled SIP. It derives the
-permission identity from `/Applications/CuaDriverLocal.app`, writes only the
+permission identity from `/Applications/MuseCodeCuaDriverLocal.app`, writes only the
 Accessibility and Screen Recording entries for that app, restarts `tccd`, and
 verifies both entries.
 
-After seeding, restart `CuaDriverLocal.app` before checking permission status if
+After seeding, restart `MuseCodeCuaDriverLocal.app` before checking permission status if
 `install-local --autostart` or an earlier probe may have started the daemon:
 
 ```bash
 ~/.local/bin/cua-driver-local stop
-open -a CuaDriverLocal
+open -a MuseCodeCuaDriverLocal
 ```
 
 If the VM sudo password is not the default `lume`, pass it without putting it
@@ -341,9 +341,9 @@ Lume version, CLT version, Rust version, Node version, and signing-certificate
 hash in the maintainer log. Also record that the following consent paths were
 granted and then rerun without prompts:
 
-- `CuaDriverLocal.app`: Accessibility and Screen Recording
+- `MuseCodeCuaDriverLocal.app`: Accessibility and Screen Recording
 - Terminal controlling System Events
-- CuaDriverLocal direct screen capture without the system picker. macOS labels
+- MuseCodeCuaDriverLocal direct screen capture without the system picker. macOS labels
   this combined consent as screen and system-audio access even though Cua
   Driver's current ScreenCaptureKit recorder does not enable audio capture.
 
@@ -573,8 +573,8 @@ golden image's inherited grants.
 4. In the VM display, reset only the disposable worker's grants:
 
    ```bash
-   tccutil reset Accessibility com.trycua.driver.local
-   tccutil reset ScreenCapture com.trycua.driver.local
+   tccutil reset Accessibility com.meta.musecode.cua.driver.local
+   tccutil reset ScreenCapture com.meta.musecode.cua.driver.local
    ~/.local/bin/cua-driver-local permissions grant
    ```
 

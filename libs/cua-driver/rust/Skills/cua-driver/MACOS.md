@@ -241,7 +241,7 @@ editor state.
      consent, although Cua Driver's current recorder does not enable audio.
      If the installed app is absent from **Screen & System Audio Recording**,
      the user should click **+**, add `/Applications/CuaDriver.app` (or
-     `/Applications/CuaDriverLocal.app`), enable it, and rerun the command.
+     `/Applications/MuseCodeCuaDriverLocal.app`), enable it, and rerun the command.
 
 ## Resolve target pid — always via `launch_app`
 

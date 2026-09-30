@@ -43,8 +43,9 @@
 #     - Skill symlinks under ~/.claude/skills/cua-driver(-rs), etc.
 #
 # Shared-path safety: /Applications/CuaDriver.app + its ~/.local/bin
-# symlink use the same bundle id (com.trycua.driver) as the Swift driver,
-# so they're only removed when an unambiguous Rust marker is on disk
+# symlink share the historical Swift install path but use the Muse Code bundle
+# id `com.meta.musecode.cua.driver`, so they're only removed when an
+# unambiguous Rust marker is on disk
 # (~/.cua-driver/packages/, legacy ~/.cua-driver-rs/, CuaDriverRs.app,
 # the LaunchAgent/systemd unit, or current Rust telemetry state).
 #
@@ -109,13 +110,151 @@ fi
 # ----------------------------------------------------------------------
 log() { printf '==> %s\n' "$*"; }
 
+RELEASE_BUNDLE_ID="com.meta.musecode.cua.driver"
+LEGACY_RELEASE_BUNDLE_ID="com.trycua.driver"
+LEGACY_RS_BUNDLE_ID="com.trycua.cuadriverrs"
+RELEASE_EXECUTABLE="cua-driver"
+PINNED_PRODUCTION_TEAM_ID="4W5TH4RKQ2"
+PRODUCTION_TEAM_ID="${CUA_DRIVER_PRODUCTION_TEAM_ID:-$PINNED_PRODUCTION_TEAM_ID}"
+LEGACY_PRODUCTION_TEAM_ID="${CUA_DRIVER_LEGACY_TEAM_ID:-YCK386LBJ7}"
+PLISTBUDDY="/usr/libexec/PlistBuddy"
+CODESIGN="/usr/bin/codesign"
+SPCTL="/usr/sbin/spctl"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+TCCUTIL="/usr/bin/tccutil"
+
+validate_apple_team_id() {
+    [[ "$1" =~ ^[A-Z0-9]{10}$ ]]
+}
+
+validate_release_home_dir() {
+    local home_dir="$1" user_home="$2" resolved_home resolved_dir
+    case "$home_dir" in
+        /*) ;;
+        *) printf 'error: CUA_DRIVER_HOME must be an absolute path\n' >&2; return 1 ;;
+    esac
+    case "$home_dir" in
+        /|"$user_home"|"$user_home"/|*/../*|*/..|*/./*|*/.)
+            printf 'error: refusing unsafe Cua Driver home: %s\n' "$home_dir" >&2
+            return 1
+            ;;
+    esac
+    [[ "$home_dir" != *$'\n'* && "$home_dir" != *$'\r'* ]] || {
+        printf 'error: refusing Cua Driver home containing a line break\n' >&2
+        return 1
+    }
+    resolved_home="$(CDPATH= cd -- "$user_home" 2>/dev/null && pwd -P)" || {
+        printf 'error: could not resolve HOME safely: %s\n' "$user_home" >&2
+        return 1
+    }
+    case "$home_dir" in
+        "$user_home"/*) ;;
+        *)
+            printf 'error: CUA_DRIVER_HOME must remain inside HOME (%s): %s\n' "$resolved_home" "$home_dir" >&2
+            return 1
+            ;;
+    esac
+    if [[ -e "$home_dir" || -L "$home_dir" ]]; then
+        [[ ! -L "$home_dir" && -d "$home_dir" ]] || {
+            printf 'error: refusing non-directory or symlink Cua Driver home: %s\n' "$home_dir" >&2
+            return 1
+        }
+        resolved_dir="$(CDPATH= cd -- "$home_dir" 2>/dev/null && pwd -P)" || {
+            printf 'error: could not resolve Cua Driver home safely: %s\n' "$home_dir" >&2
+            return 1
+        }
+        case "$resolved_dir" in
+            "$resolved_home"/*) ;;
+            *)
+                printf 'error: Cua Driver home resolves outside HOME: %s\n' "$resolved_dir" >&2
+                return 1
+                ;;
+        esac
+    fi
+}
+
+directory_has_entries() {
+    local directory="$1" entry
+    for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+        if [[ -e "$entry" || -L "$entry" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Return 0 only for a nonempty, ordinary history directory. Absence and an
+# empty directory return 1 so a later --purge can finish after the runtime was
+# already removed. Unsafe path types fail closed with status 2.
+history_state_present() {
+    local history_root="$1"
+    if [[ ! -e "$history_root" && ! -L "$history_root" ]]; then
+        return 1
+    fi
+    if [[ -L "$history_root" || ! -d "$history_root" ]]; then
+        printf 'history_purge_incomplete: refusing unsafe Computer History path %s\n' \
+            "$history_root" >&2
+        return 2
+    fi
+    directory_has_entries "$history_root"
+}
+
+macos_plist_value() {
+    local plistbuddy="$1" app_bundle="$2" key="$3"
+    [[ -x "$plistbuddy" ]] || return 1
+    "$plistbuddy" -c "Print :$key" "$app_bundle/Contents/Info.plist" 2>/dev/null
+}
+
+# Validate every immutable identity dimension before a helper at a shared app
+# path is executed or the app is removed. Signature integrity by itself is not
+# ownership: an attacker can ad-hoc sign an internally consistent replacement.
+macos_release_app_is_owned() {
+    local app_bundle="$1" expected_bundle_id="$2" expected_executable="$3"
+    local expected_team="$4" codesign_tool="$5" plistbuddy="$6" spctl_tool="$7"
+    local actual_bundle_id actual_executable details requirement executable_path spctl_output trust_requirement
+
+    validate_apple_team_id "$expected_team" || return 1
+    [[ -d "$app_bundle" && ! -L "$app_bundle" ]] || return 1
+    [[ -f "$app_bundle/Contents/Info.plist" && ! -L "$app_bundle/Contents/Info.plist" ]] || return 1
+    actual_bundle_id="$(macos_plist_value "$plistbuddy" "$app_bundle" CFBundleIdentifier || true)"
+    actual_executable="$(macos_plist_value "$plistbuddy" "$app_bundle" CFBundleExecutable || true)"
+    [[ "$actual_bundle_id" == "$expected_bundle_id" ]] || return 1
+    [[ "$actual_executable" == "$expected_executable" ]] || return 1
+    executable_path="$app_bundle/Contents/MacOS/$expected_executable"
+    [[ -f "$executable_path" && -x "$executable_path" && ! -L "$executable_path" ]] || return 1
+    [[ -x "$codesign_tool" ]] || return 1
+    "$codesign_tool" --verify --deep --strict "$app_bundle" >/dev/null 2>&1 || return 1
+    trust_requirement="anchor apple generic and identifier \"$expected_bundle_id\" and certificate leaf[subject.OU] = \"$expected_team\""
+    "$codesign_tool" --verify --deep --strict -R "=$trust_requirement" \
+        "$app_bundle" >/dev/null 2>&1 || return 1
+    details="$("$codesign_tool" -d --verbose=4 "$app_bundle" 2>&1)" || return 1
+    [[ "$(printf '%s\n' "$details" | sed -n 's/^Identifier=//p' | sed -n '1p')" == "$expected_bundle_id" ]] || return 1
+    [[ "$(printf '%s\n' "$details" | sed -n 's/^TeamIdentifier=//p' | sed -n '1p')" == "$expected_team" ]] || return 1
+    requirement="$("$codesign_tool" -d -r- "$app_bundle" 2>&1 \
+        | sed -n -e 's/^designated => //p' -e 's/^# designated => //p')" || return 1
+    [[ -n "$requirement" ]] || return 1
+    [[ "$requirement" == *"identifier \"$expected_bundle_id\""* ]] || return 1
+    [[ "$requirement" == *"anchor apple generic"* ]] || return 1
+    [[ "$requirement" == *"certificate leaf[subject.OU]"*"$expected_team"* ]] || return 1
+    [[ -x "$spctl_tool" ]] || return 1
+    spctl_output="$("$spctl_tool" --assess --type execute --verbose=4 "$app_bundle" 2>&1)" \
+        || return 1
+    [[ "$spctl_output" == *"source=Notarized Developer ID"* ]]
+}
+
 purge_macos_history() {
     local app_bundle="$1"
     local helper="$2"
     local rust_install_present="$3"
     local codesign_tool="$4"
-    if [[ "$rust_install_present" != "1" || ! -x "$helper" ]] \
-        || ! "$codesign_tool" --verify --deep --strict "$app_bundle" >/dev/null 2>&1; then
+    local plistbuddy="${5:-$PLISTBUDDY}"
+    local bundle_id="${6:-$RELEASE_BUNDLE_ID}"
+    local expected_team="${7:-$PRODUCTION_TEAM_ID}"
+    local spctl_tool="${8:-$SPCTL}"
+    local expected_helper="$app_bundle/Contents/MacOS/$RELEASE_EXECUTABLE"
+    if [[ "$rust_install_present" != "1" || "$helper" != "$expected_helper" ]] \
+        || ! macos_release_app_is_owned "$app_bundle" "$bundle_id" \
+            "$RELEASE_EXECUTABLE" "$expected_team" "$codesign_tool" "$plistbuddy" "$spctl_tool"; then
         printf 'history_purge_incomplete: installed signed Cua Driver helper unavailable; preserved history state for retry\n' >&2
         return 1
     fi
@@ -136,6 +275,35 @@ purge_linux_history() {
         printf 'history_purge_incomplete: exact-namespace Secret Service key destruction was not verified; preserved history state and runtime for retry\n' >&2
         return 1
     fi
+}
+
+purge_release_history_if_present() {
+    local history_root="$1" state_status=0 helper
+    history_state_present "$history_root" || state_status=$?
+    case "$state_status" in
+        0) ;;
+        1)
+            log "no encrypted release Computer History state to purge"
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+
+    case "$OS" in
+        Darwin)
+            helper="$APP_BUNDLE/Contents/MacOS/cua-driver"
+            purge_macos_history \
+                "$APP_BUNDLE" "$helper" "$RUST_INSTALL_PRESENT" \
+                "$CODESIGN" "$PLISTBUDDY" "$APP_BUNDLE_ID" \
+                "$APP_BUNDLE_TEAM_ID" "$SPCTL" || return 1
+            log "cryptographically purged release Computer History key and local history state"
+            ;;
+        Linux)
+            helper="$PACKAGES_DIR/current/cua-driver"
+            purge_linux_history "$helper" "$RUST_INSTALL_PRESENT" || return 1
+            log "cryptographically purged release Computer History Secret Service key and local history state"
+            ;;
+    esac
 }
 
 daemon_pid_file_path() {
@@ -195,14 +363,24 @@ daemon_wait_for_exit() {
 }
 
 daemon_process_identity() {
-    local pid="$1" identity=""
+    local pid="$1" identity="" lsof_tool="${CUA_DRIVER_LSOF:-/usr/sbin/lsof}"
     if [[ -L "/proc/$pid/exe" ]]; then
         identity="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
         identity="${identity% (deleted)}"
     fi
+    if [[ -z "$identity" && "$OS" == "Darwin" ]]; then
+        [[ -x "$lsof_tool" ]] || return 2
+        identity="$("$lsof_tool" -a -p "$pid" -d txt -Fn 2>/dev/null \
+            | sed -n 's/^n//p' | sed -n '1p')" || return 2
+        [[ -n "$identity" ]] || return 2
+    fi
     if [[ -z "$identity" ]]; then
         command -v ps >/dev/null 2>&1 || return 2
-        identity="$(ps -ww -o command= -p "$pid" 2>/dev/null)" || return 2
+        # `command=` starts with argv[0], which may be only `cua-driver` for a
+        # PATH launch and therefore loses the installed path. `comm=` is the
+        # kernel executable identity on macOS; /proc remains authoritative on
+        # Linux when available.
+        identity="$(ps -ww -o comm= -p "$pid" 2>/dev/null)" || return 2
     fi
     identity="${identity#"${identity%%[![:space:]]*}"}"
     identity="${identity%"${identity##*[![:space:]]}"}"
@@ -212,15 +390,23 @@ daemon_process_identity() {
 
 daemon_identity_matches_install() {
     case "$1" in
-        "$APP_BUNDLE"/Contents/MacOS/cua-driver|"$APP_BUNDLE"/Contents/MacOS/cua-driver[[:space:]]*|\
-        "$LEGACY_APP_BUNDLE"/Contents/MacOS/cua-driver|"$LEGACY_APP_BUNDLE"/Contents/MacOS/cua-driver[[:space:]]*|\
         "$USER_BIN_LINK"|"$USER_BIN_LINK"[[:space:]]*|\
         "$HOME_DIR"/packages/current/cua-driver|"$HOME_DIR"/packages/current/cua-driver[[:space:]]*|\
         "$HOME_DIR"/packages/releases/*/cua-driver|"$HOME_DIR"/packages/releases/*/cua-driver[[:space:]]*|\
         "$LEGACY_HOME_DIR"/packages/current/cua-driver|"$LEGACY_HOME_DIR"/packages/current/cua-driver[[:space:]]*|\
         "$LEGACY_HOME_DIR"/packages/releases/*/cua-driver|"$LEGACY_HOME_DIR"/packages/releases/*/cua-driver[[:space:]]*) return 0 ;;
-        *) return 1 ;;
     esac
+    if [[ "${APP_BUNDLE_OWNED:-0}" == "1" ]]; then
+        case "$1" in
+            "$APP_BUNDLE"/Contents/MacOS/cua-driver|"$APP_BUNDLE"/Contents/MacOS/cua-driver[[:space:]]*) return 0 ;;
+        esac
+    fi
+    if [[ "${LEGACY_APP_BUNDLE_OWNED:-0}" == "1" ]]; then
+        case "$1" in
+            "$LEGACY_APP_BUNDLE"/Contents/MacOS/cua-driver|"$LEGACY_APP_BUNDLE"/Contents/MacOS/cua-driver[[:space:]]*) return 0 ;;
+        esac
+    fi
+    return 1
 }
 
 daemon_pid_is_release() {
@@ -326,46 +512,57 @@ reject_root_invocation() {
 }
 
 # TCC revocation is on by default so uninstall leaves the next macOS install
-# in a clean promptable state. The bundle id com.trycua.driver is shared with
-# the retired Swift driver, so `--keep-tcc` remains available for users who
-# intentionally want grants to survive uninstall/reinstall.
-# When enabled, revoke Accessibility + Screen-Recording + Automation for
-# com.trycua.driver. macOS-only; no-op elsewhere.
+# in a clean promptable state. Keep the exact bundle registered until every
+# scoped reset succeeds, then explicitly unregister it from LaunchServices.
+# A failed registration, reset, or unregister preserves the app so cleanup is
+# retryable instead of leaving an unresolvable stale TCC row.
 maybe_reset_tcc() {
-    [[ "$RESET_TCC" == "1" ]] || return 0
+    local app_bundle="${1:-/Applications/CuaDriver.app}"
+    local bundle_id="${2:-$RELEASE_BUNDLE_ID}"
+    local failed_services="" service
     if [[ "$OS" != "Darwin" ]]; then
         log "TCC reset is macOS-only; nothing to revoke on $OS"
         return 0
     fi
-    if ! command -v tccutil >/dev/null 2>&1; then
-        log "TCC reset: tccutil not found; skipping"
-        return 0
+    [[ -d "$app_bundle" && ! -L "$app_bundle" ]] || {
+        printf 'error: cannot unregister missing or unsafe app bundle %s\n' "$app_bundle" >&2
+        return 1
+    }
+    [[ -x "$LSREGISTER" ]] || {
+        printf 'error: LaunchServices registration tool is unavailable; preserved %s\n' "$app_bundle" >&2
+        return 1
+    }
+    if ! "$LSREGISTER" -f "$app_bundle" >/dev/null 2>&1; then
+        printf 'error: could not register %s before permission cleanup; the app was preserved\n' "$app_bundle" >&2
+        return 1
     fi
-    # `tccutil reset <svc> com.trycua.driver` resolves the bundle id through
-    # LaunchServices. If the bundle isn't registered — or this runs AFTER the
-    # app was removed — tccutil fails with -10814 and the grant silently
-    # survives. This MUST run while /Applications/CuaDriver.app still exists;
-    # force a synchronous LaunchServices registration first so a present-but-
-    # not-yet-registered bundle (fresh install race) still resolves.
-    local app_bundle="/Applications/CuaDriver.app"
-    if [[ -d "$app_bundle" ]]; then
-        local lsregister="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
-        if [[ -x "$lsregister" ]]; then
-            "$lsregister" -f "$app_bundle" >/dev/null 2>&1 || true
+
+    if [[ "$RESET_TCC" == "1" ]]; then
+        if [[ ! -x "$TCCUTIL" ]]; then
+            printf 'error: tccutil is required to revoke permissions for %s; the app was preserved\n' "$bundle_id" >&2
+            return 1
+        fi
+        log "revoking TCC grants for $bundle_id"
+        for service in Accessibility ScreenCapture AppleEvents; do
+            if "$TCCUTIL" reset "$service" "$bundle_id" >/dev/null 2>&1; then
+                log "  reset $service"
+            else
+                failed_services="$failed_services $service"
+            fi
+        done
+        if [[ -n "$failed_services" ]]; then
+            printf 'error: could not reset these TCC services for %s:%s; the app was preserved\n' \
+                "$bundle_id" "$failed_services" >&2
+            return 1
         fi
     else
-        log "  warning: CuaDriver.app already removed; TCC reset may not resolve the bundle id"
+        log "preserving TCC grants for $bundle_id (--keep-tcc)"
     fi
-    log "revoking TCC grants for com.trycua.driver"
-    log "  note: com.trycua.driver is shared with the retired Swift driver;"
-    log "  this clears grants for both. Pass --keep-tcc to preserve them."
-    for SVC in Accessibility ScreenCapture AppleEvents; do
-        if tccutil reset "$SVC" com.trycua.driver >/dev/null 2>&1; then
-            log "  reset $SVC"
-        else
-            log "  $SVC: nothing to reset (or reset failed)"
-        fi
-    done
+
+    if ! "$LSREGISTER" -u "$app_bundle" >/dev/null 2>&1; then
+        printf 'error: could not unregister %s from LaunchServices; the app was preserved\n' "$app_bundle" >&2
+        return 1
+    fi
 }
 
 # Resolve a symlink target to an absolute path. realpath -e fails when
@@ -400,7 +597,16 @@ select_daemon_stop_helper() {
         resolved="$(realpath "$candidate" 2>/dev/null || true)"
         [[ -n "$resolved" ]] || resolved="$candidate"
         case "$resolved" in
-            "$APP_BUNDLE/Contents/MacOS/cua-driver"|"$LEGACY_APP_BUNDLE/Contents/MacOS/cua-driver"|\
+            "$APP_BUNDLE/Contents/MacOS/cua-driver")
+                [[ "${APP_BUNDLE_OWNED:-0}" == "1" ]] || continue
+                printf '%s' "$resolved"
+                return 0
+                ;;
+            "$LEGACY_APP_BUNDLE/Contents/MacOS/cua-driver")
+                [[ "${LEGACY_APP_BUNDLE_OWNED:-0}" == "1" ]] || continue
+                printf '%s' "$resolved"
+                return 0
+                ;;
             "$HOME_DIR"/packages/releases/*/cua-driver|"$LEGACY_HOME_DIR"/packages/releases/*/cua-driver)
                 printf '%s' "$resolved"
                 return 0
@@ -472,9 +678,8 @@ fi
 # ----------------------------------------------------------------------
 if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     USER_BIN_LINK="$HOME/.local/bin/cua-driver"
-    # Canonical bundle path (post-rename — shares bundle id
-    # `com.trycua.driver` with the Swift driver). The Rust install
-    # replaces Swift here; both uninstallers target this path.
+    # Canonical bundle path. The Rust install replaces the retired Swift app at
+    # this path, but uses the new `com.meta.musecode.cua.driver` bundle ID.
     APP_BUNDLE="/Applications/CuaDriver.app"
     # Legacy bundle path from earlier Rust releases that coexisted with
     # Swift under a separate name. Cleaned up if found.
@@ -485,10 +690,16 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     # current install left nothing matching and the whole uninstall no-op'd.
     HOME_DIR="${CUA_DRIVER_HOME:-${CUA_DRIVER_RS_HOME:-$HOME/.cua-driver}}"
     LEGACY_HOME_DIR="$HOME/.cua-driver-rs"
+    if ! validate_release_home_dir "$HOME_DIR" "$HOME"; then
+        exit 2
+    fi
+    if ! validate_release_home_dir "$LEGACY_HOME_DIR" "$HOME"; then
+        exit 2
+    fi
     # The versioned package store (`packages/releases/*` + `current`) is
     # written only by the Rust install-local / self-updater path — it's the
-    # one unambiguous on-disk Rust discriminator now that the .app bundle +
-    # bundle id are shared with Swift.
+    # one unambiguous on-disk Rust discriminator now that the .app path is
+    # shared with the retired Swift driver.
     PACKAGES_DIR="$HOME_DIR/packages"
     LAUNCHAGENT_PLIST="$HOME/Library/LaunchAgents/com.trycua.cua-driver.plist"
     LEGACY_LAUNCHAGENT_PLIST="$HOME/Library/LaunchAgents/com.trycua.cua-driver-rs.plist"
@@ -501,8 +712,8 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     LEGACY_SKILL_PACK_NAME="cua-driver-rs"
 
     # Rust-install marker. The Rust bundle path `/Applications/CuaDriver.app`
-    # is shared with the Swift driver (same bundle id `com.trycua.driver`),
-    # so we can't use that path alone as a discriminator — a Swift-only Mac
+    # is shared with the retired Swift driver's install path, so we can't use
+    # that path alone as a discriminator — a Swift-only Mac
     # that runs `uninstall.sh --backend=rust` by mistake would lose its
     # Swift bundle, symlink, and Claude MCP registrations. This marker says
     # "there's at least one unambiguously-Rust artifact on disk." We gate
@@ -516,8 +727,60 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     #     (autostart was used)
     #   - current telemetry identity/registration marker exists (release
     #     installs on macOS live in /Applications and have no packages dir)
+    APP_BUNDLE_OWNED=0
+    APP_BUNDLE_ID=""
+    APP_BUNDLE_TEAM_ID=""
+    LEGACY_APP_BUNDLE_OWNED=0
+    if [[ "$OS" == "Darwin" && "$PRODUCTION_TEAM_ID" != "$PINNED_PRODUCTION_TEAM_ID" ]]; then
+        printf 'error: CUA_DRIVER_PRODUCTION_TEAM_ID does not match the pinned Muse Code production Team ID\n' >&2
+        exit 1
+    fi
+    if [[ "$OS" == "Darwin" && ( -e "$APP_BUNDLE" || -L "$APP_BUNDLE" ) ]]; then
+        APP_BUNDLE_ID="$(macos_plist_value "$PLISTBUDDY" "$APP_BUNDLE" CFBundleIdentifier || true)"
+        case "$APP_BUNDLE_ID" in
+            "$RELEASE_BUNDLE_ID")
+                if ! validate_apple_team_id "$PRODUCTION_TEAM_ID"; then
+                    printf 'error: CUA_DRIVER_PRODUCTION_TEAM_ID must be the approved 10-character Apple Team ID before uninstalling %s\n' "$APP_BUNDLE" >&2
+                    exit 1
+                fi
+                APP_BUNDLE_TEAM_ID="$PRODUCTION_TEAM_ID"
+                ;;
+            "$LEGACY_RELEASE_BUNDLE_ID")
+                if ! validate_apple_team_id "$LEGACY_PRODUCTION_TEAM_ID"; then
+                    printf 'error: CUA_DRIVER_LEGACY_TEAM_ID must be a 10-character Apple Team ID before uninstalling %s\n' "$APP_BUNDLE" >&2
+                    exit 1
+                fi
+                APP_BUNDLE_TEAM_ID="$LEGACY_PRODUCTION_TEAM_ID"
+                ;;
+            *)
+                printf 'error: refusing to execute or remove unverified app at shared path %s\n' "$APP_BUNDLE" >&2
+                exit 1
+                ;;
+        esac
+        if macos_release_app_is_owned "$APP_BUNDLE" "$APP_BUNDLE_ID" \
+            "$RELEASE_EXECUTABLE" "$APP_BUNDLE_TEAM_ID" "$CODESIGN" "$PLISTBUDDY" "$SPCTL"; then
+            APP_BUNDLE_OWNED=1
+        else
+            printf 'error: refusing to execute or remove app with an unverified signer at shared path %s\n' "$APP_BUNDLE" >&2
+            exit 1
+        fi
+    fi
+    if [[ "$OS" == "Darwin" && ( -e "$LEGACY_APP_BUNDLE" || -L "$LEGACY_APP_BUNDLE" ) ]]; then
+        if ! validate_apple_team_id "$LEGACY_PRODUCTION_TEAM_ID"; then
+            printf 'error: CUA_DRIVER_LEGACY_TEAM_ID must be a 10-character Apple Team ID before uninstalling %s\n' "$LEGACY_APP_BUNDLE" >&2
+            exit 1
+        fi
+        if macos_release_app_is_owned "$LEGACY_APP_BUNDLE" "$LEGACY_RS_BUNDLE_ID" \
+            "$RELEASE_EXECUTABLE" "$LEGACY_PRODUCTION_TEAM_ID" "$CODESIGN" "$PLISTBUDDY" "$SPCTL"; then
+            LEGACY_APP_BUNDLE_OWNED=1
+        else
+            printf 'error: refusing to execute or remove unverified legacy app %s\n' "$LEGACY_APP_BUNDLE" >&2
+            exit 1
+        fi
+    fi
+
     RUST_INSTALL_PRESENT=0
-    if [[ -d "$PACKAGES_DIR" || -d "$LEGACY_HOME_DIR" || -d "$LEGACY_APP_BUNDLE" || -f "$LAUNCHAGENT_PLIST" || -f "$LEGACY_LAUNCHAGENT_PLIST" || -f "$SYSTEMD_USER_UNIT" || -f "$LEGACY_SYSTEMD_USER_UNIT" || -f "$HOME_DIR/.telemetry_id" || -f "$HOME_DIR/.installation_recorded" ]]; then
+    if [[ -d "$PACKAGES_DIR" || -d "$LEGACY_HOME_DIR" || "$APP_BUNDLE_OWNED" == "1" || "$LEGACY_APP_BUNDLE_OWNED" == "1" || -f "$LAUNCHAGENT_PLIST" || -f "$LEGACY_LAUNCHAGENT_PLIST" || -f "$SYSTEMD_USER_UNIT" || -f "$LEGACY_SYSTEMD_USER_UNIT" || -f "$HOME_DIR/.telemetry_id" || -f "$HOME_DIR/.installation_recorded" ]]; then
         RUST_INSTALL_PRESENT=1
     fi
 
@@ -536,6 +799,33 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
         log "verified no running release cua-driver daemon"
     else
         log "no Rust install marker; leaving any running cua-driver process untouched"
+    fi
+
+    MACOS_HISTORY_ROOT="$HOME/Library/Application Support/cua-driver/computer-history"
+    case "$OS" in
+        Darwin) HISTORY_ROOT="$MACOS_HISTORY_ROOT" ;;
+        Linux) HISTORY_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cua-driver/computer-history" ;;
+        *) HISTORY_ROOT="" ;;
+    esac
+    HISTORY_STATE_PRESENT=0
+    if [[ -n "$HISTORY_ROOT" ]]; then
+        _history_state_status=0
+        history_state_present "$HISTORY_ROOT" || _history_state_status=$?
+        case "$_history_state_status" in
+            0) HISTORY_STATE_PRESENT=1 ;;
+            1) ;;
+            *) exit 1 ;;
+        esac
+        unset _history_state_status
+    fi
+    if [[ "$OS" == "Darwin" && "$PURGE_DATA" == "0" \
+       && -d "$MACOS_HISTORY_ROOT" ]] \
+       && directory_has_entries "$MACOS_HISTORY_ROOT" \
+       && [[ "$APP_BUNDLE_ID" == "$LEGACY_RELEASE_BUNDLE_ID" \
+          || "$LEGACY_APP_BUNDLE_OWNED" == "1" ]]; then
+        printf 'error: refusing to remove the legacy Cua Driver identity while encrypted Computer History remains\n' >&2
+        printf 'to preserve it, keep the authenticated legacy app; to destroy it safely, rerun with --purge\n' >&2
+        exit 1
     fi
 
     # --- CLI symlink ---
@@ -578,61 +868,79 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     # executable still exists. The helper uses the production KeyProvider and
     # its own bundle-derived namespace, then takes the exclusive writer lease;
     # failure leaves the runtime and all retryable history state in place.
-    if [[ "$OS" == "Darwin" && "$PURGE_DATA" == "1" ]]; then
-        HISTORY_PURGE_HELPER="$APP_BUNDLE/Contents/MacOS/cua-driver"
-        if ! purge_macos_history \
-            "$APP_BUNDLE" "$HISTORY_PURGE_HELPER" "$RUST_INSTALL_PRESENT" /usr/bin/codesign; then
+    if [[ "$PURGE_DATA" == "1" && ( "$OS" == "Darwin" || "$OS" == "Linux" ) ]]; then
+        if ! purge_release_history_if_present "$HISTORY_ROOT"; then
             exit 1
         fi
-        log "cryptographically purged release Computer History key and local history state"
     elif [[ "$OS" == "Darwin" ]]; then
-        log "preserved encrypted Computer History if present; reinstall to reopen it or run uninstall.sh --purge to destroy it"
-    elif [[ "$OS" == "Linux" && "$PURGE_DATA" == "1" ]]; then
-        HISTORY_PURGE_HELPER="$PACKAGES_DIR/current/cua-driver"
-        if ! purge_linux_history "$HISTORY_PURGE_HELPER" "$RUST_INSTALL_PRESENT"; then
-            exit 1
-        fi
-        log "cryptographically purged release Computer History Secret Service key and local history state"
+        log "preserved encrypted Computer History if present; reinstall the same signed identity to reopen it or restore its purge helper"
     elif [[ "$OS" == "Linux" ]]; then
-        log "preserved encrypted Computer History if present; reinstall to reopen it or run uninstall.sh --purge to destroy it"
+        log "preserved encrypted Computer History if present; reinstall the same release to reopen it or restore its purge helper"
     fi
 
-    # --- Revoke TCC grants BEFORE removing the app ---
-    # tccutil resolves com.trycua.driver through LaunchServices, so the reset
-    # only works while /Applications/CuaDriver.app is still installed. Running
-    # it here (not at the closing message) is what makes the revoke actually
-    # take — otherwise it fails with -10814 and the grant silently survives.
-    maybe_reset_tcc
+    # --- Revoke TCC grants and unregister BEFORE removing each app ---
+    # Use the identity actually verified above. This also clears the retired
+    # com.trycua.driver rows when uninstalling a pre-migration canonical app.
+    if [[ "$OS" == "Darwin" && "$APP_BUNDLE_OWNED" == "1" ]]; then
+        if ! maybe_reset_tcc "$APP_BUNDLE" "$APP_BUNDLE_ID"; then
+            log "permission or LaunchServices cleanup failed; preserved $APP_BUNDLE"
+            exit 1
+        fi
+    fi
+    if [[ "$OS" == "Darwin" && "$LEGACY_APP_BUNDLE_OWNED" == "1" ]]; then
+        if ! maybe_reset_tcc "$LEGACY_APP_BUNDLE" "$LEGACY_RS_BUNDLE_ID"; then
+            log "permission or LaunchServices cleanup failed; preserved $LEGACY_APP_BUNDLE"
+            exit 1
+        fi
+    fi
 
     # --- .app bundle (macOS only) ---
     # Legacy /Applications/CuaDriverRs.app is unambiguously Rust and
     # always removed when present. /Applications/CuaDriver.app is the
     # current canonical Rust path BUT also where the Swift driver
-    # lives (same bundle id `com.trycua.driver`), so we only remove
+    # lived (with legacy bundle id `com.trycua.driver`), so we only remove
     # it when $RUST_INSTALL_PRESENT — protects a Swift-only Mac from
     # losing its bundle if `uninstall.sh --experimental-rust` is run
     # by mistake.
     if [[ "$OS" == "Darwin" ]]; then
         if [[ -d "$LEGACY_APP_BUNDLE" ]]; then
-            SUDO=""
-            if [[ ! -w "$(dirname "$LEGACY_APP_BUNDLE")" ]]; then
-                SUDO="sudo"
+            if [[ "$LEGACY_APP_BUNDLE_OWNED" == "1" ]]; then
+                if ! macos_release_app_is_owned "$LEGACY_APP_BUNDLE" \
+                    "$LEGACY_RS_BUNDLE_ID" "$RELEASE_EXECUTABLE" \
+                    "$LEGACY_PRODUCTION_TEAM_ID" "$CODESIGN" "$PLISTBUDDY" "$SPCTL"; then
+                    printf 'error: legacy app identity changed during cleanup; preserved %s\n' \
+                        "$LEGACY_APP_BUNDLE" >&2
+                    exit 1
+                fi
+                SUDO=""
+                if [[ ! -w "$(dirname "$LEGACY_APP_BUNDLE")" ]]; then
+                    SUDO="sudo"
+                fi
+                $SUDO rm -rf -- "$LEGACY_APP_BUNDLE"
+                log "removed $LEGACY_APP_BUNDLE"
+            else
+                log "$LEGACY_APP_BUNDLE was not verified as a Cua Driver release; preserving it"
             fi
-            $SUDO rm -rf "$LEGACY_APP_BUNDLE"
-            log "removed $LEGACY_APP_BUNDLE"
         else
             log "no app bundle at $LEGACY_APP_BUNDLE (skipping)"
         fi
         if [[ -d "$APP_BUNDLE" ]]; then
-            if [[ "$RUST_INSTALL_PRESENT" == "1" ]]; then
+            if [[ "$APP_BUNDLE_OWNED" == "1" ]]; then
+                if ! macos_release_app_is_owned "$APP_BUNDLE" \
+                    "$APP_BUNDLE_ID" "$RELEASE_EXECUTABLE" \
+                    "$APP_BUNDLE_TEAM_ID" "$CODESIGN" "$PLISTBUDDY" "$SPCTL"; then
+                    printf 'error: app identity changed during cleanup; preserved %s\n' \
+                        "$APP_BUNDLE" >&2
+                    exit 1
+                fi
                 SUDO=""
                 if [[ ! -w "$(dirname "$APP_BUNDLE")" ]]; then
                     SUDO="sudo"
                 fi
-                $SUDO rm -rf "$APP_BUNDLE"
+                $SUDO rm -rf -- "$APP_BUNDLE"
                 log "removed $APP_BUNDLE"
             else
-                log "$APP_BUNDLE exists but no Rust marker on disk (~/.cua-driver/packages/, ~/.cua-driver-rs/, CuaDriverRs.app, current/legacy LaunchAgent or systemd unit); leaving it (looks like a Swift-only install)"
+                log "$APP_BUNDLE was not verified as a Cua Driver release; preserving it"
             fi
         else
             log "no app bundle at $APP_BUNDLE (skipping)"
@@ -649,8 +957,30 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     if [[ -d "$HOME_DIR" ]]; then
         if [[ "$RUST_INSTALL_PRESENT" == "1" || "$PURGE_DATA" == "1" ]]; then
             if [[ "$PURGE_DATA" == "1" ]]; then
-                rm -rf "$HOME_DIR"
-                log "purged $HOME_DIR (including telemetry identity and preference)"
+                # Never recursively remove an override root. Delete only
+                # installer-owned children, then remove the directory itself
+                # only when it is empty. This makes a mistaken broad override
+                # non-destructive even when --purge was explicitly requested.
+                rm -rf -- "$HOME_DIR/packages" "$HOME_DIR/skills"
+                rm -f -- \
+                    "$HOME_DIR/.installation_recorded" \
+                    "$HOME_DIR/.telemetry_enabled" \
+                    "$HOME_DIR/.telemetry_id" \
+                    "$HOME_DIR/.telemetry_identity.lock" \
+                    "$HOME_DIR/.telemetry_install_channel" \
+                    "$HOME_DIR/.telemetry_lifecycle.lock" \
+                    "$HOME_DIR/.telemetry_retry_after" \
+                    "$HOME_DIR/.tcc-signing-identity" \
+                    "$HOME_DIR/config.json" \
+                    "$HOME_DIR/release-channel" \
+                    "$HOME_DIR/serve.out.log" \
+                    "$HOME_DIR/serve.err.log" \
+                    "$HOME_DIR/version_check.json"
+                if rmdir "$HOME_DIR" 2>/dev/null; then
+                    log "purged empty package home $HOME_DIR"
+                else
+                    log "purged Cua Driver state from $HOME_DIR; preserved unrelated files"
+                fi
             else
                 # Remove only installer/runtime-owned payloads. Unknown files
                 # and all telemetry state remain untouched.
@@ -673,8 +1003,26 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     # ~/.cua-driver on reinstall.
     if [[ -d "$LEGACY_HOME_DIR" ]]; then
         if [[ "$PURGE_DATA" == "1" ]]; then
-            rm -rf "$LEGACY_HOME_DIR"
-            log "purged legacy package home $LEGACY_HOME_DIR"
+            rm -rf -- "$LEGACY_HOME_DIR/packages" "$LEGACY_HOME_DIR/skills"
+            rm -f -- \
+                "$LEGACY_HOME_DIR/.installation_recorded" \
+                "$LEGACY_HOME_DIR/.telemetry_enabled" \
+                "$LEGACY_HOME_DIR/.telemetry_id" \
+                "$LEGACY_HOME_DIR/.telemetry_identity.lock" \
+                "$LEGACY_HOME_DIR/.telemetry_install_channel" \
+                "$LEGACY_HOME_DIR/.telemetry_lifecycle.lock" \
+                "$LEGACY_HOME_DIR/.telemetry_retry_after" \
+                "$LEGACY_HOME_DIR/.tcc-signing-identity" \
+                "$LEGACY_HOME_DIR/config.json" \
+                "$LEGACY_HOME_DIR/release-channel" \
+                "$LEGACY_HOME_DIR/serve.out.log" \
+                "$LEGACY_HOME_DIR/serve.err.log" \
+                "$LEGACY_HOME_DIR/version_check.json"
+            if rmdir "$LEGACY_HOME_DIR" 2>/dev/null; then
+                log "purged empty legacy package home $LEGACY_HOME_DIR"
+            else
+                log "purged legacy Cua Driver state; preserved unrelated files in $LEGACY_HOME_DIR"
+            fi
         else
             rm -rf "$LEGACY_HOME_DIR/packages" "$LEGACY_HOME_DIR/skills"
             rm -f \
@@ -686,12 +1034,12 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     fi
 
     # --- Swift-era macOS data dirs (leave nothing behind) ---
-    # The .app bundle + bundle id are shared with the retired Swift driver,
-    # so a default (Rust) uninstall already removes the shared bundle. Sweep
+    # The .app path is shared with the retired Swift driver, so a default
+    # (Rust) uninstall already removes the app at that path. Sweep
     # the two Swift-only support/cache dirs here too so one `uninstall.sh`
     # leaves nothing behind regardless of which backend originally installed
-    # — no second `--backend=swift` pass needed. Gated on the Rust marker
-    # for the same reason the shared bundle is: a Swift-only Mac that runs
+    # -- no second `--backend=swift` pass needed. Gated on the Rust marker
+    # for the same reason the shared path is: a Swift-only Mac that runs
     # the default uninstall by mistake keeps its data.
     if [[ "$OS" == "Darwin" && "$RUST_INSTALL_PRESENT" == "1" ]]; then
         for SWIFT_DATA_DIR in \
@@ -876,10 +1224,18 @@ PY
         echo ""
         echo "cua-driver uninstalled."
         if [[ "$PURGE_DATA" == "0" ]]; then
+            if [[ "$HISTORY_STATE_PRESENT" == "1" ]]; then
+                cat << 'HISTORYUNMSG'
+
+Encrypted Computer History was preserved. To destroy it later, first reinstall
+the same signed Cua Driver identity, then run uninstall.sh --purge while that
+verified helper is still installed.
+HISTORYUNMSG
+            fi
             cat << 'TELEMETRYUNMSG'
 
 Telemetry identity and preference were preserved for a future reinstall.
-To delete them too, re-run with --purge:
+If no encrypted Computer History remains, delete telemetry later with:
 
   /bin/bash -c "$(curl -fsSL https://cua.ai/driver/uninstall.sh)" -- --purge
 TELEMETRYUNMSG
@@ -891,8 +1247,8 @@ TCC grants (Accessibility + Screen Recording) remain in System
 Settings > Privacy & Security because uninstall was run with --keep-tcc.
 Reset them explicitly if you want a clean re-install flow:
 
-  tccutil reset Accessibility com.trycua.driver
-  tccutil reset ScreenCapture com.trycua.driver
+  tccutil reset Accessibility com.meta.musecode.cua.driver
+  tccutil reset ScreenCapture com.meta.musecode.cua.driver
 FINALUNMSG
         fi
     else
@@ -1130,7 +1486,7 @@ TCC grants (Accessibility + Screen Recording) remain in System
 Settings > Privacy & Security because uninstall was run with --keep-tcc.
 Reset them explicitly if you want a clean re-install flow:
 
-  tccutil reset Accessibility com.trycua.driver
-  tccutil reset ScreenCapture com.trycua.driver
+  tccutil reset Accessibility com.meta.musecode.cua.driver
+  tccutil reset ScreenCapture com.meta.musecode.cua.driver
 FINALUNMSG
 fi

@@ -34,7 +34,7 @@ pub const MACOS_CHECK_NAMES: &[&str] = &[
 /// The canonical bundle identifier whose TCC grants matter for the
 /// daemon. The `bundle_identity` check passes when the running process
 /// reports this id.
-pub const CANONICAL_BUNDLE_ID: &str = "com.trycua.driver";
+pub const CANONICAL_BUNDLE_ID: &str = "com.meta.musecode.cua.driver";
 
 pub struct MacosHealthProvider;
 
@@ -220,7 +220,7 @@ fn check_tcc_accessibility() -> CheckEntry {
         NAME_TCC_ACCESSIBILITY,
         "Accessibility is NOT granted for this process.",
         "Grant Accessibility to CuaDriver.app in System Settings → Privacy & Security → \
-         Accessibility. If the process bundle is not com.trycua.driver (see bundle_identity), \
+         Accessibility. If the process bundle is not com.meta.musecode.cua.driver (see bundle_identity), \
          the grant must target the responsible app — restart via `cua-driver mcp` to relaunch \
          inside CuaDriver.app.",
     )
@@ -422,7 +422,7 @@ mod tests {
         let embedded = swap_env(cua_driver_core::EMBEDDED_ENV, None);
 
         // The Rust test binary runs outside CuaDriver.app, so its
-        // bundle id is either absent or not com.trycua.driver. Either
+        // bundle id is either absent or not com.meta.musecode.cua.driver. Either
         // way the documented fail-mode shape applies: message + hint
         // + data + (when bid is present) bundle_identifier surfaced.
         //

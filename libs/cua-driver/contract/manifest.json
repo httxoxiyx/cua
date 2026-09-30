@@ -806,7 +806,7 @@
     },
     {
       "name": "get_agent_cursor_state",
-      "description": "Return the session cursor's theme, semantic playback, position, visibility, and motion.",
+      "description": "Return the session cursor's theme, semantic playback, last logical target position, visibility, and motion.",
       "platforms": [
         "macos",
         "windows",

@@ -487,7 +487,14 @@ reads it back before enabling capture, maps locked/corrupt/unavailable failures
 to fixed categories, zeroizes key bytes, and verifies absence after deletion.
 There is no file-key or environment-key fallback.
 
-Release builds use the macOS Data Protection Keychain and a signing-team-qualified access group tied to `com.trycua.driver`. Apple's [Data Protection Keychain guidance](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains) and [provisioning-profile guidance](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles) make the embedded Developer ID provisioning profile part of this boundary: it must authorize the exact restricted access-group entitlement carried by the packaged executable. `history enable` verifies those signed entitlements before admitting the installed preview. A build that cannot access its item returns a fixed key-unavailable, key-locked, or key-corrupt category, keeps capture disabled, and never creates a replacement key over an existing stream. Ad-hoc local-development builds cannot use that release access group, so their separate `cua-driver-local` namespace uses a non-synchronizing login-Keychain item. It remains encrypted and has no plaintext fallback, but it does not claim the release build's `ThisDeviceOnly` Data Protection class.
+Release builds use the macOS Data Protection Keychain and a signing-team-qualified access group tied to `com.meta.musecode.cua.driver`. Apple's [Data Protection Keychain guidance](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains) and [provisioning-profile guidance](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles) make the embedded Developer ID provisioning profile part of this boundary: it must authorize the exact restricted access-group entitlement carried by the packaged executable. `history enable` verifies those signed entitlements before admitting the installed preview. A build that cannot access its item returns a fixed key-unavailable, key-locked, or key-corrupt category, keeps capture disabled, and never creates a replacement key over an existing stream. Ad-hoc local-development builds cannot use that release access group, so their separate `cua-driver-local` namespace uses a non-synchronizing login-Keychain item. It remains encrypted and has no plaintext fallback, but it does not claim the release build's `ThisDeviceOnly` Data Protection class.
+
+Changing the production bundle ID or Apple Team ID also changes the Keychain
+access group. An installer must therefore migrate or explicitly purge existing
+history with the verified old helper before replacing that identity. The new
+runtime reads existing chunks before creating a namespace key and fails with
+`history_key_unavailable` when the old key is inaccessible; it never creates a
+replacement key over ciphertext from the prior access group.
 
 ### Preview 0 encryption format
 

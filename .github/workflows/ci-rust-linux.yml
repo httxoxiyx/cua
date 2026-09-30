@@ -6,6 +6,7 @@ on:
       - "libs/cua-driver/rust/.cargo/**"
       - "libs/cua-driver/rust/Cargo.toml"
       - "libs/cua-driver/rust/Cargo.lock"
+      - "libs/cua-driver/rust/crates/computer-use-mcp-bootstrap/**"
       - "libs/cua-driver/rust/crates/cua-driver/**"
       - "libs/cua-driver/rust/crates/cua-driver-contract/**"
       - "libs/cua-driver/rust/crates/cua-driver-core/**"
@@ -25,6 +26,7 @@ on:
       - "libs/cua-driver/rust/.cargo/**"
       - "libs/cua-driver/rust/Cargo.toml"
       - "libs/cua-driver/rust/Cargo.lock"
+      - "libs/cua-driver/rust/crates/computer-use-mcp-bootstrap/**"
       - "libs/cua-driver/rust/crates/cua-driver/**"
       - "libs/cua-driver/rust/crates/cua-driver-contract/**"
       - "libs/cua-driver/rust/crates/cua-driver-core/**"
@@ -67,7 +69,7 @@ jobs:
             imagemagick xvfb xauth x11-utils
       - name: Run Linux Rust tests
         working-directory: libs/cua-driver/rust
-        run: cargo test -p cua-driver -p cua-driver-contract -p cua-driver-core -p cua-driver-testkit -p cursor-overlay -p cursor-theme-cli -p platform-linux --all-targets --locked
+        run: cargo test -p computer-use-mcp-bootstrap -p cua-driver -p cua-driver-contract -p cua-driver-core -p cua-driver-testkit -p cursor-overlay -p cursor-theme-cli -p platform-linux --all-targets --locked
       - name: Run X11 overlay click-through regression
         working-directory: libs/cua-driver/rust
         run: |

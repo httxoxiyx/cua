@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/computer-use-mcp-bootstrap",
     "crates/cua-driver",
     "crates/cua-driver-contract",
     "crates/cua-driver-sdk",

@@ -55,6 +55,9 @@ const CHUNK_ROTATION_INTERVAL: Duration = Duration::from_secs(55 * 60);
 const WRITER_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 const ROOT_MARKER_NAME: &str = ".cua-history-root-v1";
 const ROOT_MARKER_CONTENT: &[u8] = b"cua-history-root-v1\n";
+const PURGED_ROOT_MARKER_NAME: &str = ".cua-history-purged-v1";
+const PURGED_ROOT_MARKER_CONTENT: &[u8] = b"cua-history-purged-v1\n";
+const PURGED_ROOT_MARKER_TEMP_NAME: &str = ".cua-history-purged-v1.tmp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,8 +136,12 @@ pub fn purge_offline(
     namespace: &str,
     key_provider: &dyn KeyProvider,
 ) -> Result<OfflinePurgeResult, HistoryError> {
+    if let Some(result) = resume_completed_offline_purge(root)? {
+        return Ok(result);
+    }
+    recover_interrupted_purge_marker(root)?;
     prepare_history_root(root)?;
-    let _writer_lease = WriterLease::acquire(root)?;
+    let writer_lease = WriterLease::acquire(root)?;
     let references = key_provider.references(namespace)?;
     for reference in &references {
         key_provider.destroy(namespace, reference)?;
@@ -162,10 +169,178 @@ pub fn purge_offline(
             removed_files += 1;
         }
     }
+    let chunks = chunks_dir(root);
+    if chunks.exists() {
+        fs::remove_dir(&chunks)
+            .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?;
+    }
+
+    // Publish a durable terminal marker while the writer lock is still held.
+    // If the process stops during final directory cleanup, the next offline
+    // purge can prove key destruction already completed and safely resume.
+    publish_purged_root_marker(root)?;
+    removed_files += finalize_completed_offline_purge(root, writer_lease)?;
     Ok(OfflinePurgeResult {
         destroyed_keys: references.len(),
         removed_files,
     })
+}
+
+fn publish_purged_root_marker(root: &Path) -> Result<(), HistoryError> {
+    let temporary = root.join(PURGED_ROOT_MARKER_TEMP_NAME);
+    let destination = root.join(PURGED_ROOT_MARKER_NAME);
+    let mut marker_file = secure_create_new_file(&temporary)?;
+    if marker_file
+        .write_all(PURGED_ROOT_MARKER_CONTENT)
+        .and_then(|_| marker_file.sync_data())
+        .is_err()
+    {
+        drop(marker_file);
+        let _ = fs::remove_file(&temporary);
+        return Err(HistoryError::new(HistoryHealthCategory::StorageUnavailable));
+    }
+    drop(marker_file);
+    fs::rename(&temporary, &destination)
+        .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?;
+    sync_history_directory(root)
+}
+
+#[cfg(unix)]
+fn sync_history_directory(root: &Path) -> Result<(), HistoryError> {
+    File::open(root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))
+}
+
+#[cfg(not(unix))]
+fn sync_history_directory(_root: &Path) -> Result<(), HistoryError> {
+    Ok(())
+}
+
+fn recover_interrupted_purge_marker(root: &Path) -> Result<(), HistoryError> {
+    let temporary = root.join(PURGED_ROOT_MARKER_TEMP_NAME);
+    if !temporary.exists() {
+        return Ok(());
+    }
+    validate_purge_staging_layout(root)?;
+    let file = secure_open_lock_file(&root.join("writer.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&file)
+        .map_err(|_| HistoryError::new(HistoryHealthCategory::WriterStopped))?;
+    validate_purge_staging_layout(root)?;
+    fs::remove_file(&temporary)
+        .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?;
+    drop(file);
+    Ok(())
+}
+
+fn validate_purge_staging_layout(root: &Path) -> Result<(), HistoryError> {
+    validate_transitional_purge_layout(root, PURGED_ROOT_MARKER_TEMP_NAME, false)
+}
+
+fn resume_completed_offline_purge(root: &Path) -> Result<Option<OfflinePurgeResult>, HistoryError> {
+    if !root.join(PURGED_ROOT_MARKER_NAME).exists() {
+        return Ok(None);
+    }
+    validate_purged_root_layout(root)?;
+    let file = secure_open_lock_file(&root.join("writer.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&file)
+        .map_err(|_| HistoryError::new(HistoryHealthCategory::WriterStopped))?;
+    validate_purged_root_layout(root)?;
+    let removed_files = finalize_completed_offline_purge(root, WriterLease { _file: file })?;
+    Ok(Some(OfflinePurgeResult {
+        destroyed_keys: 0,
+        removed_files,
+    }))
+}
+
+fn validate_purged_root_layout(root: &Path) -> Result<(), HistoryError> {
+    validate_transitional_purge_layout(root, PURGED_ROOT_MARKER_NAME, true)
+}
+
+fn validate_transitional_purge_layout(
+    root: &Path,
+    transition_marker: &str,
+    validate_transition_content: bool,
+) -> Result<(), HistoryError> {
+    if !root.is_absolute() {
+        return Err(HistoryError::new(HistoryHealthCategory::StorageUnavailable));
+    }
+    reject_unsafe_root_components(root)?;
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(HistoryError::new(HistoryHealthCategory::StorageUnavailable));
+    }
+    let mut transition_marker_seen = false;
+    for entry in fs::read_dir(root)
+        .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?
+    {
+        let entry =
+            entry.map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?
+            .to_owned();
+        let kind = entry
+            .file_type()
+            .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?;
+        if is_reparse_point(&entry.path())? || !kind.is_file() {
+            return Err(HistoryError::new(HistoryHealthCategory::StorageUnavailable));
+        }
+        match name.as_str() {
+            name if name == transition_marker => {
+                transition_marker_seen = true;
+                if validate_transition_content
+                    && fs::read(entry.path()).ok().as_deref() != Some(PURGED_ROOT_MARKER_CONTENT)
+                {
+                    return Err(HistoryError::new(HistoryHealthCategory::StorageUnavailable));
+                }
+            }
+            ROOT_MARKER_NAME => {
+                if fs::read(entry.path()).ok().as_deref() != Some(ROOT_MARKER_CONTENT) {
+                    return Err(HistoryError::new(HistoryHealthCategory::StorageUnavailable));
+                }
+            }
+            "writer.lock" => {}
+            _ => return Err(HistoryError::new(HistoryHealthCategory::StorageUnavailable)),
+        }
+    }
+    if !transition_marker_seen {
+        return Err(HistoryError::new(HistoryHealthCategory::StorageUnavailable));
+    }
+    Ok(())
+}
+
+fn finalize_completed_offline_purge(
+    root: &Path,
+    writer_lease: WriterLease,
+) -> Result<usize, HistoryError> {
+    validate_purged_root_layout(root)?;
+    let mut removed_files = 0;
+    let root_marker = root.join(ROOT_MARKER_NAME);
+    if root_marker.exists() {
+        fs::remove_file(&root_marker)
+            .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?;
+        removed_files += 1;
+    }
+    // The terminal marker now prevents a new writer from adopting this root.
+    // Windows cannot reliably unlink an open lock file, so release the lease
+    // before removing it and keep the terminal marker until the last step.
+    drop(writer_lease);
+    let writer_lock = root.join("writer.lock");
+    if writer_lock.exists() {
+        fs::remove_file(&writer_lock)
+            .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?;
+        removed_files += 1;
+    }
+    let purged_marker = root.join(PURGED_ROOT_MARKER_NAME);
+    fs::remove_file(&purged_marker)
+        .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?;
+    removed_files += 1;
+    fs::remove_dir(root)
+        .map_err(|_| HistoryError::new(HistoryHealthCategory::StorageUnavailable))?;
+    Ok(removed_files)
 }
 
 /// Establish that `root` is a dedicated Cua History directory before any
@@ -786,16 +961,18 @@ impl HistoryManager {
             )
         } else {
             let lease = WriterLease::acquire(&self.config.root)?;
+            let events = HistoryStore::read_all(
+                &self.config.root,
+                &self.config.namespace,
+                self.key_provider.as_ref(),
+                self.config.quota_bytes,
+            )?;
+            // A disabled/read-only query must authenticate every existing
+            // chunk before retention deletes any of them. Otherwise a signer
+            // or Keychain access-group migration could silently erase the
+            // only evidence that its former key is inaccessible.
             prune_expired_chunks(&self.config.root, self.config.retention_days)?;
-            (
-                HistoryStore::read_all(
-                    &self.config.root,
-                    &self.config.namespace,
-                    self.key_provider.as_ref(),
-                    self.config.quota_bytes,
-                )?,
-                Some(lease),
-            )
+            (events, Some(lease))
         };
         drop(writer_guard);
         let next_sequence = events
@@ -1019,15 +1196,25 @@ impl HistoryManager {
         if slot.is_some() {
             return Ok(());
         }
-        self.ensure_session_id_key()?;
         let writer_lease = WriterLease::acquire(&self.config.root)?;
-        prune_expired_chunks(&self.config.root, self.config.retention_days)?;
+        // Read every existing chunk before creating or caching a namespace key.
+        // A signing-identity or Keychain access-group migration can make an
+        // existing key temporarily unavailable. Creating a replacement key in
+        // that state would reuse the same logical reference while permanently
+        // making the existing ciphertext unreadable.
         let existing = HistoryStore::read_all(
             &self.config.root,
             &self.config.namespace,
             self.key_provider.as_ref(),
             self.config.quota_bytes,
         )?;
+        self.ensure_session_id_key()?;
+        // Pruning is destructive. Perform it only after every existing chunk
+        // has been authenticated with the currently accessible namespace key.
+        // In particular, a signing/access-group migration must not erase old
+        // ciphertext and then create a replacement key merely because the
+        // unreadable chunks happened to be expired.
+        prune_expired_chunks(&self.config.root, self.config.retention_days)?;
         let max_sequence = existing
             .iter()
             .map(|event| event.data.sequence)
@@ -3313,6 +3500,52 @@ mod tests {
     }
 
     #[test]
+    fn inaccessible_existing_history_never_creates_a_replacement_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeyProvider::default());
+        let first = HistoryManager::new(config(temp.path()), keys.clone(), None);
+        first.enable().unwrap();
+        first.disable().unwrap();
+        drop(first);
+
+        let chunks_before = history_chunk_paths(temp.path()).unwrap();
+        assert!(!chunks_before.is_empty());
+        keys.keys.lock().unwrap().clear();
+        let mut migrated = config(temp.path());
+        migrated.retention_days = 0;
+        let second = HistoryManager::new(migrated, keys.clone(), None);
+        let error = second.enable().unwrap_err();
+
+        assert_eq!(error.category, HistoryHealthCategory::KeyUnavailable);
+        assert!(keys.keys.lock().unwrap().is_empty());
+        assert_eq!(history_chunk_paths(temp.path()).unwrap(), chunks_before);
+    }
+
+    #[test]
+    fn inaccessible_existing_history_query_never_prunes_ciphertext() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeyProvider::default());
+        let first = HistoryManager::new(config(temp.path()), keys.clone(), None);
+        first.enable().unwrap();
+        first.disable().unwrap();
+        drop(first);
+
+        let chunks_before = history_chunk_paths(temp.path()).unwrap();
+        assert!(!chunks_before.is_empty());
+        keys.keys.lock().unwrap().clear();
+        let mut migrated = config(temp.path());
+        migrated.retention_days = 0;
+        let second = HistoryManager::new(migrated, keys.clone(), None);
+        let error = second
+            .query(HistoryQuery::default(), HistoryAccessOperation::LocalCli)
+            .unwrap_err();
+
+        assert_eq!(error.category, HistoryHealthCategory::KeyUnavailable);
+        assert!(keys.keys.lock().unwrap().is_empty());
+        assert_eq!(history_chunk_paths(temp.path()).unwrap(), chunks_before);
+    }
+
+    #[test]
     fn active_query_runs_on_writer_and_producer_hook_does_not_block() {
         let temp = tempfile::tempdir().unwrap();
         let keys = Arc::new(MemoryKeyProvider::default());
@@ -3399,24 +3632,62 @@ mod tests {
     #[test]
     fn offline_purge_is_exclusive_and_removes_state_only_after_keys() {
         let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("computer-history");
         let keys = Arc::new(MemoryKeyProvider::default());
-        let manager = HistoryManager::new(config(temp.path()), keys.clone(), None);
+        let manager = HistoryManager::new(config(&root), keys.clone(), None);
         manager.enable().unwrap();
         assert_eq!(
-            purge_offline(temp.path(), "test", keys.as_ref())
+            purge_offline(&root, "test", keys.as_ref())
                 .unwrap_err()
                 .category,
             HistoryHealthCategory::WriterStopped
         );
         manager.disable().unwrap();
         drop(manager);
-        fs::write(temp.path().join("admission.json"), b"{}").unwrap();
-        let result = purge_offline(temp.path(), "test", keys.as_ref()).unwrap();
+        fs::write(root.join("admission.json"), b"{}").unwrap();
+        let result = purge_offline(&root, "test", keys.as_ref()).unwrap();
         assert_eq!(result.destroyed_keys, 1);
         assert!(keys.references("test").unwrap().is_empty());
-        assert!(history_chunk_paths(temp.path()).unwrap().is_empty());
-        assert!(!state_path(temp.path()).exists());
-        assert!(!temp.path().join("admission.json").exists());
+        assert!(!root.exists());
+
+        let second = purge_offline(&root, "test", keys.as_ref()).unwrap();
+        assert_eq!(second.destroyed_keys, 0);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn offline_purge_resumes_a_verified_terminal_tombstone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("computer-history");
+        prepare_history_root(&root).unwrap();
+        let lease = WriterLease::acquire(&root).unwrap();
+        let mut marker = secure_create_new_file(&root.join(PURGED_ROOT_MARKER_NAME)).unwrap();
+        marker.write_all(PURGED_ROOT_MARKER_CONTENT).unwrap();
+        marker.sync_data().unwrap();
+        drop(marker);
+        drop(lease);
+
+        let keys = MemoryKeyProvider::default();
+        let result = purge_offline(&root, "test", &keys).unwrap();
+        assert_eq!(result.destroyed_keys, 0);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn offline_purge_recovers_an_interrupted_tombstone_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("computer-history");
+        prepare_history_root(&root).unwrap();
+        let lease = WriterLease::acquire(&root).unwrap();
+        fs::write(root.join(PURGED_ROOT_MARKER_TEMP_NAME), b"partial").unwrap();
+        drop(lease);
+
+        let keys = MemoryKeyProvider::default();
+        keys.load_or_create("test").unwrap();
+        let result = purge_offline(&root, "test", &keys).unwrap();
+        assert_eq!(result.destroyed_keys, 1);
+        assert!(keys.references("test").unwrap().is_empty());
+        assert!(!root.exists());
     }
 
     #[test]

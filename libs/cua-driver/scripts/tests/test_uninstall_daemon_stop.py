@@ -52,6 +52,7 @@ class DaemonStopTests(unittest.TestCase):
         return f"""
 APP_BUNDLE=/Applications/CuaDriver.app
 LEGACY_APP_BUNDLE=/Applications/CuaDriverRs.app
+USER_BIN_LINK="$HOME/.local/bin/cua-driver"
 HOME_DIR="$HOME/.cua-driver"
 LEGACY_HOME_DIR="$HOME/.cua-driver-rs"
 DAEMON_PID_FILE="{pid_file}"
@@ -151,6 +152,30 @@ status=0; verify_release_daemon_absent || status=$?; exit "$status"
 """
                 )
                 self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_path_launched_daemon_is_recognized_from_lsof_text_path(self) -> None:
+        argv_log = self.root / "lsof-argv"
+        installed = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+        executable(
+            self.bin / "lsof",
+            f"printf '%s' \"$*\" > '{argv_log}'\nprintf 'n%s\\n' '{installed}'",
+        )
+        self.env["CUA_DRIVER_LSOF"] = str(self.bin / "lsof")
+        result = self.shell(
+            """
+OS=Darwin
+APP_BUNDLE=/Applications/CuaDriver.app
+LEGACY_APP_BUNDLE=/Applications/CuaDriverRs.app
+USER_BIN_LINK="$HOME/.local/bin/cua-driver"
+HOME_DIR="$HOME/.cua-driver"
+LEGACY_HOME_DIR="$HOME/.cua-driver-rs"
+APP_BUNDLE_OWNED=1
+daemon_pid_is_release 4242
+"""
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-a -p 4242 -d txt -Fn", argv_log.read_text())
 
     def test_supervisor_failure_preserves_runtime(self) -> None:
         tools = self.root / "tools"

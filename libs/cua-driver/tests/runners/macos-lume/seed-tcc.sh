@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Host-side helper: seed CuaDriverLocal.app Accessibility + Screen Recording
+# Host-side helper: seed MuseCodeCuaDriverLocal.app Accessibility + Screen Recording
 # in one or more running, SIP-disabled Lume macOS VMs.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUEST_HELPER="${SCRIPT_DIR}/seed-tcc-guest.sh"
 REMOTE_HELPER="/tmp/cua-driver-seed-tcc-guest.sh"
-APP_PATH="/Applications/CuaDriverLocal.app"
+APP_PATH="/Applications/MuseCodeCuaDriverLocal.app"
 BINARY_PATH=""
-EXPECTED_CLIENT="com.trycua.driver.local"
+EXPECTED_CLIENT="com.meta.musecode.cua.driver.local"
 SSH_USER="${LUME_SSH_USER:-lume}"
 SSH_PASSWORD="${LUME_SSH_PASSWORD-${VM_PASSWORD:-lume}}"
 SSH_TIMEOUT="${CUA_TCC_LUME_SSH_TIMEOUT:-120}"
@@ -32,7 +32,7 @@ usage() {
   cat <<'USAGE'
 Usage: seed-tcc.sh [options] <vm-name> [<vm-name> ...]
 
-Seed macOS Accessibility and Screen Recording TCC rows for CuaDriverLocal.app
+Seed macOS Accessibility and Screen Recording TCC rows for MuseCodeCuaDriverLocal.app
 inside running, SSH-reachable, SIP-disabled Lume macOS VMs. This uses the
 same SIP-off system-TCC seed model as the later uvisor `gui grant --gui`
 path; it does not install the app. Run install-local first, then run this
@@ -40,12 +40,12 @@ from the host.
 
 Options:
   --app PATH                 App bundle to grant inside the guest
-                             (default: /Applications/CuaDriverLocal.app)
+                             (default: /Applications/MuseCodeCuaDriverLocal.app)
   --binary PATH              Executable to derive the code requirement from.
                              Defaults to CFBundleExecutable inside --app.
                              Only valid when --app names an app bundle.
   --expected-client ID       Expected TCC client identifier
-                             (default: com.trycua.driver.local)
+                             (default: com.meta.musecode.cua.driver.local)
   --allow-adhoc              Allow cdhash-only ad-hoc signatures. The default
                              requires a certificate-backed local/release identity.
   --ssh-user USER            Lume SSH user (default: lume)

@@ -31,7 +31,7 @@ LaunchServices (`open -a …`, `NSWorkspace.open`) makes the launched app its
 own responsible process. Second, a process can explicitly _disclaim_
 responsibility for a child (`responsibility_spawnattrs_setdisclaim`), making
 the child its own responsible process — standalone cua-driver does this on
-purpose so its permissions attach to a stable `com.trycua.driver` identity
+purpose so its permissions attach to a stable `com.meta.musecode.cua.driver` identity
 instead of whatever terminal launched it. Embedded mode turns that off.
 
 Note this is TCC **responsibility** inheritance — it is unrelated to App
@@ -207,7 +207,7 @@ daemon child.
 | Responsibility disclaim re-exec               | ON (owns its TCC identity)    | OFF (stays in the host's chain)        |
 | Tool execution process                        | `serve` daemon                | host-spawned `serve --embedded` daemon |
 | Daemon auto-relaunch via `open -a CuaDriver`  | Yes, when installed           | Never (would leave the host's chain)   |
-| TCC identity                                  | `com.trycua.driver`           | the host app                           |
+| TCC identity                                  | `com.meta.musecode.cua.driver`           | the host app                           |
 | Permission prompts / startup gate             | May prompt once               | **Never prompts**                      |
 | Settings → Privacy & Security entries         | CuaDriver                     | your app only                          |
 | `check_permissions` `source.attribution`      | `driver-daemon` (or `caller`) | `host`                                 |
@@ -292,7 +292,7 @@ a dialog (the `prompt` argument is ignored) and returns:
 - `source.attribution` values:
   - `host` — embedded mode; booleans reflect the host's grant. What you
     should always see when embedding.
-  - `driver-daemon` — standalone daemon owning `com.trycua.driver`. If you
+  - `driver-daemon` — standalone daemon owning `com.meta.musecode.cua.driver`. If you
     see this while embedding, embedded mode is not actually set.
   - `caller` — a non-embedded, non-bundle launch (e.g. someone ran the
     binary from a terminal); booleans reflect the terminal's grants.

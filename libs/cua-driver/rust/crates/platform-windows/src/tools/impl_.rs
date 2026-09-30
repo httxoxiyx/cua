@@ -4492,6 +4492,7 @@ impl Tool for TypeTextTool {
         // Only when an element_index is supplied (we have its cached center);
         // the focused-element path has no resolvable position to point at.
         if let Some(idx) = elem_idx {
+            let snapshot_id = snapshot_id.expect("element targets carry snapshot identity");
             if let Some((cx, cy)) = self.state.element_cache.get_element_center_for_snapshot(
                 pid,
                 hwnd,

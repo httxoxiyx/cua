@@ -710,7 +710,7 @@ its starting Space and always restores it in a trap/finally path.
 The repository's canonical signed/TCC acceptance remains
 [`tests/runners/macos-lume/README.md`](../tests/runners/macos-lume/README.md)
 and [`run-all.sh`](../tests/runners/macos-lume/run-all.sh). It provides the
-logged-in Aqua session, certificate-backed `CuaDriverLocal.app`, normal TCC
+logged-in Aqua session, certificate-backed `MuseCodeCuaDriverLocal.app`, normal TCC
 grant flow, and exact-source checks.
 
 After focused Namespace evidence passes, add the new fixture rows to the Lume
@@ -799,7 +799,7 @@ plugin because it can change independently of this plan.
    because the plugin's shallow clone starts from repository default HEAD.
 7. On the Namespace Mac, record `sw_vers`, OS build, architecture, SIP status,
    Xcode/Rust/Node versions, exact git SHA, and a clean worktree before testing.
-8. Use repository-supported `CuaDriverLocal.app` setup only. Follow
+8. Use repository-supported `MuseCodeCuaDriverLocal.app` setup only. Follow
    [`scripts/README.md`](../scripts/README.md), use an ephemeral
    certificate-backed local signing identity, and install with
    `--require-stable-signing`. Never copy a maintainer private key or signing
@@ -844,7 +844,7 @@ policy deliberately refuses when AX cannot prove the exact target.
 
 Accessibility and capture evidence is valid only for the process identity that
 performed it. Ad-hoc rebuilds can invalidate grants. Native acceptance requires
-the certificate-backed `CuaDriverLocal.app` flow and normal permission UI.
+the certificate-backed `MuseCodeCuaDriverLocal.app` flow and normal permission UI.
 Neither CI mocks nor a successful build substitutes for this evidence.
 
 ### Application semantic differences

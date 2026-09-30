@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+import plistlib
 import tarfile
 import zipfile
 
@@ -115,8 +116,17 @@ def release_contracts(version: str) -> tuple[ArchiveContract, ...]:
 
 
 def _normalize_member(name: str) -> str:
-    normalized = str(PurePosixPath(name.replace("\\", "/")))
-    return normalized.removeprefix("./").rstrip("/")
+    if (not name or "\\" in name
+            or any(ord(character) < 32 or ord(character) == 127 for character in name)):
+        raise ContractError("archive contains an invalid member name")
+    while name.startswith("./"):
+        name = name[2:]
+    name = name.rstrip("/")
+    path = PurePosixPath(name)
+    if (not name or path.is_absolute()
+            or any(part in ("", ".", "..") for part in path.parts)):
+        raise ContractError(f"archive contains unsafe member path: {name!r}")
+    return path.as_posix()
 
 
 def _find_archive(root: Path, filename: str) -> Path:
@@ -129,13 +139,23 @@ def _find_archive(root: Path, filename: str) -> Path:
     return matches[0]
 
 
-def _verify_tar(path: Path, contract: ArchiveContract) -> None:
+def _verify_tar(path: Path, contract: ArchiveContract, version: str) -> None:
     with tarfile.open(path, "r:gz") as archive:
-        members = {
-            _normalize_member(member.name): member
-            for member in archive.getmembers()
-            if member.isfile()
-        }
+        members = {}
+        seen = set()
+        for member in archive.getmembers():
+            normalized = _normalize_member(member.name)
+            if normalized in seen:
+                raise ContractError(
+                    f"{path.name} contains duplicate normalized member {normalized}"
+                )
+            seen.add(normalized)
+            if not (member.isfile() or member.isdir()):
+                raise ContractError(
+                    f"{path.name} contains a link or special member: {normalized}"
+                )
+            if member.isfile():
+                members[normalized] = member
 
         for expected in contract.members:
             member = members.get(expected)
@@ -149,14 +169,60 @@ def _verify_tar(path: Path, contract: ArchiveContract) -> None:
             if member is None or member.mode & 0o111 == 0:
                 raise ContractError(f"{path.name} contains non-executable member {expected}")
 
+        info_members = [
+            member
+            for name, member in members.items()
+            if name.endswith("/CuaDriver.app/Contents/Info.plist")
+        ]
+        if info_members:
+            if len(info_members) != 1:
+                raise ContractError(f"{path.name} contains ambiguous CuaDriver Info.plists")
+            reader = archive.extractfile(info_members[0])
+            if reader is None:
+                raise ContractError(f"{path.name} cannot read CuaDriver Info.plist")
+            payload = reader.read(256 * 1024 + 1)
+            if len(payload) > 256 * 1024:
+                raise ContractError(f"{path.name} contains an oversized CuaDriver Info.plist")
+            try:
+                info = plistlib.loads(payload)
+            except (plistlib.InvalidFileException, ValueError) as error:
+                raise ContractError(f"{path.name} contains an invalid CuaDriver Info.plist") from error
+            expected_identity = {
+                "CFBundleIdentifier": "com.meta.musecode.cua.driver",
+                "CFBundleExecutable": "cua-driver",
+                "CFBundlePackageType": "APPL",
+                "CFBundleShortVersionString": version,
+            }
+            for key, expected in expected_identity.items():
+                if info.get(key) != expected:
+                    raise ContractError(
+                        f"{path.name} CuaDriver Info.plist has invalid {key}: "
+                        f"expected {expected!r}, got {info.get(key)!r}"
+                    )
+            if info.get("CuaPluginManaged", False) is not False:
+                raise ContractError(
+                    f"{path.name} CuaDriver Info.plist is incorrectly plugin-managed"
+                )
+
 
 def _verify_zip(path: Path, contract: ArchiveContract) -> None:
     with zipfile.ZipFile(path) as archive:
-        members = {
-            _normalize_member(info.filename): info
-            for info in archive.infolist()
-            if not info.is_dir()
-        }
+        members = {}
+        seen = set()
+        for info in archive.infolist():
+            normalized = _normalize_member(info.filename)
+            if normalized in seen:
+                raise ContractError(
+                    f"{path.name} contains duplicate normalized member {normalized}"
+                )
+            seen.add(normalized)
+            unix_type = (info.external_attr >> 16) & 0o170000
+            if unix_type not in (0, 0o040000, 0o100000):
+                raise ContractError(
+                    f"{path.name} contains a link or special member: {normalized}"
+                )
+            if not info.is_dir():
+                members[normalized] = info
 
         for expected in contract.members:
             member = members.get(expected)
@@ -173,7 +239,7 @@ def verify_release_archives(root: Path, version: str) -> tuple[Path, ...]:
     for contract in release_contracts(version):
         path = _find_archive(root, contract.filename)
         if path.name.endswith(".tar.gz"):
-            _verify_tar(path, contract)
+            _verify_tar(path, contract, version)
         elif path.suffix == ".zip":
             _verify_zip(path, contract)
         else:  # pragma: no cover - contracts above define supported formats.

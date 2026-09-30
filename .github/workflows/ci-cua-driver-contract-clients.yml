@@ -11,6 +11,7 @@ on:
       - "libs/cua-driver/rust/Cargo.toml"
       - "libs/cua-driver/rust/Cargo.lock"
       - "libs/cua-driver/rust/include/**"
+      - "libs/cua-driver/rust/scripts/**"
       - "libs/cua-driver/rust/tests/**"
       - "libs/cua-driver/rust/crates/cua-driver/**"
       - "libs/cua-driver/rust/crates/cua-driver-contract/**"
@@ -18,15 +19,20 @@ on:
       - "libs/cua-driver/rust/crates/cua-driver-core/**"
       - "libs/cua-driver/rust/crates/cua-driver-sdk/**"
       - "libs/cua-driver/rust/crates/cua-driver-testkit/**"
+      - "libs/cua-driver/rust/crates/computer-use-mcp-bootstrap/**"
       - "libs/cua-driver/rust/crates/platform-linux/**"
       - "libs/cua-driver/rust/crates/platform-macos/**"
       - "libs/cua-driver/rust/crates/platform-windows/**"
+      - "libs/cua-driver/scripts/**"
+      - ".github/scripts/verify_cua_driver_release_archives.py"
+      - ".github/scripts/tests/test_verify_cua_driver_release_archives.py"
       - "libs/cua-driver/scripts/generate-uniffi-bindings.mjs"
       - "libs/cua-driver/scripts/stage-uniffi-library.mjs"
       - "libs/cua-driver/scripts/build-npm-packages.mjs"
       - ".github/scripts/cua-driver-mcp-compat/**"
       - ".github/workflows/cd-py-cua-driver.yml"
       - ".github/workflows/ci-cua-driver-contract-clients.yml"
+      - ".github/workflows/verify-cua-driver-release-artifacts.yml"
   push:
     branches: [main]
     paths:
@@ -38,6 +44,7 @@ on:
       - "libs/cua-driver/rust/Cargo.toml"
       - "libs/cua-driver/rust/Cargo.lock"
       - "libs/cua-driver/rust/include/**"
+      - "libs/cua-driver/rust/scripts/**"
       - "libs/cua-driver/rust/tests/**"
       - "libs/cua-driver/rust/crates/cua-driver/**"
       - "libs/cua-driver/rust/crates/cua-driver-contract/**"
@@ -45,15 +52,20 @@ on:
       - "libs/cua-driver/rust/crates/cua-driver-core/**"
       - "libs/cua-driver/rust/crates/cua-driver-sdk/**"
       - "libs/cua-driver/rust/crates/cua-driver-testkit/**"
+      - "libs/cua-driver/rust/crates/computer-use-mcp-bootstrap/**"
       - "libs/cua-driver/rust/crates/platform-linux/**"
       - "libs/cua-driver/rust/crates/platform-macos/**"
       - "libs/cua-driver/rust/crates/platform-windows/**"
+      - "libs/cua-driver/scripts/**"
+      - ".github/scripts/verify_cua_driver_release_archives.py"
+      - ".github/scripts/tests/test_verify_cua_driver_release_archives.py"
       - "libs/cua-driver/scripts/generate-uniffi-bindings.mjs"
       - "libs/cua-driver/scripts/stage-uniffi-library.mjs"
       - "libs/cua-driver/scripts/build-npm-packages.mjs"
       - ".github/scripts/cua-driver-mcp-compat/**"
       - ".github/workflows/cd-py-cua-driver.yml"
       - ".github/workflows/ci-cua-driver-contract-clients.yml"
+      - ".github/workflows/verify-cua-driver-release-artifacts.yml"
   workflow_dispatch:
 
 permissions:
@@ -105,7 +117,7 @@ jobs:
   runtime-parity:
     name: Portable contract parity (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -138,6 +150,38 @@ jobs:
         if: runner.os != 'Windows' || steps.windows-session.outputs.session_id != '0'
         working-directory: libs/cua-driver/rust
         run: cargo test --locked -p cua-driver --test schema_consistency_test portable_desktop_contracts_are_accepted_by_active_backend
+
+      - name: Test macOS onboarding runtime
+        if: runner.os == 'macOS'
+        working-directory: libs/cua-driver/rust
+        run: |
+          cargo test --locked -p computer-use-mcp-bootstrap --all-targets
+          cargo test --locked -p platform-macos --lib app_identity::
+          cargo test --locked -p platform-macos --lib permission_observation::
+          cargo test --locked -p platform-macos --lib permissions::
+          cargo test --locked -p platform-macos --lib tools::check_permissions::tests::
+          cargo test --locked -p platform-macos --lib tools::health_report::tests::
+          cargo test --locked -p platform-macos --lib tools::launch_app::tests::
+          cargo test --locked -p cua-driver --bin cua-driver cli::tests::
+          cargo test --locked -p cua-driver --bin cua-driver serve::socket_tests::
+          cargo test --locked -p cua-driver --bin cua-driver history_runtime::tests::
+          cargo test --locked -p cua-driver --bin cua-driver bundle::tests::
+          cargo test --locked -p cua-driver-core inaccessible_existing_history_never_creates_a_replacement_key
+
+      - name: Test macOS installer and identity contracts
+        if: runner.os == 'macOS'
+        run: |
+          python3 -m pip install pytest
+          python3 -m pytest -q \
+            libs/cua-driver/python/tests/test_install_local_signing.py \
+            libs/cua-driver/scripts/tests/test_bundle_presentation.py \
+            libs/cua-driver/scripts/tests/test_install_local.py \
+            libs/cua-driver/scripts/tests/test_install_macos_tcc.py \
+            libs/cua-driver/scripts/tests/test_macos_lume_runner.py \
+            libs/cua-driver/scripts/tests/test_uninstall_daemon_stop.py \
+            libs/cua-driver/scripts/tests/test_uninstall_local.py \
+            libs/cua-driver/scripts/tests/test_uninstall_macos_safety.py
+          bash libs/cua-driver/scripts/tests/uninstall-history-purge-test.sh
 
       - name: Verify released CLI and MCP compatibility
         if: runner.os != 'Windows' || steps.windows-session.outputs.session_id != '0'
@@ -242,6 +286,10 @@ jobs:
             tests/test_build_wheel.py \
             tests/test_compatibility_contract.py \
             -q
+
+      - name: Test release archive contracts
+        run: |
+          python -m pytest .github/scripts/tests/test_verify_cua_driver_release_archives.py -q
 
       - name: Build and stage host-native UniFFI library
         working-directory: libs/cua-driver

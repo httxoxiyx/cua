@@ -43,6 +43,8 @@ use crate::permissions::status::{
 
 const PERMISSION_PROBE_ARG: &str = "--cua-internal-permission-probe";
 const PERMISSION_PROBE_REQUEST_ARG: &str = "--cua-internal-permission-probe-request";
+const PERMISSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const PERMISSION_PROBE_WAIT_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Which TCC grant is missing.  Each variant maps 1:1 to a System Settings
 /// pane URL via [`MissingPermission::settings_url`].
@@ -139,13 +141,13 @@ pub fn run_permission_probe_if_requested() -> Option<i32> {
 
 fn fresh_status_with_request(request: bool) -> Result<PermissionsStatus> {
     let executable = std::env::current_exe()?;
-    let output = std::process::Command::new(executable)
-        .arg(if request {
-            PERMISSION_PROBE_REQUEST_ARG
-        } else {
-            PERMISSION_PROBE_ARG
-        })
-        .output()?;
+    let mut command = std::process::Command::new(executable);
+    command.arg(if request {
+        PERMISSION_PROBE_REQUEST_ARG
+    } else {
+        PERMISSION_PROBE_ARG
+    });
+    let output = run_bounded_command(&mut command, PERMISSION_PROBE_TIMEOUT)?;
     if !output.status.success() {
         anyhow::bail!(
             "permission probe exited with {}: {}",
@@ -154,6 +156,49 @@ fn fresh_status_with_request(request: bool) -> Result<PermissionsStatus> {
         );
     }
     serde_json::from_slice(&output.stdout).map_err(Into::into)
+}
+
+/// Run the finite helper without allowing a wedged TCC lookup to pin the
+/// LaunchServices onboarding host after its launcher has gone away.
+fn run_bounded_command(
+    command: &mut std::process::Command,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map_err(Into::into);
+        }
+        if started.elapsed() >= timeout {
+            let kill_error = child.kill().err();
+            let wait_result = child.wait();
+            if let Some(error) = kill_error {
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(anyhow::anyhow!(
+                        "terminate timed-out permission probe: {error}"
+                    ));
+                }
+                wait_result.map_err(|wait_error| {
+                    anyhow::anyhow!(
+                        "permission probe exited during timeout cleanup but could not be reaped: {wait_error}"
+                    )
+                })?;
+            } else {
+                wait_result
+                    .map_err(|error| anyhow::anyhow!("reap timed-out permission probe: {error}"))?;
+            }
+            anyhow::bail!(
+                "permission probe did not finish within {} seconds",
+                timeout.as_secs_f64()
+            );
+        }
+        std::thread::sleep(PERMISSION_PROBE_WAIT_INTERVAL.min(timeout));
+    }
 }
 
 pub(crate) fn fresh_status() -> PermissionsStatus {
@@ -900,5 +945,15 @@ mod tests {
             MissingPermission::ScreenRecording.settings_url(),
             "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
         );
+    }
+
+    #[test]
+    fn finite_permission_probe_is_killed_and_reaped_after_its_bound() {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("5");
+        let started = Instant::now();
+        let error = run_bounded_command(&mut command, Duration::from_millis(50)).unwrap_err();
+        assert!(error.to_string().contains("did not finish"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

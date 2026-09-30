@@ -7,7 +7,12 @@ use serde_json::Value;
 use std::{future::Future, path::Path, sync::Arc, time::Duration};
 
 use super::ToolState;
-use crate::permission_observation::{DirectCaptureEvidenceStore, DirectCaptureVerification};
+#[cfg(test)]
+use crate::permission_observation::direct_capture_evidence_store_for_bundle as evidence_store_for_bundle;
+use crate::permission_observation::{
+    direct_capture_evidence_store_for_driver_executable as evidence_store_for_driver_executable,
+    DirectCaptureEvidenceStore, DirectCaptureVerification,
+};
 use crate::permissions::status::{
     accessibility_granted, request_accessibility, request_screen_recording,
     screen_recording_granted,
@@ -58,10 +63,13 @@ fn direct_capture_evidence_store_for_identity(
     home: &Path,
     attribution: Option<&str>,
 ) -> Option<DirectCaptureEvidenceStore> {
-    let bundle_id = driver_bundle_id_for_executable(executable)?;
-    direct_capture_evidence_store_for_bundle(bundle_id, home, attribution)
+    if attribution != Some("driver-daemon") {
+        return None;
+    }
+    evidence_store_for_driver_executable(Path::new(executable), home)
 }
 
+#[cfg(test)]
 fn direct_capture_evidence_store_for_bundle(
     bundle_id: &str,
     home: &Path,
@@ -70,16 +78,7 @@ fn direct_capture_evidence_store_for_bundle(
     if attribution != Some("driver-daemon") {
         return None;
     }
-    let state_directory = match bundle_id {
-        "com.trycua.driver.local" => ".cua-driver-local",
-        "com.trycua.driver" => ".cua-driver",
-        _ => return None,
-    };
-    Some(DirectCaptureEvidenceStore::new(
-        home.join(state_directory)
-            .join("direct-capture-verification.json"),
-        bundle_id,
-    ))
+    evidence_store_for_bundle(bundle_id, home)
 }
 
 fn current_direct_capture_evidence_store(source: &Value) -> Option<DirectCaptureEvidenceStore> {
@@ -187,13 +186,7 @@ fn resolve_direct_capture_verification(
                     "message": "the installed product identity or user home directory is unavailable",
                 }));
             };
-            store.record_now().map(Some).map_err(|error| {
-                let message = match store.clear() {
-                    Ok(()) => error,
-                    Err(clear_error) => {
-                        format!("{error}; clear prior direct-capture verification: {clear_error}")
-                    }
-                };
+            store.refresh_now().map(Some).map_err(|message| {
                 serde_json::json!({
                     "code": "direct_capture_verification_store_failed",
                     "message": message,
@@ -219,7 +212,7 @@ fn resolve_direct_capture_verification(
 /// macOS attributes Accessibility / Screen-Recording to the *responsible
 /// process* (the LaunchServices launching app), not the executable path.
 /// So `check_permissions` answered by the daemon reflects:
-///   - the **CuaDriver daemon** (`com.trycua.driver`) when this process is
+///   - the **CuaDriver daemon** (`com.meta.musecode.cua.driver`) when this process is
 ///     its own responsible process — the real driver status.
 ///   - the **embedding host** otherwise. That is intentional only when the
 ///     host directly spawned `cua-driver serve --embedded`.
@@ -482,7 +475,7 @@ impl Tool for CheckPermissionsTool {
         if is_caller {
             summary.push_str(
                 "\nℹ️  Status reflects the launching app's TCC identity, not the CuaDriver \
-                 daemon (com.trycua.driver). See `source` for details.",
+                 daemon (com.meta.musecode.cua.driver). See `source` for details.",
             );
         }
 
@@ -531,18 +524,26 @@ mod tests {
     }
 
     fn release_evidence_store(home: &Path) -> DirectCaptureEvidenceStore {
-        direct_capture_evidence_store_for_bundle("com.trycua.driver", home, Some("driver-daemon"))
-            .expect("release store")
+        direct_capture_evidence_store_for_bundle(
+            "com.meta.musecode.cua.driver",
+            home,
+            Some("driver-daemon"),
+        )
+        .expect("release store")
     }
 
     #[test]
     fn recognizes_release_and_local_driver_bundles() {
         let root = tempfile::tempdir().unwrap();
         for (name, bundle_id, executable) in [
-            ("renamed.app", "com.trycua.driver", "cua-driver"),
-            ("cua.app", "com.trycua.driver.local", "cua-driver-local"),
+            ("renamed.app", "com.meta.musecode.cua.driver", "cua-driver"),
             (
-                "CuaDriverLocal.app",
+                "cua.app",
+                "com.meta.musecode.cua.driver.local",
+                "cua-driver-local",
+            ),
+            (
+                "MuseCodeCuaDriverLocal.app",
                 "org.example.unrelated",
                 "cua-driver-local",
             ),
@@ -581,7 +582,7 @@ mod tests {
             std::env::temp_dir().join(format!("cua-direct-capture-test-{}", uuid::Uuid::new_v4()));
         let release = release_evidence_store(&home);
         let local = direct_capture_evidence_store_for_bundle(
-            "com.trycua.driver.local",
+            "com.meta.musecode.cua.driver.local",
             &home,
             Some("driver-daemon"),
         )
@@ -598,7 +599,7 @@ mod tests {
         .is_none());
         for attribution in [Some("caller"), Some("host"), None] {
             assert!(direct_capture_evidence_store_for_bundle(
-                "com.trycua.driver",
+                "com.meta.musecode.cua.driver",
                 &home,
                 attribution,
             )

@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::app_identity::driver_app_for_executable;
+
 const SCHEMA_VERSION: u8 = 1;
 const SOURCE: &str = "permissions_grant";
 
@@ -40,16 +42,26 @@ impl DirectCaptureEvidenceStore {
             .ok_or_else(|| "recorded direct-capture verification did not validate".to_owned())
     }
 
-    pub(crate) fn load(&self) -> Option<DirectCaptureVerification> {
-        let bytes = std::fs::read(&self.path).ok()?;
-        let record: PersistedVerification = serde_json::from_slice(&bytes).ok()?;
-        if record.schema_version != SCHEMA_VERSION
-            || record.source != SOURCE
-            || record.verified_at_unix_seconds <= 0
-            || record.bundle_id != self.bundle_id
-        {
-            return None;
+    /// Replace the previous successful probe with fresh evidence. If the
+    /// replacement cannot be written, remove the old record so a caller can
+    /// never mistake stale evidence for the probe that just succeeded.
+    pub(crate) fn refresh_now(&self) -> Result<DirectCaptureVerification, String> {
+        match self.record_now() {
+            Ok(verification) => Ok(verification),
+            Err(error) => {
+                let message = match self.clear() {
+                    Ok(()) => error,
+                    Err(clear_error) => {
+                        format!("{error}; clear prior direct-capture verification: {clear_error}")
+                    }
+                };
+                Err(message)
+            }
         }
+    }
+
+    pub(crate) fn load(&self) -> Option<DirectCaptureVerification> {
+        let record = self.load_record()?;
         let verified_at =
             time::OffsetDateTime::from_unix_timestamp(record.verified_at_unix_seconds)
                 .ok()?
@@ -70,10 +82,28 @@ impl DirectCaptureEvidenceStore {
         }
     }
 
-    fn record_at(&self, verified_at_unix_seconds: i64) -> Result<(), String> {
-        if verified_at_unix_seconds <= 0 {
+    fn record_at(&self, observed_at_unix_seconds: i64) -> Result<(), String> {
+        if observed_at_unix_seconds <= 0 {
             return Err("verification timestamp is unavailable".to_owned());
         }
+        // Package A and package B intentionally share a TCC identity and
+        // therefore the same evidence file. Ensure every successful probe is
+        // observable as a strict refresh even when both complete during the
+        // same wall-clock second.
+        let verified_at_unix_seconds = self
+            .load_record()
+            .map(|record| {
+                if record.verified_at_unix_seconds >= observed_at_unix_seconds {
+                    record
+                        .verified_at_unix_seconds
+                        .checked_add(1)
+                        .ok_or_else(|| "verification timestamp overflowed".to_owned())
+                } else {
+                    Ok(observed_at_unix_seconds)
+                }
+            })
+            .transpose()?
+            .unwrap_or(observed_at_unix_seconds);
         let parent = self
             .path
             .parent()
@@ -88,6 +118,59 @@ impl DirectCaptureEvidenceStore {
         };
         write_json_atomic(&self.path, &record)
     }
+
+    fn load_record(&self) -> Option<PersistedVerification> {
+        let bytes = std::fs::read(&self.path).ok()?;
+        let record: PersistedVerification = serde_json::from_slice(&bytes).ok()?;
+        if record.schema_version != SCHEMA_VERSION
+            || record.source != SOURCE
+            || record.verified_at_unix_seconds <= 0
+            || record.bundle_id != self.bundle_id
+        {
+            return None;
+        }
+        Some(record)
+    }
+}
+
+/// Resolve the evidence namespace from the canonical executable's validated
+/// app metadata. Folder names and caller-provided bundle labels are never
+/// trusted for this decision.
+pub(crate) fn direct_capture_evidence_store_for_driver_executable(
+    executable: &Path,
+    home: &Path,
+) -> Option<DirectCaptureEvidenceStore> {
+    let identity = driver_app_for_executable(executable)?;
+    direct_capture_evidence_store_for_bundle(identity.bundle_id, home)
+}
+
+pub(crate) fn direct_capture_evidence_store_for_bundle(
+    bundle_id: &str,
+    home: &Path,
+) -> Option<DirectCaptureEvidenceStore> {
+    let state_directory = match bundle_id {
+        "com.meta.musecode.cua.driver.local" => ".cua-driver-local",
+        "com.meta.musecode.cua.driver" => ".cua-driver",
+        _ => return None,
+    };
+    Some(DirectCaptureEvidenceStore::new(
+        home.join(state_directory)
+            .join("direct-capture-verification.json"),
+        bundle_id,
+    ))
+}
+
+pub(crate) fn current_driver_direct_capture_evidence_store(
+) -> Result<DirectCaptureEvidenceStore, String> {
+    let executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| format!("resolve current driver executable: {error}"))?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "current user home directory is unavailable".to_owned())?;
+    direct_capture_evidence_store_for_driver_executable(&executable, &home).ok_or_else(|| {
+        "current executable is not a recognized installed CuaDriver app identity".to_owned()
+    })
 }
 
 fn write_json_atomic(path: &Path, value: &PersistedVerification) -> Result<(), String> {
@@ -117,7 +200,7 @@ fn write_json_atomic(path: &Path, value: &PersistedVerification) -> Result<(), S
 mod tests {
     use super::*;
 
-    const RELEASE_BUNDLE_ID: &str = "com.trycua.driver";
+    const RELEASE_BUNDLE_ID: &str = "com.meta.musecode.cua.driver";
     const VERIFIED_AT: i64 = 1_754_352_000;
 
     fn store(path: PathBuf) -> DirectCaptureEvidenceStore {
@@ -138,6 +221,39 @@ mod tests {
                 bundle_id: RELEASE_BUNDLE_ID.to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn same_identity_update_strictly_refreshes_evidence_timestamp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("verification.json");
+        let package_a = store(path.clone());
+        package_a
+            .record_at(VERIFIED_AT)
+            .expect("record package A verification");
+
+        // Package B has a different binary/CDHash but the same designated TCC
+        // identity and evidence namespace. A second-granularity wall clock may
+        // not advance during a fast update, so the writer must do so itself.
+        let package_b = store(path.clone());
+        package_b
+            .record_at(VERIFIED_AT)
+            .expect("record package B verification");
+        let refreshed: PersistedVerification =
+            serde_json::from_slice(&std::fs::read(&path).expect("read refreshed verification"))
+                .expect("parse refreshed verification");
+        assert_eq!(refreshed.verified_at_unix_seconds, VERIFIED_AT + 1);
+
+        // A backwards wall-clock adjustment must not make fresh evidence look
+        // older than the evidence emitted by the previous package.
+        package_b
+            .record_at(VERIFIED_AT - 60)
+            .expect("refresh after backwards clock adjustment");
+        let refreshed_again: PersistedVerification = serde_json::from_slice(
+            &std::fs::read(path).expect("read second refreshed verification"),
+        )
+        .expect("parse second refreshed verification");
+        assert_eq!(refreshed_again.verified_at_unix_seconds, VERIFIED_AT + 2);
     }
 
     #[test]
@@ -165,7 +281,7 @@ mod tests {
                 ..valid.clone()
             },
             PersistedVerification {
-                bundle_id: "com.trycua.driver.local".to_owned(),
+                bundle_id: "com.meta.musecode.cua.driver.local".to_owned(),
                 ..valid
             },
         ];
