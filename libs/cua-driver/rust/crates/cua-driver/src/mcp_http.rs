@@ -168,7 +168,6 @@ async fn dispatch(
         Err(_) => return Some(serialize(&Response::parse_error())),
     };
     req.id.as_ref()?;
-    let initialize_metadata = req.initialize_metadata();
     apply_session_identity(&mut req, transport_session);
     let session_context = req.tool_call().ok().and_then(|call| {
         sdk.begin_tool_call(
@@ -187,13 +186,6 @@ async fn dispatch(
         if let Some(context) = session_context {
             context.complete(&outcome);
         }
-        crate::telemetry::capture_tool_completed(outcome, crate::telemetry::Transport::McpHttp);
-    }
-    if let Some(metadata) = initialize_metadata {
-        crate::telemetry::capture_mcp_session_started(
-            metadata,
-            crate::telemetry::Transport::McpHttp,
-        );
     }
     Some(serialize(&response))
 }

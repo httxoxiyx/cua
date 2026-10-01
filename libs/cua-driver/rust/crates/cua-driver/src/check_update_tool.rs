@@ -1,19 +1,15 @@
 //! `check_for_update` MCP tool — programmatic mirror of
 //! `cua-driver check-update`.
 //!
-//! Lives in the `cua-driver` binary crate (not in `cua-driver-core` or the
-//! per-platform `tools/` modules) for one reason: the implementation calls
-//! into `version_check`, which pulls `ureq` + rustls. Putting that crypto
-//! stack into `cua-driver-core` would propagate it into every platform
-//! crate's dep graph and break cross-target builds from macOS host (ring's
-//! C bits can't find MSVC headers without an MSVC toolchain installed).
-//! Keeping it here, behind a thin registry-injection seam, means
-//! `cua-driver` keeps its existing dep footprint while every platform's
-//! tool table still exposes the new MCP tool.
+//! Update checks are disabled in this build (see [`crate::version_check`]).
+//! The tool stays registered so the tool roster, capability vocabulary, and
+//! authorization tables keep the same names, but it only returns the static
+//! "update checks are disabled" result: it makes no network request and reads
+//! or writes no files.
 //!
-//! Registered by [`register_into`] from `main.rs` immediately after the
-//! per-platform `register_tools()` call, so the result is identical to
-//! the per-platform tools registering it themselves.
+//! Registered by [`register_into`] immediately after the per-platform
+//! `register_tools()` call, so the result is identical to the per-platform
+//! tools registering it themselves.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -30,10 +26,10 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "check_for_update".into(),
-        description: "Check the saved stable/nightly Cua Driver channel for a release on GitHub. \
-             Returns current and selected channels, current and latest versions, an `update_available` boolean, \
-             the install one-liner, and the release notes URL. Read-only — never \
-             installs. Mirror of `cua-driver check-update --json`."
+        description: "Report this build's update-check policy. Update checks are disabled \
+             in this build: the tool never contacts the network and always returns \
+             `update_available: false` with a message to update through your distribution \
+             channel. Read-only. Mirror of `cua-driver check-update --json`."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -43,11 +39,16 @@ fn def() -> &'static ToolDef {
         read_only: true,
         destructive: false,
         idempotent: true,
-        // The check hits GitHub over the network, so the response can
-        // change between invocations even though the tool is read-only
-        // from the caller's perspective.
-        open_world: true,
+        // The response is static and nothing outside the process is consulted.
+        open_world: false,
     })
+}
+
+/// The static `check_for_update` result: no network, no filesystem access.
+fn update_check_result() -> ToolResult {
+    let state = crate::version_check::update_state();
+    let structured = serde_json::to_value(&state).unwrap_or_else(|_| serde_json::json!({}));
+    ToolResult::text(state.message).with_structured(structured)
 }
 
 #[async_trait]
@@ -57,32 +58,7 @@ impl Tool for CheckForUpdateTool {
     }
 
     async fn invoke(&self, _args: Value) -> ToolResult {
-        // The fetch hits the network with a 4s timeout — run on a
-        // blocking pool so the MCP server's tokio runtime keeps
-        // multiplexing other tool calls during the round-trip.
-        let state = tokio::task::spawn_blocking(|| crate::version_check::check_update_state(false))
-            .await
-            .expect("version_check::check_update_state never panics");
-        crate::version_check::capture_update_state(
-            &state,
-            crate::telemetry::UpdateCheckSource::Mcp,
-        );
-
-        let summary = if let Some(err) = &state.error {
-            format!("Update check failed: {err}")
-        } else if state.update_available {
-            let latest = state.latest_version.as_deref().unwrap_or("?");
-            format!(
-                "Update available: cua-driver {latest} (you have {}).",
-                state.current_version
-            )
-        } else {
-            format!("Up to date (cua-driver {}).", state.current_version)
-        };
-
-        let structured = serde_json::to_value(&state).unwrap_or_else(|_| serde_json::json!({}));
-
-        ToolResult::text(summary).with_structured(structured)
+        update_check_result()
     }
 }
 
@@ -91,4 +67,23 @@ impl Tool for CheckForUpdateTool {
 /// `register_tools()` signature untouched.
 pub fn register_into(registry: &mut ToolRegistry) {
     registry.register(Box::new(CheckForUpdateTool));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_for_update_returns_the_static_disabled_result() {
+        let result = serde_json::to_value(update_check_result()).unwrap();
+        assert_ne!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            crate::version_check::DISABLED_MESSAGE
+        );
+        assert_eq!(result["structuredContent"]["update_available"], false);
+        assert_eq!(result["structuredContent"]["source"], "disabled");
+        assert!(!def().open_world);
+        assert!(def().read_only);
+    }
 }

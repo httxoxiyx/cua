@@ -14,7 +14,7 @@
 //! ## Probe categories
 //!
 //! - **Cross-platform**: version + arch, install layout, home dir,
-//!   telemetry state.
+//!   telemetry (removed from this build; reports leftover legacy files).
 //! - **Windows**: interactive desktop session detection (Session 0 warning),
 //!   UI Automation COM availability, top-level window enumeration count.
 //! - **Linux**: `DISPLAY` / `WAYLAND_DISPLAY` presence, X11 connection
@@ -235,23 +235,20 @@ fn probe_home_dir() -> Probe {
     )
 }
 
-/// Probe the same effective persisted/environment state as `telemetry status`.
+/// Report the same state as `telemetry status`: telemetry is removed from this
+/// build, plus whether an earlier build left telemetry files behind. Local
+/// filesystem reads only.
 fn probe_telemetry() -> Probe {
-    let status = crate::telemetry::status();
-    if status.enabled {
-        let identity = if status.installation_id_present {
-            "install-id present"
-        } else {
-            "install-id not yet generated"
-        };
+    if crate::telemetry::status().legacy_state_present {
         Probe::ok(
             "telemetry",
-            format!("enabled via {} ({identity})", status.source),
+            "removed from this build; files from an earlier build remain \
+             (`cua-driver telemetry reset-id` deletes them)",
         )
     } else {
         Probe::ok(
             "telemetry",
-            format!("disabled via {} (installation ID retained)", status.source),
+            "removed from this build (nothing is collected or sent)",
         )
     }
 }
