@@ -615,7 +615,7 @@ fi
 # runtime-owned children, and leave any unrelated files in place.
 LOCAL_HOME_MARKER="$HOME_DIR/packages/current/cua-driver-local"
 if [[ -e "$LOCAL_HOME_MARKER" || -L "$LOCAL_HOME_MARKER" ]]; then
-    rm -rf "$HOME_DIR/packages" "$HOME_DIR/skills"
+    rm -rf "$HOME_DIR/packages" "$HOME_DIR/skills" "$HOME_DIR/.release_installed"
     rm -f \
         "$HOME_DIR/.installation_recorded" \
         "$HOME_DIR/.telemetry_enabled" \

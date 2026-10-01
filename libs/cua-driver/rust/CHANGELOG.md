@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased (httxoxiyx/cua)
+
+### Removed
+
+* **cua-driver:** product telemetry. The analytics endpoint, project key, HTTP
+  delivery, background delivery workers, installation ID, and lifecycle markers
+  are gone. `cua-driver telemetry` subcommands report the removal;
+  `telemetry reset-id` deletes the telemetry files and update-check cache left
+  by earlier builds in `~/.cua-driver`, `~/.cua-driver-local`, and
+  `~/.cua-driver-rs`, whichever build runs it.
+* **cua-driver:** update checks. No GitHub releases lookup, cache, or startup
+  banner. `check-update`, `update`, and the `check_for_update` MCP tool (still
+  registered) return a static "update checks are disabled in this build; update
+  through your distribution channel" answer; `update --apply` installs nothing.
+* **cua-driver:** remote skill downloads. `skills install` / `update` write the
+  skill pack compiled into the binary; `--from` is rejected.
+* **cua-driver:** the `ureq`, `tar`, and `flate2` dependencies.
+* **installers:** the inherited release installers no longer run
+  `telemetry install-event`, write `.telemetry_install_channel`, or copy a
+  legacy telemetry ID forward. They still install upstream binaries, which keep
+  upstream telemetry. Uninstall purges also delete `.release_installed/`.
+* **skill pack:** the bundled skill no longer tells agents to install Cua Driver
+  with the upstream `cua.ai` one-line installers.
+
 ## [0.23.2](https://github.com/trycua/cua/compare/cua-driver-rs-v0.23.1...cua-driver-rs-v0.23.2) (2026-08-31)
 
 

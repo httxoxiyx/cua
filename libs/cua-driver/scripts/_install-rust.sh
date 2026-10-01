@@ -1731,52 +1731,6 @@ fi
 
 mkdir -p "$BIN_DIR"
 
-# Persist the bounded installer channel before the new binary becomes visible.
-# If the user invokes Cua Driver before the detached install-event hook wins
-# the lifecycle lock, the ordinary first-run path will still use the installer
-# attribution. The runtime removes this hint after lifecycle delivery succeeds.
-INSTALL_CHANNEL="${CUA_DRIVER_INSTALL_CHANNEL:-install_script}"
-case "$INSTALL_CHANNEL" in
-    install_script|update_apply|python_package|first_run) ;;
-    *) INSTALL_CHANNEL="install_script" ;;
-esac
-
-# Mirror the runtime's consent precedence before writing the attribution hint:
-# environment override, compatibility override, persisted preference, default-on.
-# This keeps an opted-out install free of telemetry state even when the detached
-# install-event hook returns before reading the hint.
-TELEMETRY_HINT_ENABLED=1
-TELEMETRY_HINT_FROM_ENV=0
-for telemetry_env_name in CUA_DRIVER_RS_TELEMETRY_ENABLED CUA_TELEMETRY_ENABLED; do
-    telemetry_env_value="${!telemetry_env_name:-}"
-    telemetry_env_value="$(printf '%s' "$telemetry_env_value" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-    case "$telemetry_env_value" in
-        1|true|yes|on)
-            TELEMETRY_HINT_ENABLED=1
-            TELEMETRY_HINT_FROM_ENV=1
-            break
-            ;;
-        0|false|no|off)
-            TELEMETRY_HINT_ENABLED=0
-            TELEMETRY_HINT_FROM_ENV=1
-            break
-            ;;
-    esac
-done
-if [[ "$TELEMETRY_HINT_FROM_ENV" == "0" && -f "$HOME_DIR/config.json" ]]; then
-    TELEMETRY_CONFIG_VALUE="$(sed -nE 's/.*"telemetry_enabled"[[:space:]]*:[[:space:]]*(true|false).*/\1/p' "$HOME_DIR/config.json" | tail -n 1)"
-    case "$TELEMETRY_CONFIG_VALUE" in
-        true) TELEMETRY_HINT_ENABLED=1 ;;
-        false) TELEMETRY_HINT_ENABLED=0 ;;
-    esac
-fi
-if [[ "$TELEMETRY_HINT_ENABLED" == "1" ]]; then
-    mkdir -p "$HOME_DIR"
-    printf '%s\n' "$INSTALL_CHANNEL" > "$HOME_DIR/.telemetry_install_channel"
-else
-    rm -f "$HOME_DIR/.telemetry_install_channel"
-fi
-
 # macOS: install the .app to /Applications first, then symlink the
 # bin into the bundle so `~/.local/bin/cua-driver` resolves into
 # `/Applications/CuaDriver.app/Contents/MacOS/cua-driver`. The
@@ -2180,15 +2134,8 @@ fi
 # Runs AFTER staging so we never delete state before the replacement exists;
 # skipped when the user pinned CUA_DRIVER_RS_HOME to the legacy path on
 # purpose. Best-effort + idempotent.
+# Telemetry identity files are not carried over; they are swept with the rest.
 if [[ -d "$LEGACY_HOME_DIR" && "$HOME_DIR" != "$LEGACY_HOME_DIR" ]]; then
-    mkdir -p "$HOME_DIR"
-    for telemetry_file in .telemetry_id .installation_recorded; do
-        if [[ -f "$LEGACY_HOME_DIR/$telemetry_file" && ! -e "$HOME_DIR/$telemetry_file" ]]; then
-            cp -p "$LEGACY_HOME_DIR/$telemetry_file" "$HOME_DIR/$telemetry_file" 2>/dev/null \
-                && log "preserved legacy telemetry state $telemetry_file" \
-                || log "note: could not preserve legacy telemetry state $telemetry_file"
-        fi
-    done
     rm -rf "$LEGACY_HOME_DIR" 2>/dev/null \
         && log "swept legacy package home $LEGACY_HOME_DIR (reconciled onto $HOME_DIR)" \
         || log "note: could not fully remove legacy package home $LEGACY_HOME_DIR (best-effort)"
@@ -2215,25 +2162,15 @@ fi
 # matching GitHub release. The post-install hint below points at the
 # verb.
 
-# --- Record consent-aware install telemetry -----------------------------
+# --- Upstream telemetry notice ------------------------------------------
 #
-# Telemetry is default-on, but the binary applies the same effective consent
-# policy to installation events as every other event: environment override,
-# then the persisted preference, then the default. It records the pseudonymous
-# installation once and the installed release once per version. The channel
-# is a fixed enum so an inherited/user-controlled value cannot fragment the
-# dashboard.
-#
-# Background + redirect so a slow / failed POST never blocks the install.
-echo "Telemetry defaults to enabled for new installations; saved preferences and environment overrides are honored."
-echo "When enabled, Cua collects a pseudonymous installation ID and bounded, content-free usage metadata."
-echo "  No prompts, tool arguments, screen contents, or file paths are collected."
-echo "  Disable persistently at any time: $BIN_LINK telemetry disable"
-
-CUA_DRIVER_INSTALL_CHANNEL="$INSTALL_CHANNEL" \
-CUA_DRIVER_RELEASE_VERSION="$VERSION" \
-    "$BIN_LINK" telemetry install-event >/dev/null 2>&1 &
-disown 2>/dev/null || true
+# This inherited installer downloads upstream release binaries. It no longer
+# records an install event, writes an attribution hint, or carries a telemetry
+# ID forward, but the upstream binary itself sends usage telemetry by default.
+# The driver built from this repository has no telemetry at all.
+echo "Note: this installer installs an upstream Cua Driver release, which sends usage telemetry by default."
+echo "  Disable it persistently: $BIN_LINK telemetry disable (or set CUA_DRIVER_RS_TELEMETRY_ENABLED=0)."
+echo "  The driver built from this repository (scripts/install-local.sh) has no telemetry."
 
 # Auto-extend PATH for users whose shell doesn't already include BIN_DIR.
 if [[ "$NO_MODIFY_PATH" != "1" ]] && [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then

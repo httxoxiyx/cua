@@ -35,7 +35,6 @@ mod serve;
 mod skills;
 mod stop;
 mod telemetry;
-mod updater;
 mod version_check;
 
 use std::sync::Arc;
@@ -46,7 +45,6 @@ fn init_logging() {
         .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::from_env("CUA_LOG").add_directive(tracing::Level::WARN.into()))
         .init();
-    telemetry::register_stdio_observer();
 }
 
 fn configure_startup_permission_mode(
@@ -102,88 +100,52 @@ fn configure_startup_permission_mode(
     Ok(())
 }
 
-/// Execute finite commands in a child so the parent can observe every exit,
-/// including validation failures and legacy `process::exit` paths. Delivery is
-/// delegated to a detached, no-output worker after the child exits, so network
-/// latency is never added to the foreground command.
-fn maybe_wrap_finite_command() {
-    if telemetry::is_wrapped_cli_child() {
-        return;
-    }
-    let Some(command_name) = cli::finite_command_name_from_argv() else {
-        return;
-    };
-    let tool_name = cli::finite_tool_name_from_argv();
-    let computer_action = cli::finite_computer_action_from_argv();
-    let operation = cli::finite_operation_from_argv();
-    let client_kind = cli::finite_client_kind_from_argv();
-    telemetry::spawn_first_run_registration_worker();
-    let Ok(executable) = std::env::current_exe() else {
-        return;
-    };
-    let started_at = std::time::Instant::now();
-    let status = std::process::Command::new(executable)
-        .args(std::env::args_os().skip(1))
-        .env(telemetry::cli_wrapped_child_env(), "1")
-        .status();
-    let Ok(status) = status else {
-        return;
-    };
-    let exit_code = status.code().unwrap_or(1);
-    telemetry::spawn_cli_completion_worker(
-        command_name,
-        tool_name.as_deref(),
-        computer_action,
-        operation,
-        client_kind,
-        exit_code,
-        started_at.elapsed(),
-    );
-    std::process::exit(exit_code);
-}
-
+/// `cua-driver telemetry ...`. Telemetry is removed from this build, so every
+/// subcommand reports that. `reset-id` still deletes telemetry and update-check
+/// files an earlier build may have left in any Cua Driver home directory; it is
+/// a local-only operation.
 fn run_telemetry_command(command: cli::TelemetryCommand) {
     match command {
-        cli::TelemetryCommand::InstallEvent => telemetry::capture_install(),
-        cli::TelemetryCommand::Enable => match telemetry::set_enabled(true) {
-            Ok(()) => println!("Telemetry enabled. The retained installation ID will be reused."),
-            Err(error) => {
-                eprintln!("cua-driver: failed to enable telemetry: {error}");
-                std::process::exit(1);
-            }
-        },
-        cli::TelemetryCommand::Disable => match telemetry::set_enabled(false) {
-            Ok(()) => println!("Telemetry disabled. The local installation ID was retained; run `cua-driver telemetry reset-id` to erase it."),
-            Err(error) => {
-                eprintln!("cua-driver: failed to disable telemetry: {error}");
-                std::process::exit(1);
-            }
-        },
         cli::TelemetryCommand::Status { json } => {
             let status = telemetry::status();
             if json {
-                println!("{}", serde_json::to_string_pretty(&status).expect("serialize telemetry status"));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status).expect("serialize telemetry status")
+                );
             } else {
-                println!("Telemetry: {} (source: {})", if status.enabled { "enabled" } else { "disabled" }, status.source);
-                println!("Installation ID: {}", status.installation_id.as_deref().unwrap_or("not created"));
-                println!("Registration recorded: {}", status.registration_recorded);
-                println!("Current release recorded: {}", status.current_release_recorded);
+                println!("{}", telemetry::REMOVED_NOTICE);
+                if status.legacy_state_present {
+                    println!("Telemetry or update-check files from an earlier build are still on disk; run `cua-driver telemetry reset-id` to delete them.");
+                }
             }
         }
-        cli::TelemetryCommand::ResetId => match telemetry::reset_id() {
-            Ok(()) => println!("Telemetry installation ID and event markers erased. The enable/disable preference was retained."),
+        cli::TelemetryCommand::ResetId => match telemetry::remove_legacy_state() {
+            Ok(removed) => {
+                println!("{}", telemetry::REMOVED_NOTICE);
+                if removed.is_empty() {
+                    println!(
+                        "No telemetry or update-check files from an earlier build were found."
+                    );
+                }
+                for path in removed {
+                    println!("Removed {}", path.display());
+                }
+            }
             Err(error) => {
-                eprintln!("cua-driver: failed to reset telemetry ID: {error}");
+                eprintln!("cua-driver: failed to remove legacy telemetry files: {error}");
                 std::process::exit(1);
             }
         },
-        cli::TelemetryCommand::Inspect { event } => match telemetry::inspect_event(&event) {
-            Ok(payload) => println!("{}", serde_json::to_string_pretty(&payload).expect("serialize telemetry payload")),
-            Err(error) => {
-                eprintln!("cua-driver: {error}");
-                std::process::exit(64);
-            }
-        },
+        cli::TelemetryCommand::Enable => {
+            eprintln!("{} It cannot be enabled.", telemetry::REMOVED_NOTICE);
+            std::process::exit(1);
+        }
+        cli::TelemetryCommand::Disable
+        | cli::TelemetryCommand::InstallEvent
+        | cli::TelemetryCommand::Inspect => {
+            println!("{}", telemetry::REMOVED_NOTICE);
+        }
     }
 }
 
@@ -586,6 +548,120 @@ mod mcp_runtime_selection_tests {
     }
 }
 
+/// Regression guard for the removed phone-home paths (telemetry, update
+/// checks, remote skill downloads): no crate that is linked into, or shipped
+/// beside, a driver binary may regain an analytics endpoint or key, an HTTP
+/// client, or a GitHub API/raw/release-asset URL. Every workspace member is
+/// scanned except the test-only harness, so a crate added later is covered
+/// without editing this list. Needles are assembled at runtime so this test's
+/// own source text cannot match them.
+#[cfg(test)]
+mod no_phone_home_tests {
+    use std::path::{Path, PathBuf};
+
+    /// The one workspace member that never ships.
+    const TEST_ONLY_MEMBER: &str = "crates/cua-driver-testkit";
+
+    /// Members of the Rust workspace, read from its manifest.
+    fn workspace_members(workspace: &Path) -> Vec<String> {
+        let manifest = std::fs::read_to_string(workspace.join("Cargo.toml")).unwrap();
+        let list = manifest
+            .split_once("members = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("workspace manifest lists its members");
+        list.split(',')
+            .map(|member| member.trim().trim_matches('"').to_owned())
+            .filter(|member| !member.is_empty())
+            .collect()
+    }
+
+    /// Every file under `path`: Rust sources and the data files they embed.
+    fn collect_files(path: &Path, files: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                collect_files(&entry.unwrap().path(), files);
+            }
+        } else if path.is_file() {
+            files.push(path.to_owned());
+        }
+    }
+
+    #[test]
+    fn shipped_crates_have_no_analytics_http_client_or_github_endpoints() {
+        let needles = [
+            ["post", "hog"].concat(),
+            ["ph", "c_"].concat(),
+            ["ure", "q"].concat(),
+            ["req", "west"].concat(),
+            ["api.", "github.com"].concat(),
+            ["raw.", "githubusercontent.com"].concat(),
+            ["releases/", "download"].concat(),
+        ];
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let members = workspace_members(&workspace);
+        // Linked into a cua-driver binary on some platform, or shipped beside it
+        // (the Windows UIA helper, the cursor-theme sidecar). A rename must
+        // update this list rather than silently drop a crate from the scan.
+        for shipped in [
+            "crates/cua-driver",
+            "crates/cua-driver-core",
+            "crates/cua-driver-sdk",
+            "crates/cua-driver-contract",
+            "crates/platform-macos",
+            "crates/platform-windows",
+            "crates/platform-linux",
+            "crates/cua-driver-uia",
+            "crates/cursor-overlay",
+            "crates/cursor-theme-cli",
+            "crates/pip-preview",
+        ] {
+            assert!(
+                members.iter().any(|member| member == shipped),
+                "{shipped} is not a workspace member: {members:?}"
+            );
+        }
+        let mut files = Vec::new();
+        for member in members.iter().filter(|member| *member != TEST_ONLY_MEMBER) {
+            let crate_dir = workspace.join(member);
+            let manifest = crate_dir.join("Cargo.toml");
+            assert!(manifest.is_file(), "{} is missing", manifest.display());
+            files.push(manifest);
+            let build_script = crate_dir.join("build.rs");
+            if build_script.is_file() {
+                files.push(build_script);
+            }
+            collect_files(&crate_dir.join("src"), &mut files);
+        }
+        assert!(
+            files.len() > 300,
+            "source walk found only {} files",
+            files.len()
+        );
+        for file in files {
+            let bytes = std::fs::read(&file)
+                .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+            let source = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+            for needle in &needles {
+                assert!(
+                    !source.contains(needle.as_str()),
+                    "{} contains {needle:?}",
+                    file.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_and_update_checks_answer_statically() {
+        assert!(!crate::telemetry::is_enabled());
+        let state = crate::version_check::update_state();
+        assert!(!state.update_checks_enabled);
+        assert!(!state.update_available);
+        assert_eq!(state.latest_version, None);
+    }
+}
+
 // ── macOS entry-point ─────────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
@@ -599,8 +675,9 @@ fn main() {
     if let Some(code) = platform_macos::permissions::gate::run_permission_probe_if_requested() {
         std::process::exit(code);
     }
-    // The packaged uninstaller needs a truly offline, pre-telemetry purge
-    // path while this exact signed executable still exists on disk.
+    // The packaged uninstaller needs a truly offline purge path that runs
+    // before any other initialization, while this exact signed executable
+    // still exists on disk.
     if let Some(code) = history_runtime::run_offline_purge_if_requested() {
         std::process::exit(code);
     }
@@ -634,24 +711,11 @@ fn main() {
         }
         return;
     }
-    if telemetry::run_cli_completion_worker_if_requested() {
-        return;
-    }
-    if telemetry::run_lifecycle_worker_if_requested() {
-        return;
-    }
-    if telemetry::run_update_event_worker_if_requested() {
-        return;
-    }
-    maybe_wrap_finite_command();
 
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
     // Handled before AppKit init so `list-tools` / `describe` / `call` exit
     // cleanly without starting the overlay or NSApplication.
     let command = cli::parse_command();
-    if !telemetry::is_wrapped_cli_child() && !matches!(&command, cli::Command::Telemetry(_)) {
-        telemetry::spawn_first_run_registration_worker();
-    }
     match command {
         cli::Command::Telemetry(command) => {
             run_telemetry_command(command);
@@ -723,28 +787,16 @@ fn main() {
             );
             let gate_opts =
                 platform_macos::permissions::GateOpts::from_env_and_flag(no_permissions_gate);
-            if let Some((progress, context)) =
-                platform_macos::permissions::gate::prepare_telemetry_context(gate_opts.opt_out)
-            {
-                if progress == platform_macos::permissions::GateProgress::Started {
-                    telemetry::capture_permissions_gate_started(
-                        context.missing_accessibility,
-                        context.missing_screen_recording,
-                    );
-                }
-            }
+            // The gate records its episode start in process environment
+            // variables. Initialize them here, before the serve thread exists,
+            // so the gate never mutates the environment while other threads
+            // run. The returned bounded context was only ever used for
+            // telemetry, which this build does not have, so it is discarded.
+            let _ = platform_macos::permissions::gate::prepare_telemetry_context(gate_opts.opt_out);
             // Fail closed until a fresh helper-process probe completes. This
             // also covers a probe launch failure without letting the serving
             // process perform and cache its own negative TCC preflight.
             serve::set_permission_gate_pending(!gate_opts.opt_out);
-            telemetry::capture_start(
-                telemetry::event::SERVE_START_LEGACY,
-                telemetry::Transport::Daemon,
-            );
-            // Long-running daemon — kick off the background update check
-            // before any blocking work so the banner can land on stderr
-            // early in the serve lifecycle.
-            version_check::maybe_announce_update();
             let pip_cfg = match pip_preview::default_config_path() {
                 Some(p) => pip_preview::PipConfig::from_args_and_file(&p),
                 None => pip_preview::PipConfig::from_args(),
@@ -809,40 +861,9 @@ fn main() {
             // already active.  Honors --no-permissions-gate and
             // CUA_DRIVER_RS_PERMISSIONS_GATE=0 for CI / headless.
             //
-            let gate_result = platform_macos::permissions::run_if_needed_with_observer(
-                gate_opts,
-                |progress, context| match progress {
-                    platform_macos::permissions::GateProgress::Started => {
-                        telemetry::capture_permissions_gate_started(
-                            context.missing_accessibility,
-                            context.missing_screen_recording,
-                        );
-                    }
-                    platform_macos::permissions::GateProgress::Dismissed => {
-                        telemetry::capture_permissions_gate_dismissed(
-                            context.missing_accessibility,
-                            context.missing_screen_recording,
-                            context.elapsed,
-                        );
-                    }
-                },
-            );
+            let gate_result = platform_macos::permissions::run_if_needed(gate_opts);
             if gate_result.is_ok() {
                 serve::set_permission_gate_pending(false);
-            }
-            let gate_context = platform_macos::permissions::gate::telemetry_context();
-            if gate_context.engaged {
-                telemetry::capture_permissions_gate_completed(
-                    gate_context.missing_accessibility,
-                    gate_context.missing_screen_recording,
-                    gate_context.panel_shown,
-                    gate_context.dismissed,
-                    telemetry::permissions_gate_resolution(
-                        gate_result.is_err(),
-                        gate_context.dismissed,
-                    ),
-                    gate_context.elapsed,
-                );
             }
             if let Err(e) = gate_result {
                 eprintln!("[cua-driver] permissions gate: {e}");
@@ -952,13 +973,6 @@ fn main() {
             cli::run_channel_cmd(&subcommand, value.as_deref(), json);
         }
         cli::Command::Doctor { json } => {
-            // Long-running interactive entry point — kick off the
-            // background "new version available?" check so the banner
-            // can land on stderr if the user is on an outdated install.
-            // Skip the banner in --json mode so output stays parseable.
-            if !json {
-                version_check::maybe_announce_update();
-            }
             cli::run_doctor_cmd(json);
         }
         cli::Command::Diagnose => {
@@ -997,13 +1011,9 @@ fn main() {
             experimental_pip,
             expected_pid,
         } => {
-            let startup_started = std::time::Instant::now();
             let feedback_override = cursor_overlay::CursorConfig::click_feedback_override(
                 &std::env::args().skip(1).collect::<Vec<_>>(),
             );
-            // Long-running MCP proxy — kick off the background update check
-            // before connecting to or launching the daemon.
-            version_check::maybe_announce_update();
             let result = if expected_pid.is_some() && (direct || socket.is_none()) {
                 Err(anyhow::anyhow!(
                     "--expected-pid requires daemon-backed `mcp --socket <path>`"
@@ -1011,19 +1021,8 @@ fn main() {
             } else {
                 match mcp_uses_direct_runtime(socket.as_deref(), direct) {
                     Ok(true) => {
-                        if let Err(error) =
-                            configure_startup_permission_mode(None, false, None, false, &grants)
-                        {
-                            Err(error)
-                        } else {
-                            telemetry::capture_mcp_startup_completed(
-                                "sdk_owned_runtime",
-                                "not_applicable",
-                                true,
-                                startup_started.elapsed(),
-                            );
-                            run_mcp_direct(claude_code_compat)
-                        }
+                        configure_startup_permission_mode(None, false, None, false, &grants)
+                            .and_then(|()| run_mcp_direct(claude_code_compat))
                     }
                     Err(error) => Err(error),
                     Ok(false) => cli::run_mcp_via_daemon_proxy(
@@ -1033,23 +1032,13 @@ fn main() {
                         &grants,
                         experimental_pip,
                         feedback_override,
-                        |daemon, success| {
-                            telemetry::capture_mcp_startup_completed(
-                                "daemon_proxy",
-                                daemon.telemetry_value(),
-                                success,
-                                startup_started.elapsed(),
-                            )
-                        },
                     ),
                 }
             };
             if let Err(e) = result {
                 eprintln!("cua-driver-rs: {e}");
-                telemetry::flush_pending(std::time::Duration::from_millis(750));
                 std::process::exit(1);
             }
-            telemetry::flush_pending(std::time::Duration::from_millis(750));
         }
     }
 }
@@ -1065,25 +1054,12 @@ fn main() -> anyhow::Result<()> {
     if let Some(generation) = private_worker::requested_generation() {
         return private_worker::run(generation, None);
     }
-    if telemetry::run_cli_completion_worker_if_requested() {
-        return Ok(());
-    }
-    if telemetry::run_lifecycle_worker_if_requested() {
-        return Ok(());
-    }
-    if telemetry::run_update_event_worker_if_requested() {
-        return Ok(());
-    }
-    maybe_wrap_finite_command();
 
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
     // These commands create their own tokio runtimes internally, so they must
     // run on a plain OS thread — not inside a #[tokio::main] context which
     // would cause nested block_on panics.
     let command = cli::parse_command();
-    if !telemetry::is_wrapped_cli_child() && !matches!(&command, cli::Command::Telemetry(_)) {
-        telemetry::spawn_first_run_registration_worker();
-    }
     match command {
         cli::Command::Telemetry(command) => {
             run_telemetry_command(command);
@@ -1153,13 +1129,6 @@ fn main() -> anyhow::Result<()> {
                 cursor_cfg.async_click_feedback,
                 &grants,
             );
-            telemetry::capture_start(
-                telemetry::event::SERVE_START_LEGACY,
-                telemetry::Transport::Daemon,
-            );
-            // Long-running daemon — kick off the background update check
-            // before any blocking work so the banner can land on stderr.
-            version_check::maybe_announce_update();
             // The Rust permissions gate is macOS-only (TCC concept).
             // On Windows / Linux the flag is silently accepted for
             // CLI uniformity and ignored. The Claude-Code compat screenshot
@@ -1253,12 +1222,6 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         cli::Command::Doctor { json } => {
-            // Long-running interactive entry point — kick off the
-            // background update check so the banner can land on stderr.
-            // Skip the banner in --json mode so output stays parseable.
-            if !json {
-                version_check::maybe_announce_update();
-            }
             cli::run_doctor_cmd(json);
             return Ok(());
         }
@@ -1303,13 +1266,9 @@ fn main() -> anyhow::Result<()> {
             experimental_pip,
             expected_pid,
         } => {
-            let startup_started = std::time::Instant::now();
             let feedback_override = cursor_overlay::CursorConfig::click_feedback_override(
                 &std::env::args().skip(1).collect::<Vec<_>>(),
             );
-            // Long-running MCP proxy — kick off the background update check
-            // before connecting to the daemon.
-            version_check::maybe_announce_update();
             let result = if expected_pid.is_some() && (direct || socket.is_none()) {
                 Err(anyhow::anyhow!(
                     "--expected-pid requires daemon-backed `mcp --socket <path>`"
@@ -1318,12 +1277,6 @@ fn main() -> anyhow::Result<()> {
                 match mcp_uses_direct_runtime(socket.as_deref(), direct) {
                     Ok(true) => {
                         configure_startup_permission_mode(None, false, None, false, &grants)?;
-                        telemetry::capture_mcp_startup_completed(
-                            "sdk_owned_runtime",
-                            "not_applicable",
-                            true,
-                            startup_started.elapsed(),
-                        );
                         run_mcp_direct(claude_code_compat)
                     }
                     Err(error) => Err(error),
@@ -1334,23 +1287,13 @@ fn main() -> anyhow::Result<()> {
                         &grants,
                         experimental_pip,
                         feedback_override,
-                        |daemon, success| {
-                            telemetry::capture_mcp_startup_completed(
-                                "daemon_proxy",
-                                daemon.telemetry_value(),
-                                success,
-                                startup_started.elapsed(),
-                            )
-                        },
                     ),
                 }
             };
             if let Err(e) = result {
                 eprintln!("cua-driver-rs: {e}");
-                telemetry::flush_pending(std::time::Duration::from_millis(750));
                 std::process::exit(1);
             }
-            telemetry::flush_pending(std::time::Duration::from_millis(750));
             return Ok(());
         }
     }

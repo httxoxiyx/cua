@@ -238,7 +238,7 @@ Tool names are `snake_case`, management subcommands are
 - `cua-driver stop` / `status`
 - `cua-driver list-tools`, `describe <tool>`
 - `cua-driver recording start|stop|status` — see `RECORDING.md`
-- `cua-driver check-update [--json] [--no-cache]` — read-only "is a newer release available?" probe. Same payload as the `check_for_update` MCP tool; pair with `cua-driver update --apply` to install.
+- `cua-driver check-update [--json]` — update checks are disabled in this build; it (and the `check_for_update` MCP tool) only returns a static "update through your distribution channel" answer and never contacts the network.
 
 Canonical multi-step workflow within one persistent MCP connection (example
 shape — platform-specific launch idioms in the per-OS companion file):
@@ -400,7 +400,7 @@ decision to stop, retry, or advance the ladder.
 
 ## Choose the target on each action
 
-A session owns lifecycle, cursor, recording, cleanup, and telemetry state. It
+A session owns lifecycle, cursor, recording, and cleanup state. It
 does not store the current capture modality. Select an exact target on each
 action:
 

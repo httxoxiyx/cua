@@ -237,10 +237,10 @@ fn probe_pipe_once(socket: &str) -> ProbeOutcome {
     use std::io::{BufRead, BufReader, Write};
 
     // Exercise the real named-pipe protocol instead of spawning `status`.
-    // A finite CLI command is wrapped by the telemetry completion observer,
-    // which makes it an unnecessarily heavy and timing-sensitive readiness
-    // probe on hosted Windows runners. Completing `list` also proves that the
-    // server has progressed past pipe creation and can service the connection.
+    // Spawning a finite CLI process per attempt is an unnecessarily heavy and
+    // timing-sensitive readiness probe on hosted Windows runners. Completing
+    // `list` also proves that the server has progressed past pipe creation and
+    // can service the connection.
     let Ok(pipe) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

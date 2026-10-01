@@ -1346,16 +1346,9 @@ function Remove-LegacyInstall {
     }
 
     # 4. Remove the legacy package home tree.
+    # Telemetry identity files are not carried over; they go with the tree.
     if (Test-Path -LiteralPath $LegacyHomeDir) {
         try {
-            New-Item -ItemType Directory -Force -Path $HomeDir | Out-Null
-            foreach ($telemetryFile in @('.telemetry_id', '.installation_recorded')) {
-                $legacyTelemetryPath = Join-Path $LegacyHomeDir $telemetryFile
-                $currentTelemetryPath = Join-Path $HomeDir $telemetryFile
-                if ((Test-Path -LiteralPath $legacyTelemetryPath) -and -not (Test-Path -LiteralPath $currentTelemetryPath)) {
-                    Copy-Item -LiteralPath $legacyTelemetryPath -Destination $currentTelemetryPath -Force -ErrorAction Stop
-                }
-            }
             Remove-Item -LiteralPath $LegacyHomeDir -Recurse -Force -ErrorAction Stop
         } catch {
             Write-Host "  (could not remove $LegacyHomeDir : $($_.Exception.Message))" -ForegroundColor Yellow
@@ -1455,61 +1448,6 @@ if (-not $skipDownload) {
     }
 }
 
-# Persist the bounded installer channel before the new junction target becomes
-# visible. If a user command wins the lifecycle lock before the detached hook,
-# the runtime reads this hint and preserves installer attribution. It removes
-# the hint after lifecycle delivery succeeds.
-$allowedChannels = @("install_script", "update_apply", "python_package", "first_run")
-$installChannel = $env:CUA_DRIVER_INSTALL_CHANNEL
-if (-not $installChannel -or $installChannel -notin $allowedChannels) {
-    $installChannel = "install_script"
-}
-
-# Mirror the runtime's consent precedence before writing the attribution hint:
-# environment override, compatibility override, persisted preference, default-on.
-$telemetryHintEnabled = $true
-$telemetryHintFromEnvironment = $false
-foreach ($telemetryEnvironmentName in @('CUA_DRIVER_RS_TELEMETRY_ENABLED', 'CUA_TELEMETRY_ENABLED')) {
-    $telemetryEnvironmentValue = [Environment]::GetEnvironmentVariable($telemetryEnvironmentName)
-    if ($null -eq $telemetryEnvironmentValue) {
-        continue
-    }
-    $telemetryEnvironmentValue = $telemetryEnvironmentValue.Trim().ToLowerInvariant()
-    if ($telemetryEnvironmentValue -in @('1', 'true', 'yes', 'on')) {
-        $telemetryHintEnabled = $true
-        $telemetryHintFromEnvironment = $true
-        break
-    }
-    if ($telemetryEnvironmentValue -in @('0', 'false', 'no', 'off')) {
-        $telemetryHintEnabled = $false
-        $telemetryHintFromEnvironment = $true
-        break
-    }
-}
-if (-not $telemetryHintFromEnvironment) {
-    $telemetryConfigPath = Join-Path $HomeDir 'config.json'
-    if (Test-Path -LiteralPath $telemetryConfigPath) {
-        try {
-            $telemetryConfig = Get-Content -LiteralPath $telemetryConfigPath -Raw | ConvertFrom-Json
-            $telemetryPreference = $telemetryConfig.PSObject.Properties['telemetry_enabled']
-            if ($null -ne $telemetryPreference -and $telemetryPreference.Value -is [bool]) {
-                $telemetryHintEnabled = $telemetryPreference.Value
-            }
-        }
-        catch {
-            # Match the runtime: malformed config falls through to default-on.
-        }
-    }
-}
-$telemetryHintPath = Join-Path $HomeDir '.telemetry_install_channel'
-if ($telemetryHintEnabled) {
-    New-Item -ItemType Directory -Force -Path $HomeDir | Out-Null
-    Set-Content -LiteralPath $telemetryHintPath -Value $installChannel -Encoding Ascii -NoNewline
-}
-else {
-    Remove-Item -LiteralPath $telemetryHintPath -Force -ErrorAction SilentlyContinue
-}
-
 # Wire up the junction chain. The inner junction (current → releases\<v>)
 # is what makes the upgrade atomic; the outer junction (bin → current)
 # is what gives users a stable PATH entry.
@@ -1530,46 +1468,17 @@ Ensure-Junction $VisibleBinDir $CurrentDir
 $keepVersions = Resolve-KeepVersions
 Invoke-OldReleasesGc -releasesDir $ReleasesDir -currentDir $CurrentDir -target $target -keep $keepVersions
 
-# ---------- Record consent-aware install telemetry ------------------------
+# ---------- Upstream telemetry notice -------------------------------------
 #
-# Same shape as the Unix installer. The binary applies the normal effective
-# consent policy, preserves the v1 registration marker, and records this
-# release once per version. Keep the channel bounded before allowing it into
-# analytics.
+# This inherited installer downloads upstream release binaries. It no longer
+# records an install event, writes an attribution hint, or carries a telemetry
+# ID forward, but the upstream binary itself sends usage telemetry by default.
+# The driver built from this repository has no telemetry at all.
 $installedBinary = Join-Path $VisibleBinDir $BinaryName
 if (Test-Path -LiteralPath $installedBinary) {
-    Write-Host "Telemetry defaults to enabled for new installations; saved preferences and environment overrides are honored." -ForegroundColor Cyan
-    Write-Host "When enabled, Cua collects a pseudonymous installation ID and bounded, content-free usage metadata." -ForegroundColor Cyan
-    Write-Host "  No prompts, tool arguments, screen contents, or file paths are collected."
-    Write-Host "  Disable persistently at any time: $installedBinary telemetry disable"
-    try {
-        # install.ps1 commonly runs via `irm | iex` in the caller's shell.
-        # Restore both variables after Start-Process snapshots the environment
-        # so the install does not leak transient attribution into that shell.
-        $savedChannel = $env:CUA_DRIVER_INSTALL_CHANNEL
-        $savedReleaseVersion = $env:CUA_DRIVER_RELEASE_VERSION
-        try {
-            $env:CUA_DRIVER_INSTALL_CHANNEL = $installChannel
-            $env:CUA_DRIVER_RELEASE_VERSION = $version
-            Start-Process -FilePath $installedBinary -ArgumentList "telemetry","install-event" `
-                          -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
-        }
-        finally {
-            if ($null -eq $savedChannel) {
-                Remove-Item Env:CUA_DRIVER_INSTALL_CHANNEL -ErrorAction SilentlyContinue
-            } else {
-                $env:CUA_DRIVER_INSTALL_CHANNEL = $savedChannel
-            }
-            if ($null -eq $savedReleaseVersion) {
-                Remove-Item Env:CUA_DRIVER_RELEASE_VERSION -ErrorAction SilentlyContinue
-            } else {
-                $env:CUA_DRIVER_RELEASE_VERSION = $savedReleaseVersion
-            }
-        }
-    }
-    catch {
-        # Ignore — telemetry must never block install.
-    }
+    Write-Host "Note: this installer installs an upstream Cua Driver release, which sends usage telemetry by default." -ForegroundColor Cyan
+    Write-Host "  Disable it persistently: $installedBinary telemetry disable (or set CUA_DRIVER_RS_TELEMETRY_ENABLED=0)."
+    Write-Host "  The driver built from this repository (scripts\install-local.ps1) has no telemetry."
 }
 
 # ---------- PATH update (User scope, idempotent, fallback to manual) ------

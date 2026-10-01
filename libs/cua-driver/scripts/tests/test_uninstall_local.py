@@ -35,11 +35,17 @@ def test_unix_local_uninstall_removes_owned_links_and_preserves_release(tmp_path
     local_marker.parent.mkdir(parents=True)
     local_marker.write_text("local\n", encoding="utf-8")
     for runtime_file in (
+        ".telemetry_id",
         ".telemetry_identity.lock",
         ".telemetry_lifecycle.lock",
         ".telemetry_retry_after",
+        "version_check.json",
     ):
         (local_home / runtime_file).write_text("local runtime state\n", encoding="utf-8")
+    # Per-release markers written by builds that still had telemetry.
+    release_marker = local_home / ".release_installed/0.23.2"
+    release_marker.parent.mkdir(parents=True)
+    release_marker.write_text("local runtime state\n", encoding="utf-8")
 
     _executable(fake_bin / "uname", "printf 'Linux\\n'")
     _executable(fake_bin / "id", "printf '501\\n'")
@@ -198,6 +204,7 @@ def test_local_uninstall_contract_is_explicit_on_both_platforms() -> None:
         ".telemetry_identity.lock",
         ".telemetry_lifecycle.lock",
         ".telemetry_retry_after",
+        ".release_installed",
     ):
         assert token in unix
         assert token in windows

@@ -121,15 +121,15 @@ pub enum Command {
         pretty: bool,
         doc_type: String,
     },
+    /// `cua-driver update [--apply] [--json]`. Update checks and self-update
+    /// are disabled in this build; the verb only reports that.
     Update {
         apply: bool,
         json: bool,
     },
-    /// `cua-driver check-update [--json] [--no-cache]` — pure check verb.
-    /// Never installs; the apply path stays on `update --apply` so the
-    /// "did anything change on disk?" question is unambiguous from argv.
-    /// Mirror of the `check_for_update` MCP tool — both routes share
-    /// `crate::version_check::check_update_state`.
+    /// `cua-driver check-update [--json] [--no-cache]`. Update checks are
+    /// disabled in this build; like the `check_for_update` MCP tool it returns
+    /// the static `crate::version_check::update_state()`.
     CheckUpdate {
         json: bool,
         no_cache: bool,
@@ -160,7 +160,9 @@ pub enum Command {
         value: Option<String>,
         socket: Option<String>,
     },
-    /// Content-free telemetry preference, inspection, and installer hooks.
+    /// Telemetry is removed from this build. The verbs report that, and
+    /// `reset-id` deletes telemetry and update-check files left by an earlier
+    /// build in any Cua Driver home directory.
     Telemetry(TelemetryCommand),
     /// `cua-driver autostart {enable|disable|status|kick}` —
     /// platform-native auto-start so `cua-driver serve` comes up on
@@ -191,11 +193,9 @@ pub enum Command {
     /// installs or updates the cua-driver skill pack into their agent
     /// dirs (Claude Code / Codex / Prime Agent / OpenClaw / OpenCode); the install
     /// scripts never touch ~/.claude/skills/ etc. directly. `install`
-    /// fetches the matching versioned release asset
-    /// (`cua-driver-rs-v<v>-skills.tar.gz` — the asset filename keeps
-    /// the legacy `-rs` for backward-compat with pinned URLs) from
-    /// GitHub, places it under `<HomeDir>/skills/cua-driver/`, and
-    /// symlinks into each detected agent's `skills/` dir. See
+    /// writes the skill pack bundled into this binary to
+    /// `<HomeDir>/skills/cua-driver/` and symlinks it into each detected
+    /// agent's `skills/` dir. Nothing is downloaded. See
     /// `crates/cua-driver/src/skills.rs`.
     Skills {
         subcommand: String,
@@ -209,13 +209,15 @@ pub enum Command {
     },
 }
 
+/// Verbs accepted for compatibility with earlier builds. Telemetry is removed:
+/// `status` and `reset-id` are local-only, the rest report the removal.
 pub enum TelemetryCommand {
     InstallEvent,
     Enable,
     Disable,
     Status { json: bool },
     ResetId,
-    Inspect { event: String },
+    Inspect,
 }
 
 /// Flags whose next token is a value (not a subcommand).
@@ -275,14 +277,8 @@ fn serve_only_authorization_flag(args: &[String]) -> Option<&'static str> {
     })
 }
 
-/// Classify the requested finite command without parsing its arguments. The
-/// parent process uses this before `parse_command` so invalid JSON and other
-/// parser exits are still observed as completed failures.
-pub fn finite_command_name_from_argv() -> Option<&'static str> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    finite_command_name_from_args(&args)
-}
-
+/// Positional (non-flag) arguments, skipping each value-taking flag together
+/// with its value.
 fn positional_args(args: &[String]) -> Vec<&str> {
     let mut positionals = Vec::new();
     let mut index = 0;
@@ -298,192 +294,6 @@ fn positional_args(args: &[String]) -> Vec<&str> {
         }
     }
     positionals
-}
-
-fn finite_command_name_from_args(args: &[String]) -> Option<&'static str> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
-    {
-        return None;
-    }
-    let positionals = positional_args(args);
-    match positionals.first().copied() {
-        None | Some("mcp" | "serve" | "telemetry") => None,
-        Some("list-tools") => Some("list_tools"),
-        Some("describe") => Some("describe"),
-        Some("mcp-config") => Some("mcp_config"),
-        Some("manifest") => Some("manifest"),
-        Some("call") => Some("call"),
-        Some("stop") => Some("stop"),
-        Some("revoke") => Some("revoke"),
-        Some("status") => Some("status"),
-        Some("sessions") => Some("sessions"),
-        Some("recording") => Some("recording"),
-        Some("history") => Some("history"),
-        Some("dump-docs") => Some("dump_docs"),
-        Some("update") => Some("update"),
-        Some("check-update") => Some("check_update"),
-        Some("channel") => Some("channel"),
-        Some("doctor") => Some("doctor"),
-        Some("diagnose") => Some("diagnose"),
-        Some("permissions") => Some("permissions"),
-        Some("autostart") => Some("autostart"),
-        Some("skills") => Some("skills"),
-        Some("cursor-theme") => Some("cursor_theme"),
-        Some("config") => Some("config"),
-        Some(_) => Some("call"),
-    }
-}
-
-/// Return the candidate tool for a finite `call` command. The telemetry layer
-/// maps this through its fixed registry allowlist before anything is emitted.
-pub fn finite_tool_name_from_argv() -> Option<String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    finite_tool_name_from_args(&args)
-}
-
-/// Return whether a finite `call` targets a fixed computer-action category.
-/// JSON is inspected only long enough to classify the closed `page.action`
-/// vocabulary and is never retained or passed to telemetry.
-pub fn finite_computer_action_from_argv() -> bool {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    finite_computer_action_from_args(&args)
-}
-
-fn finite_computer_action_from_args(args: &[String]) -> bool {
-    let Some(tool_name) = finite_tool_name_from_args(args) else {
-        return false;
-    };
-    let positionals = positional_args(args);
-    let json_arg = match positionals.as_slice() {
-        ["call", _, json, ..] | [_, json, ..] => Some(*json),
-        _ => None,
-    };
-    let parsed_args = json_arg.and_then(|json| serde_json::from_str(json).ok());
-    let operation = cua_driver_core::server::tool_operation(&tool_name, parsed_args.as_ref());
-    cua_driver_core::server::is_computer_action(&tool_name, operation)
-}
-
-/// Return the bounded sub-operation for a finite command. This classifier
-/// reads only the command verb, a reviewed subcommand, and the presence of
-/// `--apply`; arbitrary values never leave this function.
-pub fn finite_operation_from_argv() -> &'static str {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    finite_operation_from_args(&args)
-}
-
-fn finite_operation_from_args(args: &[String]) -> &'static str {
-    let command = finite_command_name_from_args(args);
-    let positionals = positional_args(args);
-    let subcommand = positionals.get(1).copied();
-    match command {
-        Some("recording") => match subcommand.unwrap_or("status") {
-            "start" => "start",
-            "stop" => "stop",
-            "status" => "status",
-            "render" => "render",
-            _ => "other",
-        },
-        Some("history") => match subcommand.unwrap_or("status") {
-            "enable" => "enable",
-            "disable" => "disable",
-            "pause" => "pause",
-            "resume" => "resume",
-            "status" => "status",
-            "flush" => "flush",
-            "list" => "list",
-            "show" => "show",
-            "delete" => "delete",
-            _ => "other",
-        },
-        Some("permissions") => match subcommand.unwrap_or("status") {
-            "status" => "status",
-            "grant" => "grant",
-            _ => "other",
-        },
-        Some("config") => match subcommand.unwrap_or("show") {
-            "show" => "show",
-            "get" => "get",
-            "set" => "set",
-            "reset" => "reset",
-            _ => "other",
-        },
-        Some("sessions") => match subcommand.unwrap_or("list") {
-            "list" => "list",
-            _ => "other",
-        },
-        Some("autostart") => match subcommand.unwrap_or("") {
-            "enable" => "enable",
-            "disable" => "disable",
-            "status" => "status",
-            "kick" => "kick",
-            _ => "other",
-        },
-        Some("skills") => match subcommand.unwrap_or("status") {
-            "install" => "install",
-            "update" => "update",
-            "uninstall" => "uninstall",
-            "status" => "status",
-            "path" => "path",
-            _ => "other",
-        },
-        Some("update") if args.iter().any(|arg| arg == "--apply") => "apply",
-        Some("update") => "check_only",
-        Some("channel") => match subcommand.unwrap_or("status") {
-            "status" => "status",
-            "set" => "set",
-            _ => "other",
-        },
-        _ => "not_applicable",
-    }
-}
-
-/// Return the configured MCP client as a closed category. Raw `--client`
-/// values are mapped to `other` before the detached worker is spawned.
-pub fn finite_client_kind_from_argv() -> &'static str {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    finite_client_kind_from_args(&args)
-}
-
-fn finite_client_kind_from_args(args: &[String]) -> &'static str {
-    if finite_command_name_from_args(args) != Some("mcp_config") {
-        return "not_applicable";
-    }
-    let value = args
-        .iter()
-        .position(|arg| arg == "--client")
-        .and_then(|index| args.get(index + 1))
-        .map(String::as_str)
-        .unwrap_or("");
-    match value {
-        "" => "generic",
-        "claude" | "claude-code" => "claude_code",
-        "codex" => "codex",
-        "cursor" => "cursor",
-        "openclaw" => "openclaw",
-        "opencode" => "opencode",
-        "hermes" => "hermes",
-        "pi" => "pi",
-        "prime-agent" => "prime_agent",
-        "antigravity" | "gemini" => "antigravity",
-        "qwen" | "qwen-code" => "qwen_code",
-        "droid" | "factory" => "factory_droid",
-        "zcode" => "zcode",
-        _ => "other",
-    }
-}
-
-fn finite_tool_name_from_args(args: &[String]) -> Option<String> {
-    if finite_command_name_from_args(args) != Some("call") {
-        return None;
-    }
-    let positionals = positional_args(args);
-    match positionals.as_slice() {
-        ["call", tool, ..] => Some((*tool).to_owned()),
-        [tool, ..] => Some((*tool).to_owned()),
-        _ => None,
-    }
 }
 
 fn experimental_pip_requested(args: &[String]) -> bool {
@@ -553,17 +363,27 @@ pub fn parse_command() -> Command {
         println!("                                  way to grant; the read-only status command never triggers that probe.");
         println!();
         println!("Updating cua-driver:");
-        println!("  cua-driver check-update         Ask GitHub whether a newer release is available. Read-only.");
-        println!("                                  Default output is human-friendly text.");
-        println!("    --json                        Emit a machine-readable JSON payload (same shape as the");
-        println!("                                  check_for_update MCP tool). Hermes branches on update_available.");
-        println!("    --no-cache                    Skip the 20h on-disk cache and force a fresh GitHub round-trip.");
-        println!("  cua-driver update               Same check as above, then suggest --apply if outdated.");
-        println!("    --apply                       Download + install the latest release via the canonical installer.");
-        println!("    --json                        Emit the structured check payload (does not change --apply behaviour).");
-        println!("  cua-driver channel status      Show the saved stable/nightly update channel.");
-        println!("  cua-driver channel set <name>  Save stable or nightly; run update --apply to switch binaries.");
+        println!(
+            "  Update checks and self-update are disabled in this build: nothing contacts GitHub"
+        );
+        println!("  or downloads an installer. Update through your distribution channel.");
+        println!("  cua-driver check-update         Print that notice. Never touches the network.");
+        println!("    --json                        Emit the static payload (same shape as the check_for_update");
+        println!("                                  MCP tool; update_available is always false).");
+        println!(
+            "    --no-cache                    Accepted for compatibility; there is no cache."
+        );
+        println!("  cua-driver update               Same notice. --apply never downloads or installs anything.");
+        println!("    --json                        Emit the static payload.");
+        println!("  cua-driver channel status      Show the saved stable/nightly channel preference (local file).");
+        println!("  cua-driver channel set <name>  Save stable or nightly locally; nothing is downloaded.");
         println!("    --json                        Emit machine-readable channel state.");
+        println!();
+        println!("telemetry:");
+        println!("  Telemetry has been removed from this build; nothing is collected or sent.");
+        println!("  cua-driver telemetry status     Say so, and report telemetry or update-check files left by an earlier build.");
+        println!("    --json                        Emit machine-readable status.");
+        println!("  cua-driver telemetry reset-id   Delete those files from ~/.cua-driver, ~/.cua-driver-local and ~/.cua-driver-rs (local only).");
         println!();
         println!("autostart options (Windows-only today):");
         println!("  cua-driver autostart enable     Register a logon Scheduled Task so serve starts at every interactive logon.");
@@ -572,14 +392,15 @@ pub fn parse_command() -> Command {
         println!("  cua-driver autostart kick       Start the entry now without re-logging.");
         println!();
         println!("skills options (agent skill-pack management, opt-in):");
-        println!("  cua-driver skills install       Fetch the versioned skill pack from GitHub Releases and symlink it");
+        println!("  cua-driver skills install       Install the skill pack bundled into this binary and symlink it");
         println!("                                  into each detected agent's skills/ dir (Claude Code, Codex, Prime Agent,");
         println!("                                  OpenClaw, OpenCode). Idempotent. Never overwrites existing user links.");
-        println!("  cua-driver skills update        Re-fetch the skill pack from GitHub, refreshing the local copy + links.");
+        println!("                                  Nothing is downloaded.");
+        println!("  cua-driver skills update        Rewrite the local copy from the bundled pack, refreshing links.");
         println!("  cua-driver skills uninstall     Remove the agent symlinks. Add --all to also delete the local copy.");
         println!("  cua-driver skills status        Report local install state + per-agent link state. Read-only.");
         println!("  cua-driver skills path          Print where the local skill pack lives.");
-        println!("  --from main                     (install only) Fetch latest from main branch instead of the tagged release.");
+        println!("  --all-platforms                 (install/update) Keep every platform guide, not just this host's.");
         println!();
         println!("agent authorization (serve only):");
         println!("  --permission-mode <mode>        standard (default), bounded, or unrestricted.");
@@ -733,19 +554,7 @@ pub fn parse_command() -> Command {
     }
 
     // Strip cursor-overlay flags (and their values) to expose the subcommand.
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if VALUE_FLAGS.contains(&a) {
-            i += 2; // skip flag + value
-        } else if a.starts_with('-') {
-            i += 1; // skip bare flag
-        } else {
-            positionals.push(a);
-            i += 1;
-        }
-    }
+    let positionals = positional_args(&args);
 
     let expected_daemon_pid = parse_expected_daemon_pid(&args, positionals.first().copied());
 
@@ -971,16 +780,10 @@ pub fn parse_command() -> Command {
                 json: args.iter().any(|arg| arg == "--json"),
             }),
             Some("reset-id") => Command::Telemetry(TelemetryCommand::ResetId),
-            Some("inspect") => {
-                let event = pos.next().unwrap_or("").to_owned();
-                if event.is_empty() {
-                    eprintln!("Usage: cua-driver telemetry inspect <event> --json");
-                    process::exit(64);
-                }
-                Command::Telemetry(TelemetryCommand::Inspect { event })
-            }
+            Some("inspect") => Command::Telemetry(TelemetryCommand::Inspect),
             _ => {
-                eprintln!("Usage: cua-driver telemetry {{enable|disable|status [--json]|reset-id|inspect <event> --json}}");
+                eprintln!("Telemetry has been removed from this build of Cua Driver; nothing is collected or sent.");
+                eprintln!("Usage: cua-driver telemetry {{status [--json]|reset-id}}");
                 process::exit(64);
             }
         },
@@ -1214,15 +1017,8 @@ pub fn run_describe(tools_list: &serde_json::Value, name: &str) {
 /// Mirror of Swift `MCPCommand.launchDaemonViaOpen` +
 /// `waitForDaemon`. Split into one Rust function because we don't
 /// need the post-launch probe separation Swift has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaunchDaemonErrorKind {
-    Failed,
-    Timeout,
-}
-
 #[derive(Debug)]
 pub struct LaunchDaemonError {
-    pub kind: LaunchDaemonErrorKind,
     message: String,
 }
 
@@ -1318,13 +1114,11 @@ fn launch_daemon_with_state_and_wait(
         .status();
 
     let status = status.map_err(|error| LaunchDaemonError {
-        kind: LaunchDaemonErrorKind::Failed,
         message: format!("failed to exec `/usr/bin/open`: {error}"),
     })?;
 
     if !status.success() {
         return Err(LaunchDaemonError {
-            kind: LaunchDaemonErrorKind::Failed,
             message: format!(
                 "`open -n -g -a {app_target:?} --args serve{}` exited {:?}. \
              Check that `{app_path}` is installed.",
@@ -1349,7 +1143,6 @@ fn launch_daemon_with_state_and_wait(
     }
 
     Err(LaunchDaemonError {
-        kind: LaunchDaemonErrorKind::Timeout,
         message: format!(
             "daemon did not appear on {socket_path} within {timeout_secs}s. If this \
          is the first launch, grant Accessibility + Screen Recording to \
@@ -1396,7 +1189,6 @@ fn launch_daemon_with_state_and_wait(
     use std::time::{Duration, Instant};
 
     let executable = std::env::current_exe().map_err(|error| LaunchDaemonError {
-        kind: LaunchDaemonErrorKind::Failed,
         message: format!("current Cua Driver executable is unavailable: {error}"),
     })?;
     let managed = allow_managed_restart
@@ -1418,7 +1210,6 @@ fn launch_daemon_with_state_and_wait(
                 .stderr(Stdio::null());
             command.process_group(0);
             command.spawn().map_err(|error| LaunchDaemonError {
-                kind: LaunchDaemonErrorKind::Failed,
                 message: format!("failed to launch {} serve: {error}", executable.display()),
             })?;
         }
@@ -1434,7 +1225,6 @@ fn launch_daemon_with_state_and_wait(
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(LaunchDaemonError {
-        kind: LaunchDaemonErrorKind::Timeout,
         message: format!("daemon did not appear on {socket_path} within {timeout_secs}s"),
     })
 }
@@ -1482,7 +1272,6 @@ fn spawn_detached_windows_daemon(
         )
     }
     .map_err(|error| LaunchDaemonError {
-        kind: LaunchDaemonErrorKind::Failed,
         message: format!("failed to launch {} serve: {error}", executable.display()),
     })?;
     let _ = unsafe { CloseHandle(process.hThread) };
@@ -1665,21 +1454,6 @@ fn append_daemon_launch_state(
     }
 }
 
-/// Run the MCP proxy path: ensure a daemon is up (spawning via
-/// `open` if needed), then `crate::proxy::run_proxy` against its
-/// socket. Builds its own tokio runtime — same shape as the other
-/// `run_*` helpers in this file that own their event loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Some outcomes are platform-specific.
-pub enum McpDaemonStartup {
-    AlreadyRunning,
-    Launched,
-    LaunchFailed,
-    LaunchTimeout,
-    Unreachable,
-    UnsupportedRelaunch,
-}
-
 fn verify_expected_daemon_pid(actual_pid: u32, expected_pid: Option<u32>) -> Result<(), String> {
     if let Some(expected_pid) = expected_pid {
         if actual_pid != expected_pid {
@@ -1691,32 +1465,18 @@ fn verify_expected_daemon_pid(actual_pid: u32, expected_pid: Option<u32>) -> Res
     Ok(())
 }
 
-impl McpDaemonStartup {
-    pub const fn telemetry_value(self) -> &'static str {
-        match self {
-            Self::AlreadyRunning => "already_running",
-            Self::Launched => "launched",
-            Self::LaunchFailed => "launch_failed",
-            Self::LaunchTimeout => "launch_timeout",
-            Self::Unreachable => "unreachable",
-            Self::UnsupportedRelaunch => "unsupported_relaunch",
-        }
-    }
-}
-
-pub fn run_mcp_via_daemon_proxy<F>(
+/// Run the MCP proxy path: ensure a daemon is up (spawning via
+/// `open` if needed), then `crate::proxy::run_proxy` against its
+/// socket. Builds its own tokio runtime — same shape as the other
+/// `run_*` helpers in this file that own their event loop.
+pub fn run_mcp_via_daemon_proxy(
     socket: Option<String>,
     expected_pid: Option<u32>,
     claude_code_compat: bool,
     grants: &[String],
     experimental_pip: bool,
     feedback_override: Option<bool>,
-    on_startup: F,
-) -> anyhow::Result<()>
-where
-    F: FnOnce(McpDaemonStartup, bool),
-{
-    let mut on_startup = Some(on_startup);
+) -> anyhow::Result<()> {
     // The UIAccess helper is a daemon-internal privilege boundary. Public MCP
     // clients always enter through the canonical service authorization path;
     // they must never select the helper merely because its pipe exists.
@@ -1724,17 +1484,11 @@ where
 
     let already_running = crate::serve::is_daemon_listening(&socket_path);
     if already_running && !grants.is_empty() {
-        if let Some(on_startup) = on_startup.take() {
-            on_startup(McpDaemonStartup::AlreadyRunning, false);
-        }
         anyhow::bail!(
             "--grant configures a newly launched runtime and cannot modify the daemon already listening on {socket_path}; restart it with the same --grant option"
         );
     }
     if let Some(asynchronous) = feedback_override.filter(|_| already_running) {
-        if let Some(on_startup) = on_startup.take() {
-            on_startup(McpDaemonStartup::AlreadyRunning, false);
-        }
         let flag = if asynchronous {
             "--async-click-feedback"
         } else {
@@ -1746,14 +1500,10 @@ where
     }
     let async_click_feedback = feedback_override
         .unwrap_or_else(|| cursor_overlay::CursorConfig::default().async_click_feedback);
-    let mut daemon = McpDaemonStartup::AlreadyRunning;
     if !already_running {
         // Never replace an embedded host's TCC identity by launching the
         // standalone CuaDriver.app daemon.
         if cua_driver_core::embedded_mode() {
-            if let Some(on_startup) = on_startup.take() {
-                on_startup(McpDaemonStartup::Unreachable, false);
-            }
             anyhow::bail!(
                 "no Cua Driver daemon listening on {socket_path}. Start one with \
                  `cua-driver serve --socket {socket_path}` and retry. Embedded hosts \
@@ -1799,26 +1549,12 @@ where
                 experimental_pip,
                 async_click_feedback,
             ) {
-                if let Some(on_startup) = on_startup.take() {
-                    on_startup(
-                        if error.kind == LaunchDaemonErrorKind::Timeout {
-                            McpDaemonStartup::LaunchTimeout
-                        } else {
-                            McpDaemonStartup::LaunchFailed
-                        },
-                        false,
-                    );
-                }
                 return Err(error.into());
             }
-            daemon = McpDaemonStartup::Launched;
         }
         #[cfg(not(target_os = "macos"))]
         {
             if !crate::history_runtime::preview_admitted_preference() {
-                if let Some(on_startup) = on_startup.take() {
-                    on_startup(McpDaemonStartup::UnsupportedRelaunch, false);
-                }
                 anyhow::bail!(
                     "no Cua Driver daemon listening on {socket_path}. Start one in \
                      your interactive session — on Windows run \
@@ -1836,29 +1572,14 @@ where
                 experimental_pip,
                 async_click_feedback,
             ) {
-                if let Some(on_startup) = on_startup.take() {
-                    on_startup(
-                        if error.kind == LaunchDaemonErrorKind::Timeout {
-                            McpDaemonStartup::LaunchTimeout
-                        } else {
-                            McpDaemonStartup::LaunchFailed
-                        },
-                        false,
-                    );
-                }
                 return Err(error.into());
             }
-            daemon = McpDaemonStartup::Launched;
         }
     }
 
     if let Some(expected_pid) = expected_pid {
         let metadata = cua_driver_core::daemon::request_daemon_metadata(&socket_path)?;
         verify_expected_daemon_pid(metadata.pid, Some(expected_pid)).map_err(anyhow::Error::msg)?;
-    }
-
-    if let Some(on_startup) = on_startup.take() {
-        on_startup(daemon, true);
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2036,16 +1757,16 @@ pub fn build_manifest() -> serde_json::Value {
                   { "name": "--type", "type": "string", "description": "Output type." }
               ] },
             { "name": "update",
-              "description": "Check GitHub for a newer release; with --apply, download and install via the canonical installer.",
+              "description": "Update checks and self-update are disabled in this build; reports that and never downloads or installs anything.",
               "args": [
-                  { "name": "--apply", "type": "flag", "description": "Apply the update." },
-                  { "name": "--json", "type": "flag", "description": "Emit the structured check payload." }
+                  { "name": "--apply", "type": "flag", "description": "Accepted for compatibility; nothing is installed." },
+                  { "name": "--json", "type": "flag", "description": "Emit the static update-state payload." }
               ] },
             { "name": "check-update",
-              "description": "Read-only release-check verb (mirror of the check_for_update MCP tool).",
+              "description": "Update checks are disabled in this build; returns the static payload of the check_for_update MCP tool without network access.",
               "args": [
-                  { "name": "--json", "type": "flag", "description": "Emit the structured check payload." },
-                  { "name": "--no-cache", "type": "flag", "description": "Force a fresh GitHub round-trip." }
+                  { "name": "--json", "type": "flag", "description": "Emit the static update-state payload." },
+                  { "name": "--no-cache", "type": "flag", "description": "Accepted for compatibility; there is no cache." }
               ] },
             { "name": "channel",
               "description": "Inspect or persist the stable/nightly release channel.",
@@ -2075,17 +1796,16 @@ pub fn build_manifest() -> serde_json::Value {
                   { "name": "--socket", "type": "string", "description": "Override the daemon socket path." }
               ] },
             { "name": "telemetry",
-              "description": "Inspect or change content-free telemetry and its pseudonymous installation identity.",
+              "description": "Telemetry has been removed from this build. Reports that, and deletes telemetry and update-check files left by an earlier build (reset-id).",
               "args": [
-                  { "name": "subcommand", "type": "positional-string", "description": "enable | disable | status | reset-id | inspect" },
-                  { "name": "event", "type": "positional-string", "description": "Fixed event name for inspect." },
-                  { "name": "--json", "type": "flag", "description": "Emit machine-readable status or inspection output." }
+                  { "name": "subcommand", "type": "positional-string", "description": "status | reset-id (enable | disable | inspect only report the removal)" },
+                  { "name": "--json", "type": "flag", "description": "Emit machine-readable status." }
               ] },
             { "name": "autostart",
               "description": "Platform-native auto-start so `cua-driver serve` comes up on every logon.",
               "args": [ { "name": "subcommand", "type": "positional-string", "description": "enable | disable | status | kick" } ] },
             { "name": "skills",
-              "description": "Manage the cua-driver agent skill pack (install / update / uninstall / status / path).",
+              "description": "Manage the cua-driver agent skill pack bundled into this binary (install / update / uninstall / status / path). Nothing is downloaded.",
               "args": [ { "name": "subcommand", "type": "positional-string", "description": "install | update | uninstall | status | path. Default: status." } ] }
         ]
     })
@@ -3123,192 +2843,31 @@ fn run_recording_render(args: &[String]) {
     }
 }
 
-/// `cua-driver update [--apply]` — check for a newer release and optionally apply it.
+/// `cua-driver update [--apply] [--json]`.
 ///
-/// Shares the GitHub releases fetch with the startup banner via
-/// [`crate::version_check::fetch_latest_version`] so both code paths agree on
-/// tag filtering and HTTP semantics. `--apply` delegates to the canonical
-/// installer script — see [`crate::updater`] for why we go through the script
-/// instead of re-implementing the asset resolution + atomic swap + GC in Rust.
+/// Update checks and self-update are disabled in this build: there is no
+/// release lookup and no installer download. The verb prints the static
+/// notice (or the static JSON payload shared with `check-update` and the
+/// `check_for_update` MCP tool). `--apply` exits 1 because nothing can be
+/// installed, so scripts never mistake it for a successful update.
 pub fn run_update_cmd(apply: bool, json: bool) {
-    if apply && crate::bundle::is_local_installation() {
-        eprintln!(
-            "cua-driver-local is managed by scripts/install-local.sh (or install-local.ps1); \
-             refusing to run the release installer from the local product."
-        );
-        process::exit(2);
-    }
-    let apply_started_at = std::time::Instant::now();
-    let daemon_was_running = apply && crate::updater::daemon_is_running();
-    // `--json` short-circuits the text path entirely so scripted callers
-    // get a parseable payload regardless of `--apply`. The check itself
-    // routes through the same `check_update_state` the `check-update`
-    // verb and the MCP tool use, so all three surfaces agree.
-    if json {
-        let state = crate::version_check::check_update_state(false);
-        let val = serde_json::to_value(&state).unwrap_or_else(|_| serde_json::json!({}));
-        let pretty = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
-        println!("{pretty}");
-        // `--apply` still installs when JSON is on — the JSON is just the
-        // pre-install snapshot. Returning here when apply is false keeps
-        // the existing "check + suggest" behaviour off the JSON path.
-        if !apply {
-            crate::version_check::capture_update_state(
-                &state,
-                crate::telemetry::UpdateCheckSource::Cli,
-            );
-            return;
-        }
-    }
-
-    let current = env!("CARGO_PKG_VERSION");
-    let selected_channel = crate::release_channel::selected().unwrap_or_else(|error| {
-        eprintln!("Cannot read release channel: {error}");
-        eprintln!(
-            "Repair it with `cua-driver channel set stable` or `cua-driver channel set nightly`."
-        );
+    print_update_state(json);
+    if apply {
+        eprintln!("cua-driver update --apply: nothing was downloaded or installed.");
         process::exit(1);
-    });
-    let current_channel = crate::release_channel::ReleaseChannel::from_version(current);
-    if !json {
-        println!("Current version: {current}");
-        println!("Checking for updates…");
     }
+}
 
-    let latest = crate::version_check::fetch_latest_version();
-    match latest {
-        Err(e) => {
-            crate::telemetry::capture_update_checked(
-                crate::telemetry::UpdateCheckSource::Cli,
-                crate::telemetry::UpdateCheckOutcome::Unavailable,
-                None,
-                false,
-            );
-            if apply {
-                crate::telemetry::capture_update_apply_completed(
-                    None,
-                    crate::telemetry::UpdateApplyOutcome::Failed,
-                    crate::telemetry::UpdateFailureClass::CheckFailed,
-                    daemon_was_running,
-                    apply_started_at.elapsed(),
-                );
-            }
-            // The shared helper returns a human-readable error string for
-            // the CLI surface — pass it through so the user can see why
-            // (timeout, parse error, etc.) instead of just "unreachable".
-            tracing::debug!(target: "cua_driver::update", "fetch failed: {e}");
-            if !json {
-                println!("Could not reach GitHub — check your connection and try again.");
-            }
-            process::exit(1);
-        }
-        Ok(v)
-            if !crate::version_check::update_is_available(
-                &v,
-                current,
-                current_channel,
-                selected_channel,
-            ) =>
-        {
-            crate::telemetry::capture_update_checked(
-                crate::telemetry::UpdateCheckSource::Cli,
-                crate::telemetry::UpdateCheckOutcome::UpToDate,
-                Some(&v),
-                false,
-            );
-            if apply {
-                crate::telemetry::capture_update_apply_completed(
-                    Some(&v),
-                    crate::telemetry::UpdateApplyOutcome::AlreadyCurrent,
-                    crate::telemetry::UpdateFailureClass::None,
-                    daemon_was_running,
-                    apply_started_at.elapsed(),
-                );
-            }
-            if !json {
-                println!("Already up to date.");
-            }
-        }
-        Ok(v) => {
-            crate::telemetry::capture_update_checked(
-                crate::telemetry::UpdateCheckSource::Cli,
-                crate::telemetry::UpdateCheckOutcome::Available,
-                Some(&v),
-                false,
-            );
-            if !json {
-                println!("New version available: {v}");
-            }
-
-            if !apply {
-                if !json {
-                    println!();
-                    println!("Run with --apply to download and install it:");
-                    println!("  cua-driver update --apply");
-                    println!();
-                    println!("Or reinstall directly:");
-                    println!("  {}", crate::updater::manual_install_one_liner());
-                }
-                return;
-            }
-
-            if !json {
-                println!("Downloading and installing cua-driver {v}…");
-            }
-            crate::telemetry::capture_update_apply_started(&v, daemon_was_running);
-            match crate::updater::run_install_script(&v) {
-                Ok(s) if s.success() => {
-                    crate::telemetry::capture_update_apply_completed(
-                        Some(&v),
-                        crate::telemetry::UpdateApplyOutcome::Installed,
-                        crate::telemetry::UpdateFailureClass::None,
-                        daemon_was_running,
-                        apply_started_at.elapsed(),
-                    );
-                    if !json {
-                        println!("Installed cua-driver {v}.");
-                    }
-                    if daemon_was_running {
-                        // The atomic swap (symlink retarget / junction flip)
-                        // means the running daemon kept executing the old
-                        // binary — restart picks up the new one.
-                        println!();
-                        println!("A daemon was running before the install. Restart it to pick up the new binary:");
-                        println!("  cua-driver stop && cua-driver serve");
-                    }
-                }
-                Ok(s) => {
-                    crate::telemetry::capture_update_apply_completed(
-                        Some(&v),
-                        crate::telemetry::UpdateApplyOutcome::Failed,
-                        crate::telemetry::UpdateFailureClass::InstallerExit,
-                        daemon_was_running,
-                        apply_started_at.elapsed(),
-                    );
-                    eprintln!(
-                        "Installation failed (exit {}). Re-run install manually:",
-                        s.code().unwrap_or(1)
-                    );
-                    eprintln!("  {}", crate::updater::manual_install_one_liner());
-                    process::exit(s.code().unwrap_or(1));
-                }
-                Err(e) => {
-                    crate::telemetry::capture_update_apply_completed(
-                        Some(&v),
-                        crate::telemetry::UpdateApplyOutcome::Failed,
-                        crate::telemetry::UpdateFailureClass::InstallerLaunch,
-                        daemon_was_running,
-                        apply_started_at.elapsed(),
-                    );
-                    eprintln!("Failed to launch installer: {e}");
-                    #[cfg(windows)]
-                    eprintln!("  (is powershell.exe on PATH?)");
-                    #[cfg(not(windows))]
-                    eprintln!("  (is bash + curl on PATH?)");
-                    process::exit(1);
-                }
-            }
-        }
+/// Print the static update state shared by `update` and `check-update`.
+fn print_update_state(json: bool) {
+    let state = crate::version_check::update_state();
+    if json {
+        let value = serde_json::to_value(&state).unwrap_or_else(|_| serde_json::json!({}));
+        let pretty = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+        println!("{pretty}");
+    } else {
+        println!("Current version: {}", state.current_version);
+        println!("{}", state.message);
     }
 }
 
@@ -3573,7 +3132,7 @@ fn plugin_managed_bare_launch_requested(args: &[String], plugin_managed: bool) -
 /// macOS's Screen Recording "Quit & Reopen" action can reopen an app without
 /// preserving its onboarding arguments. Plugin-managed bundles are supervised
 /// by their launcher, so an argument-less generation must exit before logging,
-/// telemetry, MCP parsing, or default-daemon startup. Ordinary CuaDriver apps
+/// MCP parsing, or default-daemon startup. Ordinary CuaDriver apps
 /// omit the signed marker and retain their existing bare-invocation behavior.
 #[cfg(target_os = "macos")]
 pub fn run_plugin_managed_bare_launch_guard_if_requested() -> Option<i32> {
@@ -6066,64 +5625,19 @@ fn run_permissions_grant() {
     }
 }
 
-/// `cua-driver check-update [--json] [--no-cache]` — pure check, never installs.
+/// `cua-driver check-update [--json] [--no-cache]`.
 ///
-/// Mirror of the `check_for_update` MCP tool. Both routes call into
-/// [`crate::version_check::check_update_state`] so the CLI and MCP
-/// surfaces never disagree on which release is "latest".
-///
-/// Exit codes (mirror `brew outdated` / `npm outdated`):
-///   * `0` — the check itself succeeded (regardless of `update_available`)
-///   * `1` — the check failed (network down, parse error, GitHub 5xx)
-///
-/// We deliberately do NOT use a non-zero exit to mean "outdated" — that
-/// would conflict with every shell script's "non-zero means error"
-/// assumption. Hermes parses JSON; humans read text; the signal lives in
-/// the payload.
-pub fn run_check_update_cmd(json: bool, no_cache: bool) {
-    let state = crate::version_check::check_update_state(no_cache);
-    crate::version_check::capture_update_state(&state, crate::telemetry::UpdateCheckSource::Cli);
-
-    if json {
-        let val = serde_json::to_value(&state).unwrap_or_else(|_| serde_json::json!({}));
-        let pretty = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
-        println!("{pretty}");
-    } else {
-        println!("Current: {}", state.current_version);
-        match (&state.latest_version, &state.error) {
-            (Some(latest), _) => {
-                println!("Latest:  {latest}");
-                if state.update_available {
-                    println!();
-                    println!("Update available. Run `cua-driver update --apply` to install.");
-                    if let Some(url) = &state.release_notes_url {
-                        println!("Release notes: {url}");
-                    }
-                } else {
-                    println!();
-                    println!("You're on the latest release.");
-                }
-            }
-            (None, Some(err)) => {
-                println!("Latest:  <unavailable>");
-                println!();
-                println!("Could not reach GitHub: {err}");
-            }
-            (None, None) => {
-                // Network failed AND no cache existed — `error` should be set;
-                // fall through with a generic message in case it isn't.
-                println!("Latest:  <unavailable>");
-            }
-        }
-    }
-
-    if state.error.is_some() && state.latest_version.is_none() {
-        process::exit(1);
-    }
+/// Update checks are disabled in this build. Mirror of the `check_for_update`
+/// MCP tool: both print [`crate::version_check::update_state`], a static
+/// payload produced without network or filesystem access. Exits 0. `--no-cache`
+/// is accepted for compatibility; there is no cache.
+pub fn run_check_update_cmd(json: bool, _no_cache: bool) {
+    print_update_state(json);
 }
 
-/// Inspect or persist the release channel. Selection never installs by itself;
-/// replacement remains explicit through `cua-driver update --apply`.
+/// Inspect or persist the release-channel preference. This is a local file
+/// only: update checks and self-update are disabled in this build, so the
+/// selection never downloads or installs anything.
 pub fn run_channel_cmd(subcommand: &str, value: Option<&str>, json: bool) {
     let result = match subcommand {
         "status" => crate::release_channel::selected(),
@@ -6169,7 +5683,7 @@ pub fn run_channel_cmd(subcommand: &str, value: Option<&str>, json: bool) {
             None => println!("Current channel:  development"),
         }
         if subcommand == "set" && current != Some(selected) {
-            println!("Run `cua-driver update --apply` to install the latest {selected} release.");
+            println!("{}", crate::version_check::DISABLED_MESSAGE);
         }
     }
 }
@@ -6374,47 +5888,44 @@ fn cli_docs_json() -> serde_json::Value {
             },
             {
                 "name": "telemetry",
-                "abstract": "Inspect or change content-free product telemetry.",
-                "discussion": "Telemetry is default-on. Disable retains the pseudonymous installation ID; reset-id erases the ID and event markers while preserving the preference.",
+                "abstract": "Report that telemetry has been removed from this build.",
+                "discussion": "Nothing is collected or sent, and no installation ID is created. reset-id deletes telemetry and update-check files left on disk by an earlier build; enable, disable, and inspect only report the removal.",
                 "arguments": no_args,
                 "options": no_options,
                 "flags": no_flags,
                 "subcommands": [
-                    {"name":"enable","abstract":"Persistently enable telemetry.","discussion":"","arguments":[],"options":[],"flags":[],"subcommands":[]},
-                    {"name":"disable","abstract":"Persistently disable every telemetry request.","discussion":"Retains the local installation ID.","arguments":[],"options":[],"flags":[],"subcommands":[]},
-                    {"name":"status","abstract":"Show the effective setting and redacted identity state.","discussion":"","arguments":[],"options":[],"flags":[{"name":"json","short_name":null,"help":"Emit JSON.","default_value":false}],"subcommands":[]},
-                    {"name":"reset-id","abstract":"Erase the installation ID and event markers.","discussion":"The persisted enabled/disabled preference is retained.","arguments":[],"options":[],"flags":[],"subcommands":[]},
-                    {"name":"inspect","abstract":"Build a fixed event payload without sending it.","discussion":"The distinct ID is replaced with a redacted placeholder.","arguments":[{"name":"event","help":"Fixed telemetry event name.","type":"String","is_optional":false}],"options":[],"flags":[{"name":"json","short_name":null,"help":"Emit JSON.","default_value":true}],"subcommands":[]}
+                    {"name":"status","abstract":"Report that telemetry is removed and whether legacy telemetry or update-check files remain.","discussion":"","arguments":[],"options":[],"flags":[{"name":"json","short_name":null,"help":"Emit JSON.","default_value":false}],"subcommands":[]},
+                    {"name":"reset-id","abstract":"Delete telemetry and update-check files left by an earlier build.","discussion":"Local filesystem only; covers ~/.cua-driver, ~/.cua-driver-local, and the pre-rename ~/.cua-driver-rs, whichever build runs it.","arguments":[],"options":[],"flags":[],"subcommands":[]}
                 ]
             },
             {
                 "name": "check-update",
-                "abstract": "Check whether a newer cua-driver release is available.",
-                "discussion": "Read-only. Uses the same update-state payload as the check_for_update MCP tool.",
+                "abstract": "Report that update checks are disabled in this build.",
+                "discussion": "Never touches the network. Prints the same static update-state payload as the check_for_update MCP tool; update through your distribution channel.",
                 "arguments": no_args,
                 "options": no_options,
                 "flags": [
                     {"name":"json","short_name":null,"help":"Emit a machine-readable JSON payload.","default_value":false},
-                    {"name":"no-cache","short_name":null,"help":"Skip the 20-hour on-disk cache and force a GitHub request.","default_value":false}
+                    {"name":"no-cache","short_name":null,"help":"Accepted for compatibility; there is no cache.","default_value":false}
                 ],
                 "subcommands": no_subcommands
             },
             {
                 "name": "update",
-                "abstract": "Check for an update and optionally apply it.",
-                "discussion": "The apply path delegates to the canonical platform installer scripts.",
+                "abstract": "Report that update checks and self-update are disabled in this build.",
+                "discussion": "Never downloads or installs anything; --apply exits non-zero. Update through your distribution channel.",
                 "arguments": no_args,
                 "options": no_options,
                 "flags": [
-                    {"name":"apply","short_name":null,"help":"Download and install the latest release when one is available.","default_value":false},
+                    {"name":"apply","short_name":null,"help":"Accepted for compatibility; nothing is installed and the command exits 1.","default_value":false},
                     {"name":"json","short_name":null,"help":"Emit the structured update-state payload.","default_value":false}
                 ],
                 "subcommands": no_subcommands
             },
             {
                 "name": "channel",
-                "abstract": "Inspect or change the stable/nightly update channel.",
-                "discussion": "Selection is persistent but never installs by itself; use cua-driver update --apply after changing it.",
+                "abstract": "Inspect or change the saved stable/nightly channel preference.",
+                "discussion": "A local preference only. Update checks and self-update are disabled in this build; update through your distribution channel.",
                 "arguments": no_args,
                 "options": no_options,
                 "flags": no_flags,
@@ -6463,8 +5974,8 @@ fn cli_docs_json() -> serde_json::Value {
                 "options": no_options,
                 "flags": no_flags,
                 "subcommands": [
-                    {"name":"install","abstract":"Fetch the versioned skill pack and link detected agents.","discussion":"","arguments":[],"options":[{"name":"agent","short_name":null,"help":"Restrict linking to one agent.","type":"String","default_value":null,"is_optional":true},{"name":"from","short_name":null,"help":"Fetch from a source such as main instead of the tagged release.","type":"String","default_value":null,"is_optional":true}],"flags":[{"name":"all-platforms","short_name":null,"help":"Keep platform-specific skill files for every platform.","default_value":false}],"subcommands":[]},
-                    {"name":"update","abstract":"Refresh the local skill pack and links.","discussion":"","arguments":[],"options":[],"flags":[],"subcommands":[]},
+                    {"name":"install","abstract":"Install the skill pack bundled into this binary and link detected agents.","discussion":"Nothing is downloaded.","arguments":[],"options":[{"name":"agent","short_name":null,"help":"Restrict linking to one agent.","type":"String","default_value":null,"is_optional":true}],"flags":[{"name":"all-platforms","short_name":null,"help":"Keep platform-specific skill files for every platform.","default_value":false}],"subcommands":[]},
+                    {"name":"update","abstract":"Rewrite the local skill pack from the bundled copy and refresh links.","discussion":"","arguments":[],"options":[],"flags":[],"subcommands":[]},
                     {"name":"uninstall","abstract":"Remove agent skill links.","discussion":"","arguments":[],"options":[],"flags":[{"name":"all","short_name":null,"help":"Also delete the local skill-pack copy.","default_value":false}],"subcommands":[]},
                     {"name":"status","abstract":"Report local skill-pack and per-agent link state.","discussion":"","arguments":[],"options":[],"flags":[],"subcommands":[]},
                     {"name":"path","abstract":"Print the local skill-pack path.","discussion":"","arguments":[],"options":[],"flags":[],"subcommands":[]}
@@ -6784,7 +6295,8 @@ fn diagnose_config_paths_section() -> String {
             format!("{home}/Library/Caches/{}", crate::bundle::state_namespace()),
         ),
         (
-            "telemetry id",
+            // Written only by earlier builds; `telemetry reset-id` removes it.
+            "legacy telemetry",
             format!(
                 "{home}/{}/.telemetry_id",
                 crate::bundle::user_home_subdirectory()
@@ -7042,43 +6554,6 @@ mod stdin_bom_tests {
         let plain = "{\"pid\":7}";
         let stripped = plain.strip_prefix('\u{feff}').unwrap_or(plain);
         assert_eq!(stripped, plain);
-    }
-}
-
-/// Normalise a user-provided tool name into a safe PostHog event suffix.
-///
-/// Tool names are concatenated onto `cua_driver_api_` to build per-tool
-/// telemetry event names. The raw string is user-controlled (any CLI
-/// arg or MCP request can specify it), so we:
-///
-/// 1. ASCII-lowercase
-/// 2. Keep only `[a-z0-9_]` — drop punctuation, slashes, dots, anything else
-/// 3. Truncate to 64 chars (event names are a dashboard axis, not free text)
-/// 4. Fall back to `"unknown"` when the result is empty (e.g. all non-ASCII
-///    input), so we still record *that* a call happened without inventing
-///    a per-payload event name.
-#[cfg(test)]
-fn sanitize_tool_name(name: &str) -> String {
-    const MAX_LEN: usize = 64;
-    const FALLBACK: &str = "unknown";
-
-    let cleaned: String = name
-        .chars()
-        .filter_map(|c| {
-            let lc = c.to_ascii_lowercase();
-            if lc.is_ascii_alphanumeric() || lc == '_' {
-                Some(lc)
-            } else {
-                None
-            }
-        })
-        .take(MAX_LEN)
-        .collect();
-
-    if cleaned.is_empty() {
-        FALLBACK.to_owned()
-    } else {
-        cleaned
     }
 }
 
@@ -7912,122 +7387,6 @@ mod tests {
     }
 
     #[test]
-    fn finite_call_tool_extraction_supports_subcommand_and_legacy_forms() {
-        assert_eq!(
-            finite_tool_name_from_args(&args(&["call", "click", r#"{\"x\":1}"#])),
-            Some("click".into())
-        );
-        assert_eq!(
-            finite_tool_name_from_args(&args(&["--socket", "/tmp/test", "click", "{}"])),
-            Some("click".into())
-        );
-    }
-
-    #[test]
-    fn finite_call_tool_extraction_ignores_non_call_commands() {
-        assert_eq!(
-            finite_tool_name_from_args(&args(&["describe", "click"])),
-            None
-        );
-        assert_eq!(finite_tool_name_from_args(&args(&["mcp"])), None);
-    }
-
-    #[test]
-    fn finite_computer_action_discards_arguments_after_fixed_classification() {
-        assert!(finite_computer_action_from_args(&args(&[
-            "call",
-            "click",
-            r#"{"x":1,"private":"discarded"}"#,
-        ])));
-        assert!(finite_computer_action_from_args(&args(&[
-            "call",
-            "page",
-            r#"{"action":"insert_text","text":"private"}"#,
-        ])));
-        assert!(!finite_computer_action_from_args(&args(&[
-            "call",
-            "page",
-            r#"{"action":"query_dom","selector":"private"}"#,
-        ])));
-        assert!(!finite_computer_action_from_args(&args(&[
-            "call", "page", "not-json",
-        ])));
-    }
-
-    #[test]
-    fn finite_operations_are_closed_and_ignore_values() {
-        assert_eq!(
-            finite_operation_from_args(&args(&["recording", "start", "/private/path"])),
-            "start"
-        );
-        assert_eq!(
-            finite_operation_from_args(&args(&["config", "set", "private.key", "private-value"])),
-            "set"
-        );
-        assert_eq!(finite_operation_from_args(&args(&["skills"])), "status");
-        assert_eq!(finite_operation_from_args(&args(&["sessions"])), "list");
-        assert_eq!(
-            finite_operation_from_args(&args(&["sessions", "private-value"])),
-            "other"
-        );
-        assert_eq!(
-            finite_operation_from_args(&args(&["update", "--apply"])),
-            "apply"
-        );
-        assert_eq!(finite_operation_from_args(&args(&["update"])), "check_only");
-        assert_eq!(finite_operation_from_args(&args(&["channel"])), "status");
-        assert_eq!(
-            finite_operation_from_args(&args(&["channel", "set", "private-value"])),
-            "set"
-        );
-        assert_eq!(finite_operation_from_args(&args(&["history"])), "status");
-        assert_eq!(
-            finite_operation_from_args(&args(&["history", "show", "private-value"])),
-            "show"
-        );
-        assert_eq!(
-            finite_operation_from_args(&args(&["history", "private-value"])),
-            "other"
-        );
-        assert_eq!(
-            finite_operation_from_args(&args(&["doctor", "private-value"])),
-            "not_applicable"
-        );
-        assert_eq!(
-            finite_operation_from_args(&args(&["recording", "private-value"])),
-            "other"
-        );
-    }
-
-    #[test]
-    fn finite_mcp_config_clients_are_closed_before_worker_handoff() {
-        assert_eq!(
-            finite_client_kind_from_args(&args(&["mcp-config"])),
-            "generic"
-        );
-        assert_eq!(
-            finite_client_kind_from_args(&args(&["mcp-config", "--client", "claude-code"])),
-            "claude_code"
-        );
-        assert_eq!(
-            finite_client_kind_from_args(&args(&["mcp-config", "--client", "antigravity"])),
-            "antigravity"
-        );
-        assert_eq!(
-            finite_client_kind_from_args(&args(&["mcp-config", "--client", "prime-agent"])),
-            "prime_agent"
-        );
-        assert_eq!(
-            finite_client_kind_from_args(&args(&["mcp-config", "--client", "/private/client"])),
-            "other"
-        );
-        assert_eq!(
-            finite_client_kind_from_args(&args(&["doctor", "--client", "claude"])),
-            "not_applicable"
-        );
-    }
-
-    #[test]
     fn permission_grant_requires_live_capture_probe() {
         let stale = serde_json::json!({
             "accessibility": true,
@@ -8089,46 +7448,6 @@ mod tests {
             args.get("probe_direct_capture"),
             Some(&serde_json::json!(false))
         );
-    }
-
-    #[test]
-    fn sanitize_tool_name_passes_through_canonical_names() {
-        assert_eq!(sanitize_tool_name("click"), "click");
-        assert_eq!(sanitize_tool_name("move_mouse"), "move_mouse");
-        assert_eq!(sanitize_tool_name("ScrollUp"), "scrollup");
-    }
-
-    #[test]
-    fn sanitize_tool_name_strips_punctuation_and_path_separators() {
-        // Path-like input would otherwise leak directory names into event
-        // names — strip everything that's not [a-z0-9_].
-        assert_eq!(sanitize_tool_name("foo.bar/baz"), "foobarbaz");
-        assert_eq!(sanitize_tool_name("../etc/passwd"), "etcpasswd");
-        assert_eq!(sanitize_tool_name("click-element!"), "clickelement");
-    }
-
-    #[test]
-    fn sanitize_tool_name_falls_back_when_non_ascii() {
-        // Non-ASCII characters are dropped entirely — without a fallback
-        // we'd emit `cua_driver_api_` (empty suffix), which collides with
-        // the bare `cua_driver_call` event.
-        assert_eq!(sanitize_tool_name("クリック"), "unknown");
-        assert_eq!(sanitize_tool_name("🚀"), "unknown");
-    }
-
-    #[test]
-    fn sanitize_tool_name_falls_back_on_empty_or_all_stripped() {
-        assert_eq!(sanitize_tool_name(""), "unknown");
-        assert_eq!(sanitize_tool_name("---"), "unknown");
-        assert_eq!(sanitize_tool_name("///"), "unknown");
-    }
-
-    #[test]
-    fn sanitize_tool_name_caps_length_at_64() {
-        let long_name = "a".repeat(200);
-        let sanitized = sanitize_tool_name(&long_name);
-        assert_eq!(sanitized.len(), 64);
-        assert!(sanitized.chars().all(|c| c == 'a'));
     }
 
     // ── Surface 8: manifest shape ───────────────────────────────────────────
