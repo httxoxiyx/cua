@@ -914,6 +914,28 @@ mod tests {
     }
 
     #[test]
+    fn bundled_pack_never_sends_agents_to_upstream_installers_or_downloads() {
+        // The pack is compiled into the binary and copied into agents' skill
+        // directories. The upstream installers fetch upstream builds, which
+        // keep telemetry and update checks, so the pack must not suggest them.
+        // Needles are assembled at runtime so this source cannot match itself.
+        let needles = [
+            ["cua.ai/", "driver/install"].concat(),
+            ["api.", "github.com"].concat(),
+            ["raw.", "githubusercontent.com"].concat(),
+            ["releases/", "download"].concat(),
+        ];
+        for (file, body) in BUNDLED_SKILL_FILES {
+            for needle in &needles {
+                assert!(
+                    !body.contains(needle.as_str()),
+                    "{file} contains {needle:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn install_rejects_remote_sources_before_touching_anything() {
         for flags in [
             vec!["--from".to_owned(), "main".to_owned()],

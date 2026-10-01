@@ -40,14 +40,19 @@ Developer ID distribution certificate or qualified public binary release here.
 The Driver built from this repository has no telemetry, no update checks and
 no remote skill downloads: it sends no usage data and does not contact GitHub
 on its own. `cua-driver telemetry` only reports that telemetry was removed
-(`telemetry reset-id` deletes identity files an earlier build left behind),
-`cua-driver check-update`, `update` and the `check_for_update` MCP tool return a
-static "update checks are disabled" answer, and `cua-driver skills install`
-writes the skill pack compiled into the binary.
+(`telemetry reset-id` deletes the installation ID, event markers and update-check
+cache an earlier build left in `~/.cua-driver`, `~/.cua-driver-local` or
+`~/.cua-driver-rs`), `cua-driver check-update`, `update` and the
+`check_for_update` MCP tool return a static "update checks are disabled" answer,
+and `cua-driver skills install` writes the skill pack compiled into the binary.
+A Driver built from an earlier commit still contains the upstream telemetry;
+rebuild and reinstall it to remove it.
 
 Inherited installers, package names and hosted-documentation links still refer
 to upstream where they did before this extraction. Those installers download
-upstream binaries, which keep upstream telemetry and update checks.
+upstream binaries, which keep upstream telemetry and update checks. The copies
+here no longer record an install event or carry a telemetry ID forward, but the
+binaries they install still send telemetry by default.
 **Do not use those installers to obtain this development build.**
 Independent release endpoints and ownership must be configured and verified
 before distribution. This repository does not auto-install or update a Driver.

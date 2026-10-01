@@ -961,7 +961,7 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
                 # installer-owned children, then remove the directory itself
                 # only when it is empty. This makes a mistaken broad override
                 # non-destructive even when --purge was explicitly requested.
-                rm -rf -- "$HOME_DIR/packages" "$HOME_DIR/skills"
+                rm -rf -- "$HOME_DIR/packages" "$HOME_DIR/skills" "$HOME_DIR/.release_installed"
                 rm -f -- \
                     "$HOME_DIR/.installation_recorded" \
                     "$HOME_DIR/.telemetry_enabled" \
@@ -1003,7 +1003,7 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     # ~/.cua-driver on reinstall.
     if [[ -d "$LEGACY_HOME_DIR" ]]; then
         if [[ "$PURGE_DATA" == "1" ]]; then
-            rm -rf -- "$LEGACY_HOME_DIR/packages" "$LEGACY_HOME_DIR/skills"
+            rm -rf -- "$LEGACY_HOME_DIR/packages" "$LEGACY_HOME_DIR/skills" "$LEGACY_HOME_DIR/.release_installed"
             rm -f -- \
                 "$LEGACY_HOME_DIR/.installation_recorded" \
                 "$LEGACY_HOME_DIR/.telemetry_enabled" \

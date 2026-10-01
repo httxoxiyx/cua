@@ -460,14 +460,15 @@ your prior tool calls earned.
 ## Prerequisites — check before starting
 
 1. **`cua-driver` is on `$PATH`** — `Get-Command cua-driver` or
-   `where.exe cua-driver`. Install location:
-   `%LOCALAPPDATA%\Programs\trycua\cua-driver-rs\bin\cua-driver.exe`,
-   added to the user PATH by the install script.
-   If missing, point the user at:
-   ```powershell
-   irm https://cua.ai/driver/install.ps1 | iex
-   ```
-   and stop.
+   `where.exe cua-driver`. A release install lives at
+   `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin\cua-driver.exe`; a source
+   build installed with `scripts\install-local.ps1` is `cua-driver-local.exe`
+   in `%LOCALAPPDATA%\Programs\Cua\cua-driver-local\bin`. Each installer adds
+   its directory to the user PATH.
+   If missing, ask the user to install Cua Driver through their distribution
+   channel, or from a source checkout with `scripts\install-local.ps1`, and
+   stop. Do not suggest the upstream `cua.ai` one-line installer: it installs
+   an upstream build that sends usage telemetry by default.
 2. **The runtime owner must run in an interactive session (Session 1+),
    NOT Session 0.** This is the daemon for one-shot CLI/service mode and the
    MCP process for bare stdio MCP. Windows isolates services into Session 0 with no

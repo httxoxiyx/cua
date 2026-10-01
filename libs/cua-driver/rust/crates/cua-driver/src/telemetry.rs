@@ -14,8 +14,10 @@
 //! - [`is_enabled`] is a compile-time `false`. No environment variable or
 //!   config value can turn telemetry on, because there is nothing to turn on.
 //! - [`status`] and [`remove_legacy_state`] back `cua-driver telemetry status`
-//!   and `cua-driver telemetry reset-id`. They find and delete identity and
-//!   marker files that an earlier build may have left behind. Both are local
+//!   and `cua-driver telemetry reset-id`. They find and delete the identity,
+//!   marker, and update-check cache files that an earlier build may have left
+//!   in any Cua Driver home directory (release, `cua-driver-local`, or the
+//!   pre-rename release home), whichever binary runs them. Both are local
 //!   filesystem operations only.
 
 use std::path::{Path, PathBuf};
@@ -32,12 +34,20 @@ pub const fn is_enabled() -> bool {
 // A future edit that re-enables telemetry fails to compile.
 const _: () = assert!(!is_enabled());
 
-/// Pre-rename home of release installs. Earlier builds migrated telemetry state
-/// out of it; leftovers are still deleted by [`remove_legacy_state`].
-const LEGACY_HOME_SUBDIRECTORY: &str = ".cua-driver-rs";
+/// Every home directory, under `$HOME` (`%USERPROFILE%` on Windows), where
+/// earlier builds kept telemetry or update-check state: release installs,
+/// source-built `cua-driver-local` installs, and the pre-rename release home.
+/// Telemetry is gone from every namespace, so whichever binary runs the cleanup
+/// sweeps all of them.
+const LEGACY_HOME_SUBDIRECTORIES: &[&str] = &[".cua-driver", ".cua-driver-local", ".cua-driver-rs"];
+
+/// Pre-rename home of release installs. [`remove_legacy_state`] also removes
+/// the directory itself once nothing else is left in it.
+const PRE_RENAME_HOME_SUBDIRECTORY: &str = ".cua-driver-rs";
 
 /// Files earlier builds wrote for the installation ID, the consent preference
-/// marker, delivery bookkeeping, and its locks.
+/// marker, delivery bookkeeping and its locks, and the cached upstream release
+/// lookup of the removed update check.
 const LEGACY_FILES: &[&str] = &[
     ".telemetry_id",
     ".telemetry_enabled",
@@ -46,6 +56,7 @@ const LEGACY_FILES: &[&str] = &[
     ".telemetry_retry_after",
     ".telemetry_install_channel",
     ".installation_recorded",
+    "version_check.json",
 ];
 
 /// Directory of per-release "installed" markers written by earlier builds.
@@ -62,7 +73,8 @@ pub struct TelemetryStatus {
     pub enabled: bool,
     /// Always `"removed"`.
     pub source: &'static str,
-    /// Whether telemetry files from an earlier build are still on disk.
+    /// Whether telemetry or update-check files from an earlier build are still
+    /// on disk in any Cua Driver home directory.
     pub legacy_state_present: bool,
     pub message: &'static str,
 }
@@ -72,40 +84,50 @@ pub fn status() -> TelemetryStatus {
     TelemetryStatus {
         enabled: is_enabled(),
         source: "removed",
-        legacy_state_present: legacy_state_dirs()
-            .iter()
-            .any(|directory| !legacy_entries_in(directory).is_empty()),
+        legacy_state_present: home_root().is_some_and(|root| legacy_state_present_under(&root)),
         message: REMOVED_NOTICE,
     }
 }
 
-/// Delete telemetry files left by an earlier build from this product's home
-/// directory and, for release installs, the pre-rename `~/.cua-driver-rs`.
-/// Returns the paths that were removed. Never creates anything.
+/// Delete telemetry and update-check files left by an earlier build from
+/// `~/.cua-driver`, `~/.cua-driver-local`, and the pre-rename
+/// `~/.cua-driver-rs`. Returns the paths that were removed. Never creates
+/// anything.
 pub fn remove_legacy_state() -> Result<Vec<PathBuf>, String> {
+    match home_root() {
+        Some(root) => remove_legacy_state_under(&root),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The user's home directory: `$HOME`, else `%USERPROFILE%`. Empty or relative
+/// values are skipped, so cleanup never resolves paths against the working
+/// directory.
+fn home_root() -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .find(|path| path.is_absolute())
+}
+
+fn legacy_state_present_under(root: &Path) -> bool {
+    LEGACY_HOME_SUBDIRECTORIES
+        .iter()
+        .any(|name| !legacy_entries_in(&root.join(name)).is_empty())
+}
+
+fn remove_legacy_state_under(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut removed = Vec::new();
-    for directory in legacy_state_dirs() {
+    for name in LEGACY_HOME_SUBDIRECTORIES {
+        let directory = root.join(name);
         removed.extend(remove_legacy_state_in(&directory)?);
-        if directory.ends_with(LEGACY_HOME_SUBDIRECTORY) {
+        if *name == PRE_RENAME_HOME_SUBDIRECTORY {
             // Succeeds only when nothing else lives there.
             let _ = std::fs::remove_dir(&directory);
         }
     }
     Ok(removed)
-}
-
-fn legacy_state_dirs() -> Vec<PathBuf> {
-    let Some(root) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-    else {
-        return Vec::new();
-    };
-    let mut directories = vec![root.join(crate::bundle::user_home_subdirectory())];
-    if !crate::bundle::is_local_installation() {
-        directories.push(root.join(LEGACY_HOME_SUBDIRECTORY));
-    }
-    directories
 }
 
 /// Legacy telemetry entries directly inside `directory`. Read-only; a missing
@@ -173,6 +195,13 @@ mod tests {
         assert_eq!(status.message, REMOVED_NOTICE);
     }
 
+    const UNRELATED: &[&str] = &[
+        "config.json",
+        "release-channel",
+        ".tcc-signing-identity",
+        "packages/current/cua-driver",
+    ];
+
     #[test]
     fn reset_removes_every_legacy_telemetry_file_and_keeps_unrelated_state() {
         let home = tempfile::tempdir().unwrap();
@@ -182,7 +211,7 @@ mod tests {
         }
         write(&home.join(LEGACY_RELEASE_MARKER_DIRECTORY).join("0.23.2"));
         write(&home.join(".telemetry-id-0f8b.tmp"));
-        for unrelated in ["config.json", "release-channel", "version_check.json"] {
+        for unrelated in UNRELATED {
             write(&home.join(unrelated));
         }
 
@@ -190,11 +219,66 @@ mod tests {
 
         assert_eq!(removed.len(), LEGACY_FILES.len() + 2);
         assert!(legacy_entries_in(home).is_empty());
-        for unrelated in ["config.json", "release-channel", "version_check.json"] {
+        assert!(!home.join("version_check.json").exists());
+        for unrelated in UNRELATED {
             assert!(home.join(unrelated).is_file(), "{unrelated} must survive");
         }
         // A second run is a no-op.
         assert!(remove_legacy_state_in(home).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reset_sweeps_every_cua_driver_home_whichever_binary_runs_it() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        for name in LEGACY_HOME_SUBDIRECTORIES {
+            let home = root.join(name);
+            write(&home.join(".telemetry_id"));
+            write(&home.join(".installation_recorded"));
+            write(&home.join("version_check.json"));
+            write(&home.join(LEGACY_RELEASE_MARKER_DIRECTORY).join("0.23.2"));
+        }
+        write(&root.join(".cua-driver").join("config.json"));
+        write(
+            &root
+                .join(".cua-driver-local")
+                .join("packages/current/cua-driver-local"),
+        );
+        assert!(legacy_state_present_under(root));
+
+        let removed = remove_legacy_state_under(root).unwrap();
+
+        assert_eq!(removed.len(), 4 * LEGACY_HOME_SUBDIRECTORIES.len());
+        assert!(!legacy_state_present_under(root));
+        for name in LEGACY_HOME_SUBDIRECTORIES {
+            assert!(legacy_entries_in(&root.join(name)).is_empty(), "{name}");
+        }
+        assert!(root.join(".cua-driver").join("config.json").is_file());
+        assert!(root
+            .join(".cua-driver-local")
+            .join("packages/current/cua-driver-local")
+            .is_file());
+        // Only the pre-rename home is removed once it is empty.
+        assert!(!root.join(PRE_RENAME_HOME_SUBDIRECTORY).exists());
+    }
+
+    #[test]
+    fn reset_keeps_a_pre_rename_home_that_still_holds_other_files() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(PRE_RENAME_HOME_SUBDIRECTORY);
+        write(&legacy.join(".telemetry_id"));
+        write(&legacy.join("packages/current/cua-driver"));
+
+        remove_legacy_state_under(root.path()).unwrap();
+
+        assert!(!legacy.join(".telemetry_id").exists());
+        assert!(legacy.join("packages/current/cua-driver").is_file());
+    }
+
+    #[test]
+    fn the_running_products_home_is_among_the_swept_homes() {
+        assert!(LEGACY_HOME_SUBDIRECTORIES.contains(&crate::bundle::user_home_subdirectory()));
+        assert!(LEGACY_HOME_SUBDIRECTORIES.contains(&PRE_RENAME_HOME_SUBDIRECTORY));
     }
 
     #[cfg(unix)]
@@ -223,6 +307,8 @@ mod tests {
 
         assert!(legacy_entries_in(&home).is_empty());
         assert!(remove_legacy_state_in(&home).unwrap().is_empty());
+        assert!(!legacy_state_present_under(root.path()));
+        assert!(remove_legacy_state_under(root.path()).unwrap().is_empty());
 
         assert!(!home.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);

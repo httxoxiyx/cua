@@ -101,8 +101,9 @@ fn configure_startup_permission_mode(
 }
 
 /// `cua-driver telemetry ...`. Telemetry is removed from this build, so every
-/// subcommand reports that. `reset-id` still deletes telemetry files an earlier
-/// build may have left on disk; it is a local-only operation.
+/// subcommand reports that. `reset-id` still deletes telemetry and update-check
+/// files an earlier build may have left in any Cua Driver home directory; it is
+/// a local-only operation.
 fn run_telemetry_command(command: cli::TelemetryCommand) {
     match command {
         cli::TelemetryCommand::Status { json } => {
@@ -115,7 +116,7 @@ fn run_telemetry_command(command: cli::TelemetryCommand) {
             } else {
                 println!("{}", telemetry::REMOVED_NOTICE);
                 if status.legacy_state_present {
-                    println!("Telemetry files from an earlier build are still on disk; run `cua-driver telemetry reset-id` to delete them.");
+                    println!("Telemetry or update-check files from an earlier build are still on disk; run `cua-driver telemetry reset-id` to delete them.");
                 }
             }
         }
@@ -123,7 +124,9 @@ fn run_telemetry_command(command: cli::TelemetryCommand) {
             Ok(removed) => {
                 println!("{}", telemetry::REMOVED_NOTICE);
                 if removed.is_empty() {
-                    println!("No telemetry files from an earlier build were found.");
+                    println!(
+                        "No telemetry or update-check files from an earlier build were found."
+                    );
                 }
                 for path in removed {
                     println!("Removed {}", path.display());
@@ -546,23 +549,40 @@ mod mcp_runtime_selection_tests {
 }
 
 /// Regression guard for the removed phone-home paths (telemetry, update
-/// checks, remote skill downloads): the crates linked into the shipped binary
-/// must not regain an analytics endpoint or key, an HTTP client, or a GitHub
-/// API/raw/release-asset URL. Needles are assembled at runtime so this test's
+/// checks, remote skill downloads): no crate that is linked into, or shipped
+/// beside, a driver binary may regain an analytics endpoint or key, an HTTP
+/// client, or a GitHub API/raw/release-asset URL. Every workspace member is
+/// scanned except the test-only harness, so a crate added later is covered
+/// without editing this list. Needles are assembled at runtime so this test's
 /// own source text cannot match them.
 #[cfg(test)]
 mod no_phone_home_tests {
     use std::path::{Path, PathBuf};
 
-    fn collect_sources(path: &Path, files: &mut Vec<PathBuf>) {
+    /// The one workspace member that never ships.
+    const TEST_ONLY_MEMBER: &str = "crates/cua-driver-testkit";
+
+    /// Members of the Rust workspace, read from its manifest.
+    fn workspace_members(workspace: &Path) -> Vec<String> {
+        let manifest = std::fs::read_to_string(workspace.join("Cargo.toml")).unwrap();
+        let list = manifest
+            .split_once("members = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("workspace manifest lists its members");
+        list.split(',')
+            .map(|member| member.trim().trim_matches('"').to_owned())
+            .filter(|member| !member.is_empty())
+            .collect()
+    }
+
+    /// Every file under `path`: Rust sources and the data files they embed.
+    fn collect_files(path: &Path, files: &mut Vec<PathBuf>) {
         if path.is_dir() {
             for entry in std::fs::read_dir(path).unwrap() {
-                collect_sources(&entry.unwrap().path(), files);
+                collect_files(&entry.unwrap().path(), files);
             }
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "rs" || extension == "toml")
-        {
+        } else if path.is_file() {
             files.push(path.to_owned());
         }
     }
@@ -578,28 +598,50 @@ mod no_phone_home_tests {
             ["raw.", "githubusercontent.com"].concat(),
             ["releases/", "download"].concat(),
         ];
-        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let mut files = Vec::new();
-        for name in [
-            "cua-driver",
-            "cua-driver-core",
-            "cua-driver-sdk",
-            "platform-macos",
-            "cursor-overlay",
-            "pip-preview",
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let members = workspace_members(&workspace);
+        // Linked into a cua-driver binary on some platform, or shipped beside it
+        // (the Windows UIA helper, the cursor-theme sidecar). A rename must
+        // update this list rather than silently drop a crate from the scan.
+        for shipped in [
+            "crates/cua-driver",
+            "crates/cua-driver-core",
+            "crates/cua-driver-sdk",
+            "crates/cua-driver-contract",
+            "crates/platform-macos",
+            "crates/platform-windows",
+            "crates/platform-linux",
+            "crates/cua-driver-uia",
+            "crates/cursor-overlay",
+            "crates/cursor-theme-cli",
+            "crates/pip-preview",
         ] {
-            collect_sources(&crates.join(name).join("src"), &mut files);
-            files.push(crates.join(name).join("Cargo.toml"));
+            assert!(
+                members.iter().any(|member| member == shipped),
+                "{shipped} is not a workspace member: {members:?}"
+            );
+        }
+        let mut files = Vec::new();
+        for member in members.iter().filter(|member| *member != TEST_ONLY_MEMBER) {
+            let crate_dir = workspace.join(member);
+            let manifest = crate_dir.join("Cargo.toml");
+            assert!(manifest.is_file(), "{} is missing", manifest.display());
+            files.push(manifest);
+            let build_script = crate_dir.join("build.rs");
+            if build_script.is_file() {
+                files.push(build_script);
+            }
+            collect_files(&crate_dir.join("src"), &mut files);
         }
         assert!(
-            files.len() > 50,
+            files.len() > 300,
             "source walk found only {} files",
             files.len()
         );
         for file in files {
-            let source = std::fs::read_to_string(&file)
-                .unwrap_or_else(|error| panic!("read {}: {error}", file.display()))
-                .to_ascii_lowercase();
+            let bytes = std::fs::read(&file)
+                .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+            let source = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
             for needle in &needles {
                 assert!(
                     !source.contains(needle.as_str()),

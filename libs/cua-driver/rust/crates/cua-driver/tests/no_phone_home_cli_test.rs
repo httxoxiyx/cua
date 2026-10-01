@@ -100,22 +100,27 @@ fn telemetry_and_update_commands_answer_statically_and_create_nothing() {
 }
 
 #[test]
-fn telemetry_reset_id_deletes_only_legacy_telemetry_files() {
+fn telemetry_reset_id_deletes_only_legacy_files_from_every_cua_driver_home() {
     let home = tempfile::tempdir().unwrap();
-    let current = home.path().join(".cua-driver");
+    let release = home.path().join(".cua-driver");
+    // Written by source-built `cua-driver-local` installs. The release binary
+    // under test must clean it too: telemetry is gone in every namespace.
+    let local = home.path().join(".cua-driver-local");
     let legacy = home.path().join(".cua-driver-rs");
-    for directory in [&current, &legacy] {
+    for directory in [&release, &local, &legacy] {
         std::fs::create_dir_all(directory.join(".release_installed")).unwrap();
         std::fs::write(directory.join(".release_installed").join("0.23.1"), "1").unwrap();
         for name in [
             ".telemetry_id",
             ".installation_recorded",
             ".telemetry_lifecycle.lock",
+            "version_check.json",
         ] {
             std::fs::write(directory.join(name), "1").unwrap();
         }
     }
-    std::fs::write(current.join("config.json"), "{}").unwrap();
+    std::fs::write(release.join("config.json"), "{}").unwrap();
+    std::fs::write(local.join("config.json"), "{}").unwrap();
 
     let status = run(home.path(), &["telemetry", "status", "--json"]);
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
@@ -125,8 +130,13 @@ fn telemetry_reset_id_deletes_only_legacy_telemetry_files() {
     assert_success(&reset);
     assert!(stdout(&reset).contains("Removed"), "{}", stdout(&reset));
 
-    assert_eq!(entries(&current), vec!["config.json".to_owned()]);
+    assert_eq!(entries(&release), vec!["config.json".to_owned()]);
+    assert_eq!(entries(&local), vec!["config.json".to_owned()]);
     assert!(!legacy.exists(), "emptied legacy home should be removed");
+
+    let status = run(home.path(), &["telemetry", "status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["legacy_state_present"], false);
 }
 
 #[test]

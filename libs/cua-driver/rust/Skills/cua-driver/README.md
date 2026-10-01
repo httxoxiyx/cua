@@ -13,19 +13,28 @@ failure before a caller escalates to foreground input.
 
 ## Install Cua Driver
 
+Install Cua Driver through your distribution channel. To build it from a
+source checkout instead, run the local installer from the checkout root. It
+installs the source build as `cua-driver-local`, beside any release
+installation.
+
 macOS or Linux:
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"
+bash libs/cua-driver/scripts/install-local.sh --release
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://cua.ai/driver/install.ps1 | iex
+.\libs\cua-driver\scripts\install-local.ps1
 ```
 
-Then verify the current host:
+Do not use the upstream `cua.ai` one-line installers to get this build. They
+download upstream release binaries, which send usage telemetry by default and
+check GitHub for updates. This build does neither.
+
+Then verify the current host (`cua-driver-local doctor` for a local build):
 
 ```bash
 cua-driver doctor

@@ -161,7 +161,8 @@ pub enum Command {
         socket: Option<String>,
     },
     /// Telemetry is removed from this build. The verbs report that, and
-    /// `reset-id` deletes telemetry files left by an earlier build.
+    /// `reset-id` deletes telemetry and update-check files left by an earlier
+    /// build in any Cua Driver home directory.
     Telemetry(TelemetryCommand),
     /// `cua-driver autostart {enable|disable|status|kick}` —
     /// platform-native auto-start so `cua-driver serve` comes up on
@@ -380,9 +381,9 @@ pub fn parse_command() -> Command {
         println!();
         println!("telemetry:");
         println!("  Telemetry has been removed from this build; nothing is collected or sent.");
-        println!("  cua-driver telemetry status     Say so, and report telemetry files left by an earlier build.");
+        println!("  cua-driver telemetry status     Say so, and report telemetry or update-check files left by an earlier build.");
         println!("    --json                        Emit machine-readable status.");
-        println!("  cua-driver telemetry reset-id   Delete telemetry files left by an earlier build (local only).");
+        println!("  cua-driver telemetry reset-id   Delete those files from ~/.cua-driver, ~/.cua-driver-local and ~/.cua-driver-rs (local only).");
         println!();
         println!("autostart options (Windows-only today):");
         println!("  cua-driver autostart enable     Register a logon Scheduled Task so serve starts at every interactive logon.");
@@ -1795,7 +1796,7 @@ pub fn build_manifest() -> serde_json::Value {
                   { "name": "--socket", "type": "string", "description": "Override the daemon socket path." }
               ] },
             { "name": "telemetry",
-              "description": "Telemetry has been removed from this build. Reports that, and deletes telemetry files left by an earlier build (reset-id).",
+              "description": "Telemetry has been removed from this build. Reports that, and deletes telemetry and update-check files left by an earlier build (reset-id).",
               "args": [
                   { "name": "subcommand", "type": "positional-string", "description": "status | reset-id (enable | disable | inspect only report the removal)" },
                   { "name": "--json", "type": "flag", "description": "Emit machine-readable status." }
@@ -5888,13 +5889,13 @@ fn cli_docs_json() -> serde_json::Value {
             {
                 "name": "telemetry",
                 "abstract": "Report that telemetry has been removed from this build.",
-                "discussion": "Nothing is collected or sent, and no installation ID is created. reset-id deletes telemetry files left on disk by an earlier build; enable, disable, and inspect only report the removal.",
+                "discussion": "Nothing is collected or sent, and no installation ID is created. reset-id deletes telemetry and update-check files left on disk by an earlier build; enable, disable, and inspect only report the removal.",
                 "arguments": no_args,
                 "options": no_options,
                 "flags": no_flags,
                 "subcommands": [
-                    {"name":"status","abstract":"Report that telemetry is removed and whether legacy telemetry files remain.","discussion":"","arguments":[],"options":[],"flags":[{"name":"json","short_name":null,"help":"Emit JSON.","default_value":false}],"subcommands":[]},
-                    {"name":"reset-id","abstract":"Delete telemetry files left by an earlier build.","discussion":"Local filesystem only; covers the product home and the pre-rename ~/.cua-driver-rs.","arguments":[],"options":[],"flags":[],"subcommands":[]}
+                    {"name":"status","abstract":"Report that telemetry is removed and whether legacy telemetry or update-check files remain.","discussion":"","arguments":[],"options":[],"flags":[{"name":"json","short_name":null,"help":"Emit JSON.","default_value":false}],"subcommands":[]},
+                    {"name":"reset-id","abstract":"Delete telemetry and update-check files left by an earlier build.","discussion":"Local filesystem only; covers ~/.cua-driver, ~/.cua-driver-local, and the pre-rename ~/.cua-driver-rs, whichever build runs it.","arguments":[],"options":[],"flags":[],"subcommands":[]}
                 ]
             },
             {

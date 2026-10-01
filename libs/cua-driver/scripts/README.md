@@ -94,14 +94,20 @@ encrypted Computer History is present. Purge that history with the verified old
 helper or use a separately reviewed key-migration tool before retrying.
 
 Telemetry and update checks have been removed from the driver built from this
-repository: it collects and sends nothing, so `cua-driver telemetry install-event`
-(still invoked by the inherited release installers) is a no-op, and
-`cua-driver telemetry reset-id` only deletes identity and marker files that an
-earlier build left in the package home. The inherited release installers still
-download upstream binaries, which keep upstream telemetry; see the repository
-README. Uninstalling with `--purge` on Unix, or with
-`CUA_DRIVER_RS_UNINSTALL_PURGE=1` on Windows, also deletes the legacy
-installation ID and preference files; this is local and needs no network.
+repository: it collects and sends nothing. `cua-driver telemetry install-event`
+is a no-op kept for compatibility, and `cua-driver telemetry reset-id` only
+deletes the installation ID, event markers and update-check cache that an
+earlier build left in `~/.cua-driver`, `~/.cua-driver-local` or
+`~/.cua-driver-rs`, whichever build runs it.
+
+The inherited release installers (`install.sh`, `install.ps1`) no longer record
+an install event, write an install-channel hint, or carry a telemetry ID
+forward. They still download upstream binaries, which send telemetry by default;
+see the repository README. `uninstall-local.sh` and `uninstall-local.ps1` delete
+those files from the local home. Uninstalling a release install with `--purge`
+on Unix, or with `CUA_DRIVER_RS_UNINSTALL_PURGE=1` on Windows, deletes them from
+the package home, including `.release_installed/`. Both are local and need no
+network.
 
 Keep source commits host-owned. Verification machines should sync from this
 checkout and return artifacts, not push code.
