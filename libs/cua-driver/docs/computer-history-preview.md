@@ -18,6 +18,13 @@ performed through Cua Driver. It does not watch unrelated desktop activity.
 
 ## Install or switch to the nightly channel
 
+> **This repository's builds:** update checks and self-update are removed from
+> the driver built here. `cua-driver update --apply` only prints "Update checks
+> are disabled in this build; update through your distribution channel." and
+> exits non-zero, so the channel switches below apply to upstream releases.
+> Install a build from this repository through your own distribution channel
+> instead.
+
 For a fresh macOS or Linux installation, run:
 
 ```bash

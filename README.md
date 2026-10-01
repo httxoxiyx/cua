@@ -37,9 +37,18 @@ The app's display name is `cua`, without a custom icon. Bundle identity,
 permission attribution and signing behavior are unchanged. There is no approved
 Developer ID distribution certificate or qualified public binary release here.
 
-Inherited installers, package names, update checks, telemetry settings and
-hosted-documentation links still refer to upstream where they did before this
-extraction. **Do not use those installers to obtain this development build.**
+The Driver built from this repository has no telemetry, no update checks and
+no remote skill downloads: it sends no usage data and does not contact GitHub
+on its own. `cua-driver telemetry` only reports that telemetry was removed
+(`telemetry reset-id` deletes identity files an earlier build left behind),
+`cua-driver check-update`, `update` and the `check_for_update` MCP tool return a
+static "update checks are disabled" answer, and `cua-driver skills install`
+writes the skill pack compiled into the binary.
+
+Inherited installers, package names and hosted-documentation links still refer
+to upstream where they did before this extraction. Those installers download
+upstream binaries, which keep upstream telemetry and update checks.
+**Do not use those installers to obtain this development build.**
 Independent release endpoints and ownership must be configured and verified
 before distribution. This repository does not auto-install or update a Driver.
 

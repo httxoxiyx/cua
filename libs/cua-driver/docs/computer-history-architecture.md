@@ -911,6 +911,10 @@ platform qualifies.
 
 ### Telemetry firewall
 
+> The driver built from this repository has no product telemetry at all (it was
+> removed, including the CLI command classifier mentioned below), so these
+> rules describe the upstream design and hold trivially here.
+
 History and product telemetry are separate systems:
 
 - no history event, field, identifier, result, count, path, title, URL, query, summary, or content is copied into telemetry;

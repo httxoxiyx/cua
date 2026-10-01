@@ -93,12 +93,15 @@ The one-time migration from `com.trycua.driver` defaults its old signer to
 encrypted Computer History is present. Purge that history with the verified old
 helper or use a separately reviewed key-migration tool before retrying.
 
-Released installers show a telemetry notice before asking the installed binary
-to record anything. Telemetry is enabled by default and can be persistently
-disabled with `cua-driver telemetry disable`. Installation events use the same
-consent decision as routine events. A normal uninstall preserves the pseudonymous
-installation ID and preference for a future reinstall; use `--purge` on Unix,
-or set `CUA_DRIVER_RS_UNINSTALL_PURGE=1` on Windows, to delete them.
+Telemetry and update checks have been removed from the driver built from this
+repository: it collects and sends nothing, so `cua-driver telemetry install-event`
+(still invoked by the inherited release installers) is a no-op, and
+`cua-driver telemetry reset-id` only deletes identity and marker files that an
+earlier build left in the package home. The inherited release installers still
+download upstream binaries, which keep upstream telemetry; see the repository
+README. Uninstalling with `--purge` on Unix, or with
+`CUA_DRIVER_RS_UNINSTALL_PURGE=1` on Windows, also deletes the legacy
+installation ID and preference files; this is local and needs no network.
 
 Keep source commits host-owned. Verification machines should sync from this
 checkout and return artifacts, not push code.

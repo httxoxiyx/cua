@@ -51,9 +51,12 @@ directories:
 cua-driver skills install
 ```
 
-The direct installer keeps only the current host's platform guide by default.
-Use `--all-platforms` when the agent assists users across operating systems.
-`cua-driver skills update` refreshes the pack to match a later driver release.
+The skill pack is compiled into the driver binary, so this works offline and
+never downloads anything. The direct installer keeps only the current host's
+platform guide by default. Use `--all-platforms` when the agent assists users
+across operating systems. `cua-driver skills update` rewrites the local copy
+from the pack bundled into the installed driver, for example after upgrading
+the driver.
 
 ## Reading order
 
@@ -94,12 +97,9 @@ missing. See `RECORDING.md`.
 
 ## Updates and source builds
 
-The skill is versioned with Cua Driver releases. For bleeding-edge validation
-against `main`:
-
-```bash
-cua-driver skills install --from main
-```
+The skill is versioned with, and bundled into, each Cua Driver build. Remote
+skill sources such as `--from main` were removed; to try newer skill text,
+build the driver from a checkout that contains it.
 
 From a local checkout, `libs/cua-driver/scripts/install-local.sh` installs the
 source-built macOS driver as `cua-driver-local` and `MuseCodeCuaDriverLocal.app`, without
